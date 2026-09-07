@@ -1,0 +1,536 @@
+Ye screen VYRX ka central navigation + quick control panel hoga. User kisi bhi module me instantly ja sakta hai aur kuch important controls bina Settings khole access kar sakta hai.
+
+
+---
+
+☰ Side Menu Purpose
+
+Drawer ka kaam:
+
+App ke sabhi modules access karna
+
+AI profile/status dekhna
+
+Quick settings control karna
+
+System health check karna
+
+Version/update information dekhna
+
+
+Flow:
+
+☰ Button Tap
+      ↓
+Navigation Drawer Open
+      ↓
+User Select Module
+      ↓
+VYRX Screen Switch
+
+
+---
+
+1. Top Logo Section 🌐
+
+VYRX
+AI Assistant
+Your Personal AI Agent
+
+Function:
+
+Brand + AI identity.
+
+Tap karne par:
+
+About VYRX
+↓
+Version
+AI Engine
+Architecture
+Credits
+
+
+---
+
+2. User Profile Card 👤
+
+Example:
+
+Akash
+
+Think • Create • Achieve
+        >
+
+Function:
+
+User profile management.
+
+Tap:
+
+Profile
+
+Name
+Avatar
+AI Preferences
+Usage Statistics
+Personalization
+
+
+---
+
+Avatar Icon 🟣
+
+AI generated profile image / user icon.
+
+Tap:
+
+Options:
+
+Change Avatar
+Create AI Avatar
+Remove Avatar
+
+
+---
+
+3. Home 🏠
+
+Icon:
+
+🏠 Home
+AI Orb & Voice Assistant
+
+Function:
+
+Main VYRX screen.
+
+Open:
+
+AI Orb
+
+Voice assistant
+
+Chat input
+
+Action logs
+
+
+Example:
+
+User:
+Open YouTube
+
+VYRX:
+🟣 Thinking
+🟢 Executing
+✓ Done
+
+
+---
+
+4. Chat 💬
+
+Icon:
+
+💬 Chat
+Have a conversation with VYRX
+
+Function:
+
+Normal AI conversation.
+
+Features:
+
+Text chat
+
+Voice chat
+
+File upload
+
+Image understanding
+
+
+Long press message:
+
+Copy
+Save Memory
+Regenerate
+Explain
+Delete
+
+
+---
+
+5. Memory 🧠
+
+Icon:
+
+🧠 Memory
+Your AI Knowledge Base
+
+Function:
+
+AI brain management.
+
+Open:
+
+Personal Memory
+Experience
+Knowledge
+Learned Data
+
+Actions:
+
+Search
+Edit
+Delete
+Pin
+Export
+
+Example:
+
+User prefers Hinglish
+
+Saved ✓
+
+
+---
+
+6. Dashboard 📊
+
+Icon:
+
+📊 Dashboard
+System Analytics & Stats
+
+Function:
+
+AI monitoring center.
+
+Shows:
+
+AI Status
+CPU
+Memory
+API Usage
+Tasks
+Automation
+
+Example:
+
+Tasks Today:
+23
+
+API:
+Groq Active
+
+Learning:
+72%
+
+
+---
+
+7. Tools 🛠
+
+Icon:
+
+🛠 Tools
+AI Agent Tool Kit
+
+Function:
+
+AI abilities management.
+
+Examples:
+
+✓ App Control
+✓ Web Search
+✓ Code Executor
+✓ File Manager
+✓ Automation
+
+Controls:
+
+Enable
+Disable
+Configure
+Permission
+
+
+---
+
+8. Settings ⚙️
+
+Icon:
+
+⚙ Settings
+Customize Your Experience
+
+Function:
+
+Complete configuration.
+
+Contains:
+
+AI Personality
+Voice
+Theme
+Notifications
+Privacy
+Security
+
+
+---
+
+9. API Providers 🔌
+
+Icon:
+
+🔌 API Providers
+Manage AI Models & Connections
+
+Function:
+
+AI model management.
+
+Providers:
+
+Groq
+Gemini
+OpenAI
+Custom API
+
+Actions:
+
+Add API Key
+Switch Model
+Test Connection
+Remove Provider
+
+
+---
+
+10. Security 🛡️
+
+Icon:
+
+🛡 Security
+Privacy & Protection
+
+Function:
+
+Protection center.
+
+Controls:
+
+App Lock
+Encryption
+Permissions
+Data Control
+
+Example:
+
+API Keys:
+Encrypted ✓
+
+Memory:
+Protected ✓
+
+
+---
+
+11. Quick Actions Section ⚡
+
+Ye drawer ka shortcut area hai.
+
+
+---
+
+🌙 Dark Mode Toggle
+
+Function:
+
+Theme switch.
+
+OFF:
+
+Light Mode
+
+ON:
+
+Dark Neon Mode
+
+
+---
+
+⚡ System Status
+
+Example:
+
+🟢 Healthy
+
+Tap:
+
+System Check
+
+AI Engine ✓
+Database ✓
+APIs ✓
+Tools ✓
+
+
+---
+
+🔄 Check For Updates
+
+Function:
+
+VYRX latest version check.
+
+Flow:
+
+Check Update
+
+↓
+New Version Found
+
+↓
+Install
+
+
+---
+
+12. VYRX Pro Card 👑
+
+Example:
+
+VYRX Pro
+
+Unlock more powerful features
+
+Function:
+
+Premium feature area.
+
+Tap:
+
+VYRX Pro
+
+Advanced Models
+More Automation
+Cloud Sync
+Extra Memory
+
+
+---
+
+13. About VYRX ℹ️
+
+Example:
+
+About VYRX
+
+Version 1.0.0
+Build 2026.09.01
+
+Tap:
+
+About
+
+Version
+License
+Developer Info
+Privacy
+Open Source
+
+
+---
+
+14. Drawer Close Gesture
+
+User:
+
+Swipe left → close drawer
+
+Tap outside → close drawer
+
+Press back → close drawer
+
+
+Animation:
+
+Drawer →
+Smooth slide →
+Main screen returns
+
+
+---
+
+15. Background Dim Layer
+
+Jab drawer open hota hai:
+
+Behind screen dark ho jati hai.
+
+Purpose:
+
+Focus drawer par
+
+Better readability
+
+Premium UI feel
+
+
+
+---
+
+16. Drawer Architecture
+
+Side Menu UI
+       |
+       |
+Navigation Controller
+       |
+ -------------------------
+ |     |      |      |
+Chat Memory Tools Settings
+ |
+VYRX Core Engine
+
+
+---
+
+17. Real Example
+
+User Dashboard par hai:
+
+Dashboard
+    |
+    ↓
+Tap ☰
+    |
+    ↓
+Select Tools
+    |
+    ↓
+Tools Screen Open
+
+No restart, no reload.
+
+
+---
+
+Final Role
+
+Side Menu VYRX ka command center hai. 🚀
+
+Home = AI face 🌐
+Chat = Conversation 💬
+Memory = Brain 🧠
+Tools = Hands 🛠
+Dashboard = Eyes 📊
+Settings = Control ⚙️
+API Providers = Intelligence Sources 🔌
+
+Drawer sabko ek jagah connect karta hai.

@@ -1,0 +1,704 @@
+Ye screen AI ke brain behavior, API connection, permissions, security aur personalization control center ki tarah kaam karegi.
+
+
+---
+
+⚙️ Settings Screen Purpose
+
+Settings se user control karega:
+
+VYRX ka behavior
+
+AI models
+
+Voice
+
+API keys
+
+Phone permissions
+
+Privacy
+
+Appearance
+
+Notifications
+
+
+
+---
+
+1. Top Left ☰ Hamburger Menu
+
+Function: Main Navigation Drawer
+
+Tap:
+
+VYRX
+
+🏠 Home
+💬 Chat
+🧠 Memory
+📊 Dashboard
+🛠 Tools
+⚙ Settings
+🔌 API Providers
+🔐 Security
+
+Use:
+
+Modules change karna
+
+Settings se bahar jaana
+
+
+
+---
+
+2. Top Center ⚙️ SETTINGS Title
+
+SETTINGS
+
+Customize Your VYRX Experience
+
+Purpose:
+
+Current section identify karna
+
+
+
+---
+
+3. Top Right 🔍 Search Icon
+
+Function: Settings Search
+
+Example:
+
+User type:
+
+voice
+
+Results:
+
+🎤 Voice & Speech
+🔊 Audio Settings
+
+Ya:
+
+API
+
+Results:
+
+API Providers
+Manage API Keys
+
+
+---
+
+4. VYRX Profile Card 🌐
+
+Top card:
+
+VYRX
+AI Assistant
+
+Version 1.0.0
+
+🟢 System Healthy
+
+Purpose:
+
+App status overview.
+
+Tap:
+
+Open:
+
+System Information
+
+Version
+Build Number
+AI Engine Status
+Database Status
+Storage
+
+
+---
+
+5. AI & Personality Section 🧠
+
+Ye VYRX ke behavior ka control hai.
+
+
+---
+
+🤖 AI Model Provider
+
+Example:
+
+Groq
+Mixtral 8x7B
+
+Tap:
+
+AI Provider
+
+○ Groq
+○ Gemini
+○ OpenAI
+○ Custom API
+
+Auto Switch:
+ON/OFF
+
+Function:
+
+AI ka brain select karna.
+
+
+---
+
+👤 Personality
+
+Example:
+
+Assistant
+(Default)
+
+Tap:
+
+Personality
+
+Professional
+Friendly
+Creative
+Developer
+Custom
+
+Example:
+
+Professional:
+
+"Formal answers"
+
+Friendly:
+
+"Casual conversation"
+
+
+---
+
+⚡ Response Style
+
+Example:
+
+Balanced
+
+Options:
+
+Fast
+Balanced
+Deep Thinking
+
+Effect:
+
+Fast:
+
+Short response
+
+Less processing
+
+
+Deep:
+
+More reasoning
+
+Detailed answer
+
+
+
+---
+
+🎤 Voice & Speech
+
+Tap:
+
+Voice Settings
+
+Voice:
+ON/OFF
+
+Language:
+English
+Hindi
+Hinglish
+
+Speech Speed:
+1x
+
+Wake Word:
+ON/OFF
+
+
+---
+
+6. API Providers Section 🔌
+
+AI connection management.
+
+
+---
+
+Groq API
+
+Shows:
+
+🟢 Active
+
+Tap:
+
+API Details
+
+Model
+API Status
+Usage
+Remove Key
+Change Key
+
+
+---
+
+Gemini API
+
+Not Configured
+
+Tap:
+
+Add Gemini API Key
+
+
+---
+
+OpenAI API
+
+Same:
+
+Add OpenAI Key
+
+
+---
+
+Custom API
+
+For:
+
+Private AI Server
+Self-hosted Model
+Other Endpoints
+
+
+---
+
+🔑 Manage API Keys Button
+
+Important section.
+
+Open:
+
+API Key Manager
+
+Groq
+************
+
+Gemini
+Not Added
+
+OpenAI
+************
+
+Storage:
+Android Keystore
+
+Security:
+
+No plain text storage
+
+Encrypted keys
+
+
+
+---
+
+7. App & System Section 📱
+
+Phone integration controls.
+
+
+---
+
+🔐 App Permissions
+
+Tap:
+
+Permissions
+
+Microphone
+Storage
+Accessibility
+Notifications
+Camera
+
+Shows:
+
+Allowed / Denied
+
+
+---
+
+♿ Accessibility Service
+
+Purpose:
+
+Device automation.
+
+Example:
+
+Open app
+Click buttons
+Read screen
+
+Toggle:
+
+ON → AI can control device
+
+OFF → No automation
+
+
+---
+
+🔋 Battery Optimization
+
+Purpose:
+
+Background AI running.
+
+ON:
+
+Allow VYRX background work
+
+
+---
+
+🌙 Background Activity
+
+Controls:
+
+AI Agent running in background
+
+Example:
+
+Monitor tasks
+
+Notifications
+
+Automation
+
+
+
+---
+
+🚀 Auto Start
+
+Boot ke baad:
+
+Start VYRX automatically
+
+
+---
+
+8. Privacy & Security 🔐
+
+
+---
+
+🔒 Data Encryption
+
+Shows:
+
+Enabled
+
+Uses:
+
+Encrypted storage
+
+Secure database
+
+
+
+---
+
+🧬 Biometric Lock
+
+Options:
+
+Fingerprint
+Face Unlock
+PIN
+
+Purpose:
+
+App protection.
+
+
+---
+
+🛡 Secure Storage
+
+For:
+
+API Keys
+Memory Database
+User Data
+
+
+---
+
+🗑 Clear Data
+
+Danger option:
+
+Clear
+
+Delete:
+Chat History
+Memory
+Settings
+
+
+---
+
+9. Notifications Section 🔔
+
+
+---
+
+App Notifications
+
+Controls:
+
+AI responses
+Updates
+Alerts
+
+
+---
+
+Task Notifications
+
+Example:
+
+Task completed
+
+YouTube opened
+File downloaded
+
+
+---
+
+System Alerts
+
+Shows:
+
+Battery low
+API error
+Permission issue
+
+
+---
+
+Notification Style
+
+Options:
+
+Minimal
+Detailed
+Silent
+
+
+---
+
+10. Appearance Section 🎨
+
+UI customization.
+
+
+---
+
+Theme
+
+Options:
+
+Dark
+Light
+Auto
+
+
+---
+
+Accent Color
+
+Change VYRX glow:
+
+Purple
+Blue
+Green
+Amber
+Custom
+
+
+---
+
+Font Size
+
+Options:
+
+Small
+Medium
+Large
+
+
+---
+
+11. Support & About ℹ️
+
+
+---
+
+Help & Support
+
+Contains:
+
+FAQ
+Troubleshooting
+Contact
+
+
+---
+
+About VYRX
+
+Shows:
+
+Version
+Developer Info
+Open Source Licenses
+
+
+---
+
+Privacy Policy
+
+Explains:
+
+Data handling
+Memory storage
+Permissions
+
+
+---
+
+12. Bottom Navigation
+
+🏠 Home
+
+Main AI Orb screen.
+
+
+---
+
+💬 Chat
+
+Conversation.
+
+
+---
+
+🌐 Center Orb
+
+Quick AI activation.
+
+Actions:
+
+Single tap:
+
+Listening
+
+Long press:
+
+Voice Assistant Mode
+
+Double tap:
+
+Emergency Mode
+
+
+---
+
+📊 Dashboard
+
+System analytics.
+
+
+---
+
+🧠 Memory
+
+AI knowledge.
+
+
+---
+
+13. Real Example Flow
+
+User:
+
+> "Mujhe Gemini use karna hai"
+
+
+
+Flow:
+
+Settings
+   ↓
+AI Model Provider
+   ↓
+Gemini API
+   ↓
+Add API Key
+   ↓
+Encrypted Storage
+   ↓
+Activate Model
+
+
+---
+
+14. Complete Settings Architecture
+
+Settings UI
+     |
+     |
+----------------------
+|        |           |
+AI     System    Security
+|        |           |
+Model  Tools    Encryption
+Voice  Access   Privacy
+API    Battery  Lock
+
+     ↓
+
+VYRX Core Engine
+
+
+---

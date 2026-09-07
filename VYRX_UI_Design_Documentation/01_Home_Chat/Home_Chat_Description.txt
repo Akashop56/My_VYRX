@@ -1,0 +1,413 @@
+Ye sirf decoration nahi hai — har icon ka ek clear role hai. 👇
+
+1. Top Left ☰ (3 Lines / Hamburger Menu)
+
+Purpose: Main navigation drawer
+
+Tap karne par side panel open hoga:
+
+VYRX
+----------------
+🏠 Home
+💬 Chat
+🧠 Memory
+⚙ Settings
+🛠 Tools
+📊 Analytics
+🔌 API Providers
+🔐 Security
+
+Function:
+
+Different modules switch karna
+
+AI personality change
+
+Connected tools manage karna
+
+Account/project settings
+
+
+
+---
+
+2. Top Right 🎚️ (Sliders Icon)
+
+Ye quick control panel hoga.
+
+Tap karne par:
+
+AI Controls
+
+🧠 Model
+[ Groq ▼ ]
+
+🎭 Personality
+[ Assistant ▼ ]
+
+⚡ Response Mode
+○ Fast
+○ Balanced
+○ Deep Thinking
+
+🎤 Voice
+ON/OFF
+
+🔋 Background Agent
+ON/OFF
+
+Function:
+
+Without settings me jaaye AI ka behaviour change karna.
+
+
+---
+
+3. Center Orb 🌐 (AI State Avatar)
+
+Ye VYRX ka main identity element hoga.
+
+Orb ka colour AI state ke hisaab se change:
+
+🔵 Blue
+
+Listening
+
+Waiting for voice command...
+
+Animation:
+
+Slow pulse
+
+Wave rings
+
+
+
+---
+
+🟣 Purple
+
+Thinking
+
+Analyzing request...
+Calling API...
+Planning steps...
+
+Animation:
+
+Fast particles
+
+Internal movement
+
+
+
+---
+
+🟢 Green
+
+Executing
+
+Opening YouTube...
+Running automation...
+Sending message...
+
+Animation:
+
+Energy flowing outward
+
+
+
+---
+
+🟠 Amber
+
+Learning
+
+Saving new memory...
+Updating knowledge...
+
+Animation:
+
+Data particles entering orb
+
+
+
+---
+
+4. Left Card (Active Model)
+
+Example:
+
+ACTIVE MODEL
+
+Groq Mixtral 8x7B
+
+Response:
+1.2 sec
+
+Tap:
+
+Open:
+
+AI Provider
+
+● Groq
+○ Gemini
+○ OpenAI
+○ Custom API
+
+Auto Switch:
+ON
+
+
+---
+
+5. Right Card (Today's Summary)
+
+AI productivity stats:
+
+TODAY
+
+✓ 23 Tasks Completed
+
+⚡ 12 Auto Tasks
+
+📚 5 Things Learned
+
+Tap:
+
+Detailed analytics:
+
+Today:
+
+Voice Commands: 42
+Apps Opened: 18
+Web Searches: 7
+Memories Saved: 5
+
+
+---
+
+6. Action Log Window (3 Dots UI)
+
+Ye bahut important AGI feel deta hai.
+
+Example:
+
+•••
+
+[03:47]
+Searching web...
+
+[03:48]
+Analyzing results...
+
+[03:49]
+Executing action...
+
+User ko transparency milegi:
+
+AI kya kar raha hai pata chalega.
+
+Task complete hone ke baad:
+
+Animation:
+
+LOG ↓
+Collapse
+
+
+---
+
+7. Chat Area
+
+Normal AI conversation.
+
+Extra features:
+
+Long press message:
+
+Copy
+Regenerate
+Save Memory
+Explain
+
+AI response ke niche:
+
+👍 Feedback
+
+👎 Correction
+
+🧠 Remember this
+
+
+---
+
+8. Message Box
+
+Input:
+
+Type a message...
+        🎤  ➤
+
+🎤 Mic:
+
+Voice input
+
+➤ Send:
+
+Text command
+
+Future:
+
+Camera button
+
+File upload
+
+Screen sharing
+
+
+
+---
+
+9. Health Dashboard
+
+Bottom card:
+
+VYRX HEALTH
+
+Memory
+64%
+
+Storage
+7.8GB
+
+CPU
+28%
+
+API
+Groq Active
+
+Tap:
+
+Full system monitor:
+
+Memory Database
+
+Vectors:
+15,240
+
+Knowledge:
+2.4GB
+
+Tasks:
+1,250
+
+Uptime:
+14 days
+
+
+---
+
+10. Bottom Navigation
+
+Current design:
+
+🏠 Home
+
+💬 Chat
+
+       🌐
+      Orb
+
+📊 Dashboard
+
+🧠 Memory
+
+Center Orb Button
+
+Ye special action button:
+
+Tap:
+
+Start listening
+
+Hold:
+
+Wake mode
+
+Double tap:
+
+Emergency assistant
+
+
+---
+
+11. Memory Module 🧠
+
+AI ka long-term brain:
+
+Memory
+
+Personal
+---------
+User preferences
+
+Experience
+---------
+Previous errors
+
+Knowledge
+---------
+Learned information
+
+Actions:
+
+Edit memory
+
+Delete memory
+
+Export memory
+
+
+
+---
+
+12. Tools Module 🛠
+
+AI ke hands:
+
+Tools
+
+✓ App Control
+
+✓ Web Search
+
+✓ Code Runner
+
+✓ File Manager
+
+✓ Automation
+
+✓ Notifications
+
+
+---
+
+Overall flow:
+
+User
+ |
+Voice/Text
+ |
+VYRX Brain
+ |
+Planner
+ |
+Action Log
+ |
+Tool Execution
+ |
+Memory Update
+ |
+Response

@@ -1,0 +1,493 @@
+— har icon, button aur section ka real app behaviour kya hoga. 🧠⚡
+
+🧠 Memory Screen Purpose
+
+Ye VYRX ka Long-Term Brain Management Center hoga.
+
+Yaha AI:
+
+User preferences save karega
+
+Previous conversations se important points store karega
+
+Errors aur solutions yaad rakhega
+
+Learned knowledge maintain karega
+
+
+
+---
+
+1. Top Left ☰ Hamburger Menu
+
+Function: Global Navigation Drawer
+
+Tap karne par:
+
+VYRX
+----------------
+🏠 Home
+💬 Chat
+🧠 Memory   ← Current
+📊 Dashboard
+🛠 Tools
+⚙ Settings
+🔌 API Providers
+🔐 Security
+
+Use:
+
+Kisi bhi module me jump karna
+
+App navigation
+
+
+
+---
+
+2. Top Center 🧠 MEMORY Title
+
+MEMORY
+AI Knowledge & Experience
+
+Purpose:
+
+Current module indicator
+
+
+
+---
+
+3. Top Right 🔍 Search Icon
+
+Function: Memory Search
+
+Tap:
+
+Search Memory
+
+"Termux error"
+"User preference"
+"API settings"
+
+AI semantic search karega.
+
+Example:
+
+User:
+
+> "Maine Groq API kab add ki thi?"
+
+
+
+VYRX:
+
+> "You added Groq API on 28 May 2025."
+
+
+
+
+---
+
+4. Top Right 🎚️ Filter/Control Icon
+
+Function: Memory Settings
+
+Options:
+
+Memory Filter
+
+☑ Personal
+☑ Experience
+☑ Knowledge
+
+Sort:
+Newest
+Oldest
+Most Used
+Important
+
+
+---
+
+5. Memory Category Tabs
+
+🟣 All Memory
+
+Sab memories show hongi.
+
+Example:
+
+15,240 Memories
+
+
+---
+
+👤 Personal
+
+User related preferences:
+
+Example:
+
+User prefers Hinglish replies
+
+User likes dark UI
+
+User prefers detailed explanation
+
+
+---
+
+⚙ Experience
+
+AI ke past experiences:
+
+Example:
+
+Fixed Gradle build error
+
+Solved Termux permission issue
+
+API connection repaired
+
+
+---
+
+📚 Knowledge
+
+General learned information:
+
+Example:
+
+Android Architecture
+Python concepts
+AI research notes
+
+
+---
+
+6. Memory Overview Cards
+
+🧠 Total Memories
+
+Example:
+
+15,240
+Total Memories
+
+Tap:
+
+Full list open.
+
+
+---
+
+💾 Memory Size
+
+Example:
+
+2.48 GB
+
+Shows:
+
+Database
+Vector Storage
+Cache
+
+
+---
+
+🛡 Health Score
+
+Example:
+
+98%
+
+Checks:
+
+Duplicate memories
+
+Corrupted data
+
+Outdated information
+
+
+
+---
+
+⏳ Retention
+
+Example:
+
+14 days
+
+Meaning:
+
+AI memory activity timeline.
+
+
+---
+
+7. Search Bar
+
+Search memories...
+
+Features:
+
+Keyword search
+
+AI semantic search
+
+Voice search
+
+
+Example:
+
+Search:
+
+"APK build"
+
+Results:
+
+Gradle Fix Experience
+GitHub Action Solution
+Kotlin Error Memory
+
+
+---
+
+8. Filter Button 🔽
+
+Advanced filtering:
+
+Filter
+
+Type:
+○ Personal
+○ Experience
+○ Knowledge
+
+Importance:
+⭐⭐⭐⭐⭐
+
+Date:
+Today
+Week
+Month
+All
+
+
+---
+
+9. Memory Cards
+
+Example:
+
+👤 User Preference
+
+Prefers concise answers in Hinglish
+
+Personal
+
+Each card:
+
+Tap:
+
+Open detail:
+
+Memory Details
+
+Created:
+28 May 2025
+
+Source:
+Chat
+
+Confidence:
+96%
+
+Used:
+42 times
+
+
+---
+
+Long Press:
+
+Options:
+
+Edit
+Delete
+Pin
+Export
+Forget
+
+
+---
+
+10. Three Dots Menu ⋮
+
+Every memory card me:
+
+⋮
+
+⭐ Important
+✏ Edit
+📌 Pin
+📤 Export
+🗑 Delete
+
+
+---
+
+11. Add Memory Button ➕
+
+Purpose:
+
+Manually memory create karna.
+
+Open:
+
+Add Memory
+
+Category:
+Personal ▼
+
+Title:
+________
+
+Content:
+________
+
+Importance:
+⭐⭐⭐⭐⭐
+
+Save
+
+
+---
+
+12. Bottom Navigation
+
+🏠 Home
+
+AI Orb main screen
+
+
+---
+
+💬 Chat
+
+Normal conversation
+
+
+---
+
+🌐 Center Orb
+
+Quick AI activation:
+
+Single tap:
+
+Start listening
+
+Long press:
+
+Voice assistant mode
+
+Double tap:
+
+Emergency command mode
+
+
+---
+
+📊 Dashboard
+
+System analytics
+
+
+---
+
+🧠 Memory
+
+Current screen
+
+
+---
+
+13. Memory AI Automation
+
+Background me VYRX automatically:
+
+New conversation ke baad:
+
+Analyzing conversation...
+
+Important information found
+
+Save memory?
+
+
+---
+
+Error solve hone ke baad:
+
+Experience saved:
+
+"Gradle Kotlin compile error fixed"
+
+
+---
+
+User correction:
+
+User:
+
+> "Mujhe short answer pasand nahi"
+
+
+
+AI:
+
+Preference updated
+
+
+---
+
+14. Memory Safety Controls
+
+Settings me:
+
+Memory Permission
+
+Auto Save:
+ON/OFF
+
+Ask Before Saving:
+ON/OFF
+
+Clear Memory:
+Delete All
+
+
+---
+
+Overall flow:
+
+Conversation
+      ↓
+AI Analysis
+      ↓
+Important Data Detection
+      ↓
+Memory Classification
+
+Personal
+Experience
+Knowledge
+
+      ↓
+Vector Database
+      ↓
+Future Responses Better

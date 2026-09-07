@@ -1,0 +1,609 @@
+Ye screen VYRX ke AI Brain connections manager ki tarah kaam karegi — yaha se user different AI models connect, switch, monitor aur secure karega.
+
+
+---
+
+🔌 API Providers Screen Purpose
+
+VYRX ek single AI model par dependent nahi rahega.
+
+Architecture:
+
+User Request
+      ↓
+VYRX AI Router
+      ↓
+Available Provider Check
+      ↓
+Best AI Model Select
+      ↓
+Response
+
+Example:
+
+Groq slow ho gaya:
+
+Groq ❌
+      ↓
+Gemini ✅
+      ↓
+Continue response
+
+
+---
+
+1. Top Left ☰ Hamburger Menu
+
+Function: Main Navigation
+
+Tap:
+
+VYRX
+
+🏠 Home
+💬 Chat
+🧠 Memory
+📊 Dashboard
+🛠 Tools
+⚙ Settings
+🔌 API Providers
+
+Use:
+
+Modules change karna
+
+App navigation
+
+
+
+---
+
+2. Top Center 🔗 API PROVIDERS
+
+API PROVIDERS
+
+Manage AI Models & API Connections
+
+Purpose:
+
+Current screen identify karna.
+
+
+---
+
+3. Top Right 🔍 Search Icon
+
+Function: Provider Search
+
+Example:
+
+Search:
+
+Gemini
+
+Result:
+
+✓ Gemini API
+
+Search:
+
+Custom
+
+Result:
+
+✓ Custom Endpoint
+
+
+---
+
+4. Top Right 🎚️ Filter Icon
+
+Provider Filter
+
+Options:
+
+Filter Providers
+
+Status:
+
+✓ Active
+✓ Configured
+✓ Not Configured
+
+Type:
+
+Cloud AI
+Custom API
+Local Model
+
+
+---
+
+5. AI Engine Status Card ☁️
+
+Top banner:
+
+AI ENGINE STATUS
+
+🟢 Online
+
+Hybrid Multi Provider
+Auto Failover Enabled
+
+Function:
+
+VYRX ke AI routing ka status.
+
+Tap:
+
+Open:
+
+AI Engine Monitor
+
+Current Provider:
+Groq
+
+Backup:
+Gemini
+
+Failover:
+ON
+
+Health:
+98%
+
+
+---
+
+6. Groq Provider Card 🟢
+
+Example:
+
+Groq
+
+Active
+
+Mixtral 8x7B
+
+Shows:
+
+Status
+
+🟢 Active
+
+Meaning: Currently VYRX isi model se response le raha hai.
+
+
+---
+
+Latency
+
+320ms
+
+Response speed.
+
+
+---
+
+Usage
+
+2847 requests
+
+Kitni baar use hua.
+
+
+---
+
+Success Rate
+
+99.2%
+
+Reliability.
+
+
+---
+
+Toggle Switch
+
+ON:
+
+AI can use Groq
+
+OFF:
+
+Disable Groq
+
+
+---
+
+Arrow >
+
+Open details:
+
+Groq Settings
+
+Model:
+Mixtral 8x7B
+
+API Key:
+************
+
+Usage Limit
+
+Remove Key
+
+
+---
+
+7. Gemini API Card 🔵
+
+Default:
+
+Not Configured
+
+Purpose:
+
+Google Gemini connect karna.
+
+Tap:
+
+Add API Key
+
+Open:
+
+Gemini Setup
+
+Paste API Key
+
+Test Connection
+
+Save
+
+
+---
+
+8. OpenAI API Card 🟢
+
+Purpose:
+
+OpenAI models connect karna.
+
+Example:
+
+GPT-4o
+GPT-4.1
+
+Setup:
+
+Add API Key
+↓
+Verify
+↓
+Activate
+
+
+---
+
+9. Custom API Card </>
+
+Purpose:
+
+External AI servers connect karna.
+
+Examples:
+
+Self Hosted Model
+
+Ollama Server
+
+Private Endpoint
+
+Company API
+
+Tap:
+
+Custom API Setup
+
+Endpoint URL
+
+API Key
+
+Model Name
+
+Headers
+
+Save
+
+
+---
+
+10. Provider Toggle System
+
+Har provider ke liye:
+
+ON
+
+Available for AI Router
+
+OFF
+
+Ignored by AI Router
+
+Example:
+
+Groq     ON
+Gemini   ON
+OpenAI   OFF
+Custom   OFF
+
+
+---
+
+11. Manage API Keys 🔑
+
+Important button.
+
+Open:
+
+API KEY MANAGER
+
+Features:
+
+Groq
+**************
+
+Gemini
+**************
+
+OpenAI
+**************
+
+Custom
+**************
+
+Actions:
+
++ Add Key
+
+Edit
+
+Delete
+
+Test
+
+
+---
+
+12. API Key Security 🔐
+
+Keys kaha save hongi:
+
+Android Keystore
+        +
+Encrypted Storage
+
+Never:
+
+❌ Plain text file
+❌ Database readable
+❌ Chat storage
+
+
+---
+
+13. Security Features Cards
+
+🛡 Secure Storage
+
+Function:
+
+API keys encryption.
+
+
+---
+
+🔄 Auto Failover
+
+Function:
+
+Automatic provider switching.
+
+Example:
+
+Groq Error
+
+↓
+Check Gemini
+
+↓
+Switch
+
+
+---
+
+📊 Usage Monitoring
+
+Track:
+
+Requests
+Tokens
+Latency
+Errors
+
+
+---
+
+🔒 Privacy First
+
+Meaning:
+
+Keys stay on device
+
+
+---
+
+14. Provider Detail Screen
+
+Example Groq open karne par:
+
+GROQ CONFIGURATION
+
+Status:
+Active
+
+Model:
+Mixtral 8x7B
+
+API Key:
+********
+
+Requests Today:
+245
+
+Average Speed:
+400ms
+
+
+[ Test Connection ]
+
+[ Remove Provider ]
+
+
+---
+
+15. Add New Provider Flow
+
+User:
+
+"Gemini add karna hai"
+
+Flow:
+
+API Providers
+
+↓
+Gemini
+
+↓
+Add API Key
+
+↓
+Validate Key
+
+↓
+Encrypt Storage
+
+↓
+Activate
+
+↓
+AI Router Update
+
+
+---
+
+16. Bottom Navigation
+
+🏠 Home
+
+AI Orb screen
+
+
+---
+
+💬 Chat
+
+Conversation
+
+
+---
+
+🌐 Center Orb
+
+Quick AI activation:
+
+Single tap:
+
+Listening...
+
+Long press:
+
+Voice Mode
+
+
+---
+
+📊 Dashboard
+
+Analytics
+
+
+---
+
+🧠 Memory
+
+AI knowledge
+
+
+---
+
+17. Real AGI Example
+
+User:
+
+> "Explain this code"
+
+
+
+VYRX:
+
+Request Received
+
+↓
+Router checks providers
+
+↓
+Groq Available
+
+↓
+Send request
+
+↓
+Response received
+
+↓
+Save experience (optional)
+
+Agar:
+
+Groq timeout
+
+Then:
+
+Action Log:
+
+⚠ Groq unavailable
+
+🔄 Switching to Gemini
+
+✓ Response ready
+
+
+---
+
+Final Architecture:
+
+API Providers UI
+        |
+        ↓
+Provider Manager
+        |
+        ↓
+AI Router
+        |
+ ----------------
+ |      |       |
+Groq Gemini OpenAI
+ |
+Response
+

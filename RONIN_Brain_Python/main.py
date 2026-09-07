@@ -1,0 +1,222 @@
+from __future__ import annotations
+import asyncio
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Literal
+import json
+import uuid
+import traceback
+import sys
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from core.router import route_request
+from core.llm_handler import SYSTEM_PROMPT, complete, LLMError
+from core.system_updater import safe_hot_reload
+from core.tool_registry import execute_tool, get_available_tools
+from memory.db_manager import initialize_database, recent_history, save_conversation, store_fact
+from tools.system_control import AndroidCommand, command_for_request
+from tools.web_search import search
+
+class ProviderRequest(BaseModel):
+    provider: Literal["openai", "gemini", "groq", "openrouter", "custom"]
+    api_key: str = Field(min_length=1, max_length=1024)
+    endpoint: str | None = Field(default=None, max_length=2048)
+    model: str | None = Field(default=None, max_length=256)
+
+class AskRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=8000)
+    session_id: str = Field(default="default", min_length=1, max_length=128)
+    providers: list[ProviderRequest] = Field(default_factory=list, max_length=10)
+
+class UpdateProposal(BaseModel):
+    proposal_id: str
+    file_path: str
+    module_name: str
+    new_code: str
+    summary: str
+
+class AskResponse(BaseModel):
+    response: str
+    route: Literal["android_command", "web_search", "local_tool", "llm", "tool_creation"]
+    command: AndroidCommand | None = None
+    update_proposal: UpdateProposal | None = None
+    error: str | None = None
+
+class ApprovalRequest(BaseModel):
+    approved: bool
+    proposal: UpdateProposal
+
+class ApprovalResponse(BaseModel):
+    accepted: bool
+    success: bool
+    message: str
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    await initialize_database(); yield
+
+app = FastAPI(title="RONIN Brain", version="1.0.0", lifespan=lifespan)
+
+SETTINGS_PATH = Path(__file__).resolve().parent / "config" / "settings.json"
+
+
+def _runtime_settings() -> dict:
+    defaults = {"tool_execution_mode": "full", "developer_mode": True, "allow_dynamic_tools": True}
+    try:
+        values = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        return {**defaults, **values} if isinstance(values, dict) else defaults
+    except (OSError, json.JSONDecodeError):
+        return defaults
+
+
+def _tool_execution_enabled(settings: dict) -> bool:
+    mode = str(settings.get("tool_execution_mode", "full")).strip().lower()
+    return bool(settings.get("developer_mode", True)) and bool(settings.get("allow_dynamic_tools", True)) and mode not in {"disabled", "off", "none"}
+
+
+def _conversation_messages(message: str, history: list[dict[str, str]]) -> list[dict[str, object]]:
+    messages: list[dict[str, object]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for item in history:
+        messages.extend((
+            {"role": "user", "content": item["user_message"]},
+            {"role": "assistant", "content": item["assistant_response"]},
+        ))
+    messages.append({"role": "user", "content": message})
+    return messages
+
+
+def _assistant_message(completion: dict) -> dict:
+    choices = completion.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return {"role": "assistant", "content": "No response generated."}
+    message = choices[0].get("message")
+    return message if isinstance(message, dict) else {"role": "assistant", "content": "No response generated."}
+
+
+def _response_text(message: dict) -> str:
+    content = message.get("content")
+    if content is None:
+        return "No response generated."
+    return content if isinstance(content, str) else json.dumps(content, ensure_ascii=False, default=str)
+
+@app.get("/health")
+async def health() -> dict: return {"status": "ok"}
+
+@app.post("/ask_ronin", response_model=AskResponse)
+async def ask_ronin(request: AskRequest) -> AskResponse:
+    decision = route_request(request.message)
+    command = command_for_request(request.message)
+    try:
+        if decision.route == "android_command":
+            response = f"Approved Android command prepared: {command.action}."
+            result = AskResponse(response=response, route=decision.route, command=command)
+            
+        elif decision.route == "web_search":
+            query = request.message.split(" ", 2)[-1]
+            data = search(query)
+            response = "\n".join(f"{x['title']}: {x['snippet']}" for x in data["results"]) or "No web results were returned."
+            result = AskResponse(response=response, route=decision.route)
+            
+        elif decision.route == "local_tool":
+            fact = request.message.split(" ", 1)[-1]
+            await store_fact(fact[:120].lower(), fact)
+            result = AskResponse(response="Stored in persistent memory.", route=decision.route)
+            
+        # --- THE DEVELOPER AGENT: SELF CODING LOGIC ---
+        elif decision.route == "tool_creation":
+            tool_creation_system_prompt = (
+                "You generate a single Python tool file for RONIN. "
+                "Return only complete, valid raw Python source code for exactly one file. "
+                "Do not use Markdown or code fences. Do not include explanations, tutorials, or prose. "
+                "CRITICAL RULE: Write simple standalone Python functions (def). DO NOT create classes, BaseModels, or use fake AI tool frameworks. "
+                "DO NOT import non-existent modules like 'rpn_tools'. Use only standard Python libraries and 'requests'. "
+                "The entire response must compile as the requested Python tool."
+            )
+            
+            generated_response = complete(
+                request.message,
+                [],
+                [provider.model_dump() for provider in request.providers],
+                system_prompt=tool_creation_system_prompt,
+            )
+            generated_code = _response_text(_assistant_message(generated_response))
+            
+            # 3. Clean up the code (remove markdown if the LLM ignored instructions)
+            cleaned_code = generated_code.replace("```python", "").replace("```", "").strip()
+            
+            prop_id = str(uuid.uuid4())[:8]
+            module_name = f"tools.dynamic_{prop_id}"
+            
+            tools_dir = Path(__file__).resolve().parent / "tools"
+            file_path = str(tools_dir / f"dynamic_{prop_id}.py")
+            
+            proposal = UpdateProposal(
+                proposal_id=prop_id,
+                file_path=file_path,
+                module_name=module_name,
+                new_code=cleaned_code,
+                summary=f"Generated a new tool for: {request.message}"
+            )
+            
+            response_text = "Boss, maine is tool ka Python code likh liya hai. Please screen par review aur approve kijiye."
+            result = AskResponse(response=response_text, route=decision.route, update_proposal=proposal)
+            
+        else:
+            history = await recent_history(request.session_id)
+            provider_payload = [provider.model_dump() for provider in request.providers]
+            settings = _runtime_settings()
+            available_tools = get_available_tools() if _tool_execution_enabled(settings) else []
+            completion = complete(request.message, history, provider_payload, tools=available_tools)
+            assistant_message = _assistant_message(completion)
+
+            if available_tools and assistant_message.get("tool_calls"):
+                messages = _conversation_messages(request.message, history)
+                while assistant_message.get("tool_calls"):
+                    messages.append(assistant_message)
+                    for tool_call in assistant_message["tool_calls"]:
+                        function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+                        tool_name = function.get("name", "")
+                        arguments = function.get("arguments", "{}")
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.get("id", "") if isinstance(tool_call, dict) else "",
+                            "name": tool_name,
+                            "content": execute_tool(tool_name, arguments),
+                        })
+                    
+                    # GROQ RATE LIMIT BYPASS: 2 second ka pause
+                    await asyncio.sleep(2)
+                    
+                    completion = complete(
+                        "",
+                        [],
+                        provider_payload,
+                        tools=available_tools,
+                        messages=messages,
+                    )
+
+                    assistant_message = _assistant_message(completion)
+
+            result = AskResponse(response=_response_text(assistant_message), route=decision.route)
+            
+        await save_conversation(request.session_id, request.message, result.response)
+        return result
+        
+    except Exception as exc:
+        # SILENT FAIL KO FIX KIYA: Ab asli error Termux me print hoga!
+        print(f"\n[🔥 RONIN CRITICAL ERROR]:\n{traceback.format_exc()}\n", file=sys.stderr)
+        return AskResponse(response="RONIN could not complete that request.", route=decision.route, error=str(exc))
+
+@app.post("/approve_update", response_model=ApprovalResponse)
+async def approve_update(request: ApprovalRequest) -> ApprovalResponse:
+    if not request.approved:
+        return ApprovalResponse(accepted=False, success=False, message="Update rejected; no source files changed.")
+    workspace = Path(__file__).resolve().parent
+    target = Path(request.proposal.file_path).resolve()
+    if workspace not in target.parents:
+        raise HTTPException(400, "Update target must remain inside RONIN_Brain_Python")
+    
+    outcome = safe_hot_reload(request.proposal.module_name, str(target), request.proposal.new_code)
+    # Safe fallback dictionary check
+    is_success = outcome.get("success") == True or outcome.get("status") == "success"
+    return ApprovalResponse(accepted=True, success=is_success, message=outcome.get("error") or outcome.get("message") or "Update applied safely.")

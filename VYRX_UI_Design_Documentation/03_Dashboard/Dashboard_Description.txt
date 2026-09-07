@@ -1,0 +1,535 @@
+ye sirf stats page nahi hoga, balki AI ka control room / system observatory hoga. 📊🧠
+
+📊 Dashboard Purpose
+
+Dashboard user ko batayega:
+
+AI abhi kya kar raha hai
+
+System health kaisi hai
+
+Kitne tasks complete hue
+
+Kaun se tools use hue
+
+Memory learning status
+
+Automation history
+
+
+
+---
+
+1. Top Left ☰ Hamburger Menu
+
+Function: Global Navigation
+
+Same drawer open karega:
+
+VYRX
+
+🏠 Home
+💬 Chat
+🧠 Memory
+📊 Dashboard
+🛠 Tools
+⚙ Settings
+🔌 API Providers
+🔐 Security
+
+Use:
+
+Modules change karna
+
+App navigation
+
+
+
+---
+
+2. Top Center 📊 Dashboard Title
+
+DASHBOARD
+System Overview & Analytics
+
+Purpose:
+
+Current screen identify karna
+
+
+
+---
+
+3. Top Right 🔄 Refresh Icon
+
+Function: Live Data Update
+
+Tap:
+
+Updating...
+
+✓ Memory synced
+✓ CPU refreshed
+✓ API status checked
+✓ Tasks updated
+
+Use:
+
+Latest system information fetch karna
+
+
+
+---
+
+4. Top Right 🎚️ Control Icon
+
+Dashboard Filters
+
+Open:
+
+Dashboard Settings
+
+Time Range:
+○ Today
+○ Week
+○ Month
+
+Show:
+✓ AI Stats
+✓ Device Stats
+✓ Automation
+✓ Learning
+
+
+---
+
+5. AI State Card 🌐
+
+Top ka main card:
+
+AI STATE
+
+🟣 Thinking
+
+Processing API request...
+
+Active Model:
+Groq Mixtral 8x7B
+
+Response Speed:
+1.2s
+
+Function:
+
+Real-time AI status.
+
+States:
+
+🔵 Listening
+
+Waiting for command
+
+🟣 Thinking
+
+Processing request
+
+🟢 Executing
+
+Running device action
+
+🟠 Learning
+
+Saving memory
+
+
+---
+
+6. System Health Section ⚡
+
+🧠 Memory Usage Card
+
+Example:
+
+64%
+RAM
+
+Tap:
+
+Open:
+
+Memory Details
+
+RAM Usage
+Database Size
+Cache
+Vector Storage
+
+
+---
+
+💾 Storage Card
+
+Shows:
+
+7.8 GB / 16 GB
+
+Tap:
+
+Storage
+
+App Data
+Memory DB
+Logs
+Cache
+
+
+---
+
+CPU Load Card
+
+Shows:
+
+CPU 28%
+
+Stable
+
+Tap:
+
+Detailed:
+
+CPU Usage
+
+AI Processing
+Background Tasks
+Idle
+
+
+---
+
+🔌 API Status Card
+
+Shows:
+
+Groq API
+
+● Active
+
+Tap:
+
+API Monitor
+
+Current:
+Groq
+
+Latency:
+320ms
+
+Requests:
+124 today
+
+Errors:
+0
+
+
+---
+
+7. Today's Activity Cards 📈
+
+✅ Tasks Completed
+
+Example:
+
+23 Tasks Completed
+
+Shows:
+
+Commands executed
+
+Automations done
+
+
+
+---
+
+⚡ Auto Tasks
+
+Example:
+
+12 Auto Tasks
+
+AI initiated actions:
+
+Example:
+
+Scheduled reminder
+
+Background sync
+
+
+
+---
+
+📚 Things Learned
+
+Example:
+
+5 Learned
+
+Memory updates count.
+
+
+---
+
+🎤 Voice Commands
+
+Example:
+
+42 Commands
+
+Voice usage statistics.
+
+
+---
+
+📱 Apps Opened
+
+Example:
+
+18 Apps
+
+Device automation count.
+
+
+---
+
+🌐 Web Searches
+
+Example:
+
+7 Searches
+
+AI research activity.
+
+
+---
+
+8. Tasks Over Time Graph 📊
+
+Purpose:
+
+AI productivity history.
+
+Example:
+
+Last 7 Days
+
+Thu ███
+Fri ████
+Sat ██████
+Today ███████
+
+Tap:
+
+Full analytics:
+
+Daily
+Weekly
+Monthly
+Yearly
+
+
+---
+
+9. Top Tools Used 🛠
+
+Shows AI ke most used tools:
+
+Example:
+
+Web Search       28%
+
+App Control      22%
+
+Code Executor    18%
+
+File Manager     15%
+
+Notes            9%
+
+Tap:
+
+Tool analytics:
+
+Tool History
+
+When used
+How many times
+Success rate
+
+
+---
+
+10. Recent Automations 🤖
+
+Shows background actions:
+
+Example:
+
+✓ Opened YouTube
+03:45 AM
+
+✓ Sent Telegram message
+03:32 AM
+
+✓ Created Reminder
+03:10 AM
+
+Tap:
+
+Complete history:
+
+Automation Logs
+
+Successful
+Failed
+Pending
+
+
+---
+
+11. Learning Status 🟠
+
+AI learning monitor:
+
+Example:
+
+Learning in progress...
+
+Saving new information
+
+72%
+
+Shows:
+
+Memory processing
+
+Knowledge extraction
+
+Experience saving
+
+
+Tap:
+
+Learning Queue
+
+New memories:
+5
+
+Processing:
+2
+
+Completed:
+34
+
+
+---
+
+12. Bottom Navigation
+
+🏠 Home
+
+Main AI Orb screen.
+
+
+---
+
+💬 Chat
+
+Conversation interface.
+
+
+---
+
+🌐 Center Orb Button
+
+Quick AI activation.
+
+Single Tap:
+
+Listening...
+
+Long Press:
+
+Voice Mode Started
+
+Double Tap:
+
+Emergency Assistant
+
+
+---
+
+📊 Dashboard
+
+Current screen.
+
+
+---
+
+🧠 Memory
+
+AI brain storage.
+
+
+---
+
+13. Hidden AGI Features
+
+Dashboard background me:
+
+Live Monitoring:
+
+AI thinking...
+↓
+Tool execution...
+↓
+Task complete...
+↓
+Memory update...
+
+Example:
+
+User:
+
+"Open YouTube and find AI news"
+
+Dashboard:
+
+Thinking 🟣
+
+Searching web
+
+Executing app command 🟢
+
+Saving preference 🟠
+
+Completed ✓
+
+
+---
+
+Complete Dashboard Flow:
+
+User Command
+      ↓
+AI Brain
+      ↓
+Planner
+      ↓
+Tools
+      ↓
+Execution
+      ↓
+Analytics Update
+      ↓
+Memory Update

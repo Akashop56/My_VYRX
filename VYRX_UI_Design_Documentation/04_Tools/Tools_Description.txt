@@ -1,0 +1,614 @@
+Ye screen VYRX ke "hands & abilities manager" ki tarah kaam karegi — yaha se AI ke saare tools enable, disable aur configure honge.
+
+
+---
+
+🛠️ Tools Screen Purpose
+
+VYRX ke paas AI Brain hai, lekin tools uske actions perform karne ki capability hain.
+
+Example:
+
+User:
+
+> "YouTube open karo"
+
+
+
+Flow:
+
+AI Brain
+   ↓
+Tool Router
+   ↓
+App Control Tool
+   ↓
+YouTube Launch
+
+
+---
+
+1. Top Left ☰ Hamburger Menu
+
+Function: Main Navigation Drawer
+
+Tap:
+
+VYRX
+
+🏠 Home
+💬 Chat
+🧠 Memory
+📊 Dashboard
+🛠 Tools  ← Current
+⚙ Settings
+🔌 API Providers
+🔐 Security
+
+Use:
+
+Different modules switch karna
+
+AI system management
+
+
+
+---
+
+2. Top Center 🛠️ Tools Title
+
+TOOLS
+AI Agent Tool Kit
+
+Purpose:
+
+Batata hai ki user AI capabilities manage kar raha hai.
+
+
+---
+
+3. Top Right 🔍 Search Icon
+
+Function: Tool Search
+
+Example:
+
+User search:
+
+camera
+
+Result:
+
+📷 Camera Control
+📸 Image Analyzer
+
+Search:
+
+Tool name
+
+Category
+
+Description
+
+
+
+---
+
+4. Top Right 🎚️ Filter Icon
+
+Tool Filter & Sorting
+
+Open:
+
+Tool Filter
+
+Category:
+
+✓ Device
+✓ Internet
+✓ Automation
+✓ Development
+
+Status:
+
+✓ Active
+✓ Disabled
+
+Sort:
+
+Most Used
+Recently Added
+
+
+---
+
+5. Tool Category Tabs
+
+🌐 All Tools
+
+Sab tools show.
+
+
+---
+
+📱 Device
+
+Phone control tools:
+
+App Control
+Battery Monitor
+File Access
+Notification Control
+
+
+---
+
+🌍 Internet
+
+Online tools:
+
+Web Search
+API Request
+Cloud Services
+Information Retrieval
+
+
+---
+
+⚡ Automation
+
+Background actions:
+
+Task Scheduler
+Workflow Runner
+Reminders
+Triggers
+
+
+---
+
+</> Development
+
+Developer tools:
+
+Code Executor
+Terminal
+Git Tools
+Debug Assistant
+
+
+---
+
+6. Tool Status Card
+
+Top summary:
+
+TOOLS STATUS
+
+12/12 Available
+
+● All Systems Online
+
+Function:
+
+AI tool availability check.
+
+Tap:
+
+Open:
+
+System Check
+
+✓ App Control
+✓ Web Search
+✓ File Manager
+✓ Code Runner
+
+Last Check:
+03:47 AM
+
+
+---
+
+7. Tool Usage Today Card
+
+Shows:
+
+8 Tools Used
+
+67% Success Rate
+
+Tap:
+
+Analytics:
+
+Today:
+
+Web Search
+24 times
+
+App Control
+18 times
+
+Automation
+7 times
+
+
+---
+
+8. Core Tools Section
+
+📱 App Control
+
+Purpose:
+
+Phone applications control.
+
+Functions:
+
+Open App
+Close App
+Launch Intent
+Check Installed Apps
+
+Example:
+
+Command:
+
+"Open Telegram"
+
+Tool:
+
+App Control
+↓
+Telegram Launch
+
+
+---
+
+🌐 Web Search
+
+Purpose:
+
+Internet research.
+
+Functions:
+
+Search Web
+Read Results
+Summarize Information
+
+Example:
+
+"Find latest AI news"
+
+
+---
+
+</> Code Executor
+
+Purpose:
+
+Code execution.
+
+Supports:
+
+Python
+Shell
+Scripts
+
+Example:
+
+User:
+
+"Calculate this"
+
+AI:
+
+Runs code → returns result.
+
+
+---
+
+📁 File Manager
+
+Purpose:
+
+File handling.
+
+Functions:
+
+Read File
+Create File
+Move File
+Search Files
+Organize Data
+
+
+---
+
+⚡ Task Automation
+
+Purpose:
+
+Repeat tasks automatically.
+
+Examples:
+
+Every morning:
+Check weather
+
+At 6 PM:
+Reminder
+
+Weekly:
+Backup files
+
+
+---
+
+🔔 Notification Manager
+
+Purpose:
+
+Phone notifications.
+
+Functions:
+
+Create Notification
+Read Alerts
+Manage Reminders
+
+
+---
+
+9. Communication Tools
+
+✈️ Telegram Integration
+
+Functions:
+
+Send Message
+Read Chat
+Manage Telegram Actions
+
+Example:
+
+"Send message to John"
+
+
+---
+
+✉️ Email Manager
+
+Functions:
+
+Read Email
+Send Email
+Search Inbox
+Draft Reply
+
+Supports:
+
+Gmail
+
+Custom email API
+
+
+
+---
+
+10. Advanced Tools
+
+📈 System Monitor
+
+Phone health:
+
+Battery
+CPU
+RAM
+Storage
+Network
+
+Dashboard se connected.
+
+
+---
+
+☁️ Custom API
+
+Purpose:
+
+External services connect karna.
+
+Example:
+
+Custom AI Model
+Private API
+Company Service
+
+Toggle:
+
+OFF → Disabled
+
+ON → Available for AI
+
+
+---
+
+11. Tool Card Controls
+
+Har tool ke card me:
+
+▶ Arrow Icon
+
+Open detailed settings.
+
+Example:
+
+App Control →
+
+Permissions
+
+Accessibility:
+ON
+
+Allowed Apps:
+25
+
+
+---
+
+🟢 Active Badge
+
+Meaning:
+
+Tool ready hai.
+
+
+---
+
+Toggle Switch
+
+Enable/Disable:
+
+ON:
+
+AI can use this tool
+
+OFF:
+
+AI cannot access
+
+
+---
+
+12. Tool Detail Page
+
+Example:
+
+App Control open:
+
+APP CONTROL
+
+Status:
+Active
+
+Permission:
+Granted
+
+Usage:
+124 times
+
+Success:
+98%
+
+Settings:
+
+✓ Allow Background Use
+✓ Confirm Before Action
+
+
+---
+
+13. Bottom Navigation
+
+🏠 Home
+
+AI main interface.
+
+
+---
+
+💬 Chat
+
+Conversation.
+
+
+---
+
+🌐 Center Orb
+
+Quick AI activation.
+
+Single tap:
+
+Listening...
+
+Long press:
+
+Voice Mode
+
+Double tap:
+
+Emergency Assistant
+
+
+---
+
+📊 Dashboard
+
+Analytics.
+
+
+---
+
+🧠 Memory
+
+AI brain.
+
+
+---
+
+14. Real AGI Workflow Example
+
+User:
+
+> "Meri battery 20% se niche ho to notification dena aur Telegram pe message bhejna"
+
+
+
+VYRX:
+
+Thinking 🟣
+
+↓
+Task Automation Tool
+
+↓
+System Monitor Tool
+
+↓
+Notification Manager
+
+↓
+Telegram Integration
+
+↓
+Memory Save 🟠
+
+Done ✓
+
+
+---
+
+15. Security Layer
+
+Tools ke liye permissions:
+
+Tool Permission
+
+Camera:
+Ask First
+
+Files:
+Allowed
+
+Messages:
+Confirm
+
+Automation:
+Allowed
+
+
+---

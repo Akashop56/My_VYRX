@@ -1,0 +1,16 @@
+from __future__ import annotations
+from typing import Literal
+from pydantic import BaseModel
+from tools.system_control import command_for_request
+
+Route = Literal["android_command", "web_search", "local_tool", "llm"]
+class RouteDecision(BaseModel):
+    route: Route
+    reason: str
+
+def route_request(message: str) -> RouteDecision:
+    value = message.strip().lower()
+    if command_for_request(message): return RouteDecision(route="android_command", reason="matches explicit allowlisted Android command")
+    if value.startswith(("search web ", "web search ", "look up ")): return RouteDecision(route="web_search", reason="explicit web-search request")
+    if value.startswith(("remember ", "save fact ")): return RouteDecision(route="local_tool", reason="persistent-memory request")
+    return RouteDecision(route="llm", reason="general reasoning request")
