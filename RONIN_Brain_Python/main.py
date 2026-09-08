@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 # VYRX core modules
@@ -494,6 +494,111 @@ async def api_feedback(req: FeedbackRequest) -> dict:
         text += f" — {req.comment}"
     ACTION_LOG.log(text, "info")
     return {"ok": True}
+
+
+# --- Live status dashboard (additive — for previewing the Brain in a browser) --
+
+_STATUS_HTML = """<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VYRX Brain — Live Status</title>
+<style>
+:root{--bg:#05060A;--card:#0E1118;--stroke:#1E2635;--txt:#E8EAF0;--dim:#8A93A6;--faint:#5A6478;
+--purple:#8B5CF6;--purple2:#A78BFA;--blue:#38BDF8;--green:#4ADE80;--amber:#FBBF24;--red:#F87171;--log:#34D399}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font:14px/1.5 ui-sans-serif,system-ui,sans-serif;padding:28px 20px 48px}
+.wrap{max-width:980px;margin:0 auto}
+header{display:flex;align-items:center;gap:14px;margin-bottom:20px}
+.mark{width:46px;height:46px;border-radius:14px;background:radial-gradient(circle at 35% 30%,var(--purple2),var(--purple) 55%,#4C3A85);box-shadow:0 0 24px rgba(139,92,246,.45)}
+h1{font-size:20px;letter-spacing:3px}
+.sub{color:var(--dim);font-size:12px}
+.dot{margin-left:auto;display:flex;align-items:center;gap:7px;color:var(--dim);font-size:12px}
+.dot i{width:9px;height:9px;border-radius:50%;background:var(--red);box-shadow:0 0 10px var(--red)}
+.dot.on i{background:var(--green);box-shadow:0 0 10px var(--green)}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:760px){.grid{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--stroke);border-radius:20px;padding:18px}
+.card h2{font-size:10px;letter-spacing:1.6px;color:var(--dim);text-transform:uppercase;margin-bottom:12px}
+.state{display:flex;gap:14px;align-items:center}
+.orb{width:64px;height:64px;border-radius:50%;flex:none;animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.07)}}
+.state .name{font-size:17px;font-weight:700}
+.state .msg{color:var(--dim);font-size:12px;margin-top:3px}
+.kv{margin-top:12px;display:flex;justify-content:space-between;font-size:12px;color:var(--dim)}
+.kv b{color:var(--purple2);font-weight:600}
+.bar{height:7px;border-radius:4px;background:#161D2A;overflow:hidden;margin-top:6px}
+.bar i{display:block;height:100%;border-radius:4px;background:linear-gradient(90deg,var(--green),var(--blue))}
+.metric{margin-top:10px}
+.metric .row{display:flex;justify-content:space-between;font-size:12px;color:var(--dim)}
+.metrics{grid-column:1/-1}
+.counters{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;grid-column:1/-1}
+.cnt{background:#0B0F17;border:1px solid var(--stroke);border-radius:14px;padding:12px;text-align:center}
+.cnt b{display:block;font-size:20px;color:var(--txt)}
+.cnt span{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:1px}
+#log{grid-column:1/-1;font:12px/1.7 ui-monospace,Menlo,Consolas,monospace;max-height:260px;overflow:auto}
+#log div{white-space:pre-wrap;word-break:break-word}
+#log .t{color:#3E9C6E}#log .success{color:var(--log)}#log .error{color:var(--red)}
+#log .tool{color:var(--blue)}#log .info{color:var(--log)}
+.off{color:var(--faint);font-size:12px}
+</style></head><body><div class="wrap">
+<header><div class="mark"></div><div><h1>VYRX BRAIN</h1><div class="sub" id="ver">v? • FastAPI • 127.0.0.1:8000</div></div>
+<div class="dot" id="pdot"><i></i><span id="ptxt">connecting…</span></div></header>
+<div class="grid">
+ <div class="card"><h2>AI State</h2><div class="state">
+   <div class="orb" id="orb" style="background:radial-gradient(circle at 35% 30%,#c4b5fd,#38BDF8 60%,#0b1e3a)"></div>
+   <div><div class="name" id="sname" style="color:var(--blue)">…</div><div class="msg" id="smsg">waking up…</div></div>
+ </div><div class="kv"><span>Active model</span><b id="smodel">—</b></div>
+ <div class="kv"><span>Response</span><b id="sms">—</b></div></div>
+ <div class="card metrics"><h2>System Health</h2>
+   <div class="metric"><div class="row"><span>CPU</span><span id="cpu">—</span></div><div class="bar"><i id="cpub" style="width:0%"></i></div></div>
+   <div class="metric"><div class="row"><span>Memory (RAM)</span><span id="ram">—</span></div><div class="bar"><i id="ramb" style="width:0%"></i></div></div>
+   <div class="metric"><div class="row"><span>Storage</span><span id="sto">—</span></div><div class="bar"><i id="stob" style="width:0%"></i></div></div>
+   <div class="kv"><span>Uptime</span><b id="up">—</b></div><div class="kv"><span>Python</span><b id="py">—</b></div></div>
+ <div class="card" style="grid-column:1/-1"><h2>Today's Activity</h2>
+   <div class="counters" id="cnt"></div></div>
+ <div class="card"><h2>Live Action Log <span style="color:var(--faint)">— SSE stream</span></h2><div id="log"><div class="off">waiting for events…</div></div></div>
+</div></div>
+<script>
+const ORB={idle:["#c4b5fd","#38BDF8","#0b1e3a","#38BDF8","Ready"],listening:["#bae6fd","#38BDF8","#0b1e3a","#38BDF8","Listening"],
+thinking:["#ddd6fe","#8B5CF6","#2a1a4a","#A78BFA","Thinking"],executing:["#bbf7d0","#4ADE80","#0a2e1a","#4ADE80","Executing"],
+learning:["#fde68a","#FBBF24","#3a2a08","#FBBF24","Learning"]};
+const $=id=>document.getElementById(id);
+async function j(u){try{const r=await fetch(u);return r.ok?r.json():null}catch(e){return null}}
+async function tick(){
+ const s=await j("/api/state"),h=await j("/api/health"),sum=await j("/api/summary");
+ const pdot=$("pdot");pdot.classList.toggle("on",!!s);$("ptxt").textContent=s?"online":"offline";
+ if(s){$("ver").textContent="v"+(s.version||"?")+" • FastAPI • 127.0.0.1:8000";
+  const c=ORB[s.state]||ORB.idle;$("orb").style.background="radial-gradient(circle at 35% 30%,"+c[0]+","+c[1]+" 60%,"+c[2]+")";
+  $("orb").style.boxShadow="0 0 34px "+c[1]+"66";$("sname").textContent=c[4];$("sname").style.color=c[3];
+  $("smsg").textContent=s.message||"";$("smodel").textContent=s.model||s.provider||"—";
+  $("sms").textContent=s.response_ms!=null?(s.response_ms/1000).toFixed(2)+" s":"—";}
+ if(h){$("cpu").textContent=Math.round(h.cpu_percent)+"%";$("cpub").style.width=h.cpu_percent+"%";
+  $("ram").textContent=Math.round(h.memory_percent)+"% ("+Math.round(h.memory_used_mb)+" MB)";$("ramb").style.width=h.memory_percent+"%";
+  const sp=h.storage_total_gb?h.storage_used_gb/h.storage_total_gb*100:0;
+  $("sto").textContent=h.storage_used_gb+" / "+h.storage_total_gb+" GB";$("stob").style.width=sp+"%";
+  const u=h.uptime_seconds;$("up").textContent=(u>=3600?Math.floor(u/3600)+"h ":"")+(Math.floor(u%3600/60))+"m "+(u%60)+"s";
+  $("py").textContent=h.python||"—";}
+ if(sum&&sum.today){const t=sum.today;
+  $("cnt").innerHTML=[["Tasks",t.tasks_completed],["Auto tasks",t.auto_tasks],["Learned",t.learned],
+   ["Voice",t.voice_commands],["Apps opened",t.apps_opened],["Web searches",t.web_searches]]
+   .map(x=>'<div class="cnt"><b>'+x[1]+'</b><span>'+x[0]+'</span></div>').join("");}
+}
+const logEl=$("log");
+function addLog(e){if(logEl.firstElementChild&&logEl.firstElementChild.className==="off")logEl.innerHTML="";
+ const d=document.createElement("div");
+ d.innerHTML='<span class="t">['+e.time+']</span> <span class="'+(e.level||"info")+'">'+e.text.replace(/</g,"&lt;")+'</span>';
+ logEl.appendChild(d);while(logEl.children.length>200)logEl.firstChild.remove();logEl.scrollTop=logEl.scrollHeight;}
+function es(){try{const s=new EventSource("/api/events");
+ s.addEventListener("hello",ev=>{const o=JSON.parse(ev.data);(o.logs||[]).forEach(addLog);});
+ s.addEventListener("log",ev=>addLog(JSON.parse(ev.data).log||{}));
+ s.onerror=()=>{s.close();setTimeout(es,5000);};}catch(e){setTimeout(es,5000);}}
+tick();setInterval(tick,5000);es();
+</script></body></html>"""
+
+
+@app.get("/", response_class=HTMLResponse)
+async def status_dashboard() -> HTMLResponse:
+    return HTMLResponse(_STATUS_HTML)
 
 
 if __name__ == "__main__":
