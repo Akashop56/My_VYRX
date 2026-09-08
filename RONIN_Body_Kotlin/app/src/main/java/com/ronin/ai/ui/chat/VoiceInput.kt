@@ -41,7 +41,7 @@ object VoiceInput {
         recognizer = rec
         isListening = true
         rec.setRecognitionListener(object : RecognitionListener {
-            override fun onReadyForSpeech(params: Map<String, ?>?) {}
+            override fun onReadyForSpeech(params: android.os.Bundle?) {}
             override fun onBeginningOfSpeech() {}
             override fun onRmsChanged(rmsdB: Float) {}
             override fun onBufferReceived(buffer: ByteArray?) {}
@@ -63,7 +63,7 @@ object VoiceInput {
                 if (text.isBlank()) onError("Nothing heard. Try again.") else onResult(text)
             }
             override fun onPartialResults(partialResults: android.os.Bundle?) {}
-            override fun onEvent(eventType: Int, params: Map<String, ?>?) {}
+            override fun onEvent(eventType: Int, params: android.os.Bundle?) {}
         })
         val intent = android.content.Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)

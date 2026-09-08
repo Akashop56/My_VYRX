@@ -48,7 +48,7 @@ fun AiOrb(state: OrbState, modifier: Modifier = Modifier) {
     val transition = rememberInfiniteTransition()
     val pulse by transition.animateFloat(
         initialValue = 0f, targetValue = 1f,
-        animationSpec = infiniteRepeatable(tween((1800 * speedFactor).toInt(), FastOutSlowInEasing), RepeatMode.Reverse)
+        animationSpec = infiniteRepeatable(tween((1800 * speedFactor).toInt(), easing = FastOutSlowInEasing), RepeatMode.Reverse)
     )
     val rotation by transition.animateFloat(
         initialValue = 0f, targetValue = 360f,
@@ -84,7 +84,7 @@ fun AiOrb(state: OrbState, modifier: Modifier = Modifier) {
         for (i in 0 until 46) {
             val shell = (i % 4)
             val angle = (i * 2.39996f) + (rotation * (0.5f + shell * 0.14f)).let { Math.toRadians(it.toDouble()).toFloat() }
-            val dist = radius * (0.42f + 0.52f * fract(sin(i * 12.9898) * 43758.5453f))
+            val dist = radius * (0.42f + 0.52f * fract(sin(i * 12.9898f) * 43758.5453f))
             val x = center.x + cos(angle) * dist
             val y = center.y + sin(angle) * dist * 0.94f
             val twinkle = 0.20f + 0.80f * fract(sin(i * 78.233f) * 43758.5453f + rotation / 40f)
@@ -135,13 +135,13 @@ fun HeartbeatOrb(state: OrbState, modifier: Modifier = Modifier, sizeDp: Int = 6
             val step = w / 24f
             for (i in 0 until 24) {
                 val x = i * step
-                val local = sin((i / 24f * 2f * Math.PI) + phase)
-                val spike = if (i in 10..13) sin((i - 10f) / 3f * Math.PI) * 0.42f else local * 0.08f
+                val local = sin((i / 24f * 2f * Math.PI.toFloat()) + phase)
+                val spike = if (i in 10..13) sin((i - 10f) / 3f * Math.PI.toFloat()) * 0.42f else local * 0.08f
                 val y = mid + spike * size.height * 0.35f
                 if (i > 0) {
                     val px = (i - 1) * step
-                    val pl = sin(((i - 1) / 24f * 2f * Math.PI) + phase)
-                    val pspike = if (i - 1 in 10..13) sin(((i - 1) - 10f) / 3f * Math.PI) * 0.42f else pl * 0.08f
+                    val pl = sin(((i - 1) / 24f * 2f * Math.PI.toFloat()) + phase)
+                    val pspike = if (i - 1 in 10..13) sin(((i - 1) - 10f) / 3f * Math.PI.toFloat()) * 0.42f else pl * 0.08f
                     val py = mid + pspike * size.height * 0.35f
                     drawLine(Color.White.copy(alpha = 0.85f), androidx.compose.ui.geometry.Offset(px, py), androidx.compose.ui.geometry.Offset(x, y), 2.2f)
                 }

@@ -1,0 +1,43 @@
+name: Android build
+
+on:
+  pull_request:
+    paths:
+      - 'RONIN_Body_Kotlin/**'
+      - '.github/workflows/android.yml'
+  push:
+    branches: [main, arena/01a07f24-my-vyrx]
+    paths:
+      - 'RONIN_Body_Kotlin/**'
+      - '.github/workflows/android.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Compile and assemble debug APK
+        working-directory: RONIN_Body_Kotlin
+        run: |
+          set -o pipefail
+          bash gradlew :app:assembleDebug --stacktrace 2>&1 | tee "$RUNNER_TEMP/android-build.log"
+      - name: Report build errors as annotations
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/android-build.log" ]; then
+            diagnostics=$(grep -E '^e: |^\* What went wrong|^> [^T]|^Execution failed|^Could not|^Inconsistent' "$RUNNER_TEMP/android-build.log" | head -80 || true)
+            diagnostics="${diagnostics//'%'/'%25'}"
+            diagnostics="${diagnostics//$'\n'/'%0A'}"
+            echo "::error::$diagnostics"
+          fi

@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Apps
@@ -266,7 +267,7 @@ fun ToolsScreen(
                             .background(Color(0xFF0C1018))
                             .border(1.dp, VyRxColors.CardStroke, RoundedCornerShape(14.dp))
                             .padding(start = 16.dp, end = 12.dp),
-                        contentAlignment = Alignment.CenterVertically
+                        contentAlignment = Alignment.CenterStart
                     ) {
                         androidx.compose.foundation.text.BasicTextField(
                             value = query,

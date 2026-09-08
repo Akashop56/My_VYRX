@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Refresh
@@ -357,8 +358,6 @@ fun DashboardScreen(onOpenDrawer: () -> Unit, onNavigate: (String) -> Unit) {
         }
     }
 }
-
-private fun rememberCoroutineScopeSafe() = androidx.compose.runtime.rememberCoroutineScope()
 
 @Composable
 private fun HealthMiniTile(modifier: Modifier = Modifier, content: @Composable () -> Unit) {

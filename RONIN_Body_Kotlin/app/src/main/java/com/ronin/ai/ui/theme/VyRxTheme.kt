@@ -95,13 +95,23 @@ fun VyRxTheme(
 ) {
     val accentColor = VyRxColors.accentColor(accent)
     val s = fontScale
+    val defaults = Typography()
     val typography = Typography(
-        defaultBody = 14f * s,
-        displaySmall = 24f * s, displayMedium = 28f * s, displayLarge = 34f * s,
-        headlineSmall = 20f * s, headlineMedium = 22f * s, headlineLarge = 26f * s,
-        titleSmall = 14f * s, titleMedium = 16f * s, titleLarge = 18f * s,
-        bodySmall = 11f * s, bodyMedium = 14f * s, bodyLarge = 15f * s,
-        labelSmall = 10f * s, labelMedium = 12f * s, labelLarge = 13f * s
+        displaySmall = defaults.displaySmall.copy(fontSize = (24f * s).sp),
+        displayMedium = defaults.displayMedium.copy(fontSize = (28f * s).sp),
+        displayLarge = defaults.displayLarge.copy(fontSize = (34f * s).sp),
+        headlineSmall = defaults.headlineSmall.copy(fontSize = (20f * s).sp),
+        headlineMedium = defaults.headlineMedium.copy(fontSize = (22f * s).sp),
+        headlineLarge = defaults.headlineLarge.copy(fontSize = (26f * s).sp),
+        titleSmall = defaults.titleSmall.copy(fontSize = (14f * s).sp),
+        titleMedium = defaults.titleMedium.copy(fontSize = (16f * s).sp),
+        titleLarge = defaults.titleLarge.copy(fontSize = (18f * s).sp),
+        bodySmall = defaults.bodySmall.copy(fontSize = (11f * s).sp),
+        bodyMedium = defaults.bodyMedium.copy(fontSize = (14f * s).sp),
+        bodyLarge = defaults.bodyLarge.copy(fontSize = (15f * s).sp),
+        labelSmall = defaults.labelSmall.copy(fontSize = (10f * s).sp),
+        labelMedium = defaults.labelMedium.copy(fontSize = (12f * s).sp),
+        labelLarge = defaults.labelLarge.copy(fontSize = (13f * s).sp)
     )
     val scheme = if (dark) {
         androidx.compose.material3.darkColorScheme(
@@ -176,7 +186,7 @@ fun SectionLabel(text: String, color: Color = VyRxColors.TextDim, modifier: Modi
 fun NeonDot(color: Color, size: Int = 8, modifier: Modifier = Modifier) {
     Box(modifier = modifier.size(size.dp)) {
         Box(Modifier.matchParentSize().clip(CircleShape).background(color.copy(alpha = 0.30f)))
-        Box(Modifier.align(Alignment.Center).size((size * 0.55).coerceAtLeast(3).dp).clip(CircleShape).background(color))
+        Box(Modifier.align(Alignment.Center).size((size * 0.55f).coerceAtLeast(3f).dp).clip(CircleShape).background(color))
     }
 }
 

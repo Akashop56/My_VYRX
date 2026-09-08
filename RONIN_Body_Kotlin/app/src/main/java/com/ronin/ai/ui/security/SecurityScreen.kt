@@ -38,6 +38,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -119,7 +120,7 @@ fun SecurityScreen(
                         Column(horizontalAlignment = Alignment.End) {
                             Text("Brain", color = VyRxColors.TextDim, fontSize = 10.sp)
                             Text(
-                                if (health != null) "v${health.version} ✓" else "Offline",
+                                health?.let { "v${it.version} ✓" } ?: "Offline",
                                 color = if (health != null) VyRxColors.Green else VyRxColors.Red,
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.SemiBold

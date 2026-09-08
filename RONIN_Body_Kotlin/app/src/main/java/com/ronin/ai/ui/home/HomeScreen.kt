@@ -19,7 +19,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Book
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.ElectricBolt
+import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Warning
@@ -195,7 +195,7 @@ private fun TodaySummaryCard(tasks: Int, auto: Int, learned: Int, modifier: Modi
         Spacer(Modifier.height(8.dp))
         SummaryRow(Icons.Filled.CheckCircle, VyRxColors.Green, tasks, "Tasks Completed")
         Spacer(Modifier.height(8.dp))
-        SummaryRow(Icons.Filled.ElectricBolt, VyRxColors.Blue, auto, "Auto Tasks")
+        SummaryRow(Icons.Filled.Bolt, VyRxColors.Blue, auto, "Auto Tasks")
         Spacer(Modifier.height(8.dp))
         SummaryRow(Icons.Filled.Book, VyRxColors.Amber, learned, "Things Learned")
     }
@@ -236,7 +236,7 @@ private fun ActionLogPanel(logs: List<com.ronin.ai.network.ActionLogEntry>, expa
                         when (entry.level) {
                             "success" -> Icons.Filled.CheckCircle
                             "error" -> Icons.Filled.Warning
-                            "tool" -> Icons.Filled.ElectricBolt
+                            "tool" -> Icons.Filled.Bolt
                             else -> Icons.Filled.Info
                         },
                         null,

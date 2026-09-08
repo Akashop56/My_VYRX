@@ -25,7 +25,7 @@ import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
-import androidx.compose.material.icons.filled.Tools
+import androidx.compose.material.icons.filled.Build
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -51,7 +51,7 @@ val DRAWER_ITEMS = listOf(
     DrawerItem("chat", Icons.Filled.Search, "Chat", "Conversations & Ask Anything"),
     DrawerItem("dashboard", Icons.Filled.Dashboard, "Dashboard", "Stats, Logs & Monitoring"),
     DrawerItem("memory", Icons.Filled.Memory, "Memory", "AI Memory & Knowledge Base"),
-    DrawerItem("tools", Icons.Filled.Tools, "Tools", "AI Agent Tool Kit"),
+    DrawerItem("tools", Icons.Filled.Build, "Tools", "AI Agent Tool Kit"),
     DrawerItem("settings", Icons.Filled.Settings, "Settings", "Customize Your VYRX Experience")
 )
 
@@ -142,7 +142,7 @@ fun VyRxDrawerContent(
                 QuickActionRow(Icons.Filled.Memory, VyRxColors.Blue, "AI Orb", "Open your orb — think, ask, create", onToast)
             }
             item {
-                QuickActionRow(Icons.Filled.Tools, VyRxColors.Green, "Manage Tools", "Configure AI tools", onToast)
+                QuickActionRow(Icons.Filled.Build, VyRxColors.Green, "Manage Tools", "Configure AI tools", onToast)
             }
 
             item {
