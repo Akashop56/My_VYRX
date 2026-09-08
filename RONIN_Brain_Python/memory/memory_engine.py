@@ -162,6 +162,66 @@ class MemoryEngine:
             )
             await db.commit()
 
+    # -- agent recall ---------------------------------------------------------
+    # Keyword-ranked retrieval used by the ReAct loop to inject standing
+    # orders / preferences into the system prompt on every request.
+
+    _STOPWORDS = frozenset({
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "and", "or", "but", "if", "then", "else", "when", "what", "which",
+        "who", "whom", "this", "that", "these", "those", "am", "do", "does",
+        "did", "will", "would", "could", "should", "may", "might", "must",
+        "have", "has", "had", "having", "with", "for", "from", "into", "on",
+        "of", "to", "in", "it", "its", "my", "your", "you", "i", "me", "we",
+        "open", "close", "please", "boss",
+    })
+
+    @classmethod
+    def _query_tokens(cls, query: str) -> list[str]:
+        cleaned = "".join(
+            ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in query
+        )
+        return [word for word in cleaned.split()
+                if len(word) > 2 and word not in cls._STOPWORDS]
+
+    async def search_relevant(self, query: str, limit: int = 5) -> list[dict]:
+        """Return memories most relevant to ``query`` (keyword-ranked).
+
+        Pinned + high-importance memories win ties. Returns [] when nothing
+        matches so the prompt stays clean.
+        """
+        limit = max(1, min(20, int(limit or 5)))
+        words = self._query_tokens(query or "")
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            if not words:
+                cursor = await db.execute(
+                    "SELECT * FROM memories ORDER BY pinned DESC, importance DESC, id DESC LIMIT ?",
+                    (limit,),
+                )
+                return [_norm(row) for row in await cursor.fetchall()]
+            like_clauses = " OR ".join(["(title LIKE ? OR content LIKE ?)"] * len(words))
+            params: list = []
+            for word in words:
+                like = f"%{word}%"
+                params.extend([like, like])
+            cursor = await db.execute(
+                f"SELECT * FROM memories WHERE {like_clauses}", params  # noqa: S608 - placeholders only
+            )
+            candidates = [_norm(row) for row in await cursor.fetchall()]
+
+        def _score(row: dict) -> float:
+            haystack = f"{row.get('title', '')} {row.get('content', '')}".lower()
+            hits = sum(1 for word in words if word in haystack)
+            if hits == 0:
+                return -1.0
+            return (hits * 10.0 + float(row.get("importance", 3)) * 2.0
+                    + (5.0 if row.get("pinned") else 0.0)
+                    + min(float(row.get("use_count", 0)), 10.0) * 0.3)
+
+        ranked = sorted(candidates, key=_score, reverse=True)
+        return [row for row in ranked if _score(row) >= 0.0][:limit]
+
     async def delete(self, memory_id: int) -> bool:
         async with aiosqlite.connect(self._db_path) as db:
             cursor = await db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))

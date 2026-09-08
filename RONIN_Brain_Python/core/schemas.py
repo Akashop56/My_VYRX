@@ -5,11 +5,12 @@ circular import with `main.py`.
 """
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-Route = Literal["android_command", "web_search", "local_tool", "llm", "tool_creation"]
+Route = Literal["android_command", "web_search", "local_tool", "llm", "tool_creation",
+                "agent_action", "agent_final"]
 
 from tools.system_control import AndroidCommand as AndroidCommandSchema  # noqa: E402
 
@@ -40,12 +41,44 @@ class UpdateProposal(BaseModel):
     summary: str
 
 
+class AgentAction(BaseModel):
+    """One pending device-side tool call for the Kotlin Body to execute.
+
+    The Body MUST execute it (open app, read screen, click, …) and POST the
+    observation back to ``/agent/result`` without requiring any user tap.
+    """
+
+    tool: str = Field(min_length=1, max_length=64)
+    args: dict[str, Any] = Field(default_factory=dict)
+    tool_call_id: str | None = Field(default=None, max_length=64)
+    thought: str | None = Field(default=None, max_length=2000)
+
+
 class AskResponse(BaseModel):
     response: str
     route: Route
     command: AndroidCommandSchema | None = None
     update_proposal: UpdateProposal | None = None
     error: str | None = None
+    # --- agentic loop fields (additive; old bodies ignore them) ---
+    action: AgentAction | None = None
+    needs_tool_result: bool = False
+    thought: str | None = None
+    steps: int = 0
+
+
+class ToolResultRequest(BaseModel):
+    """Hidden background callback: Body -> Brain execution observation.
+
+    Sent automatically by the Kotlin Body after executing an ``AgentAction``,
+    continuing the ReAct loop without user interaction.
+    """
+
+    session_id: str = Field(default="default", min_length=1, max_length=128)
+    tool: str = Field(min_length=1, max_length=64)
+    result: str = Field(default="", max_length=20000)
+    success: bool = True
+    tool_call_id: str | None = Field(default=None, max_length=64)
 
 
 class ApprovalRequest(BaseModel):

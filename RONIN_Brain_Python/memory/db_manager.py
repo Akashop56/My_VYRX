@@ -43,3 +43,26 @@ async def store_fact(key: str, value: str) -> None:
         stamp = now()
         await db.execute("INSERT INTO facts(fact_key,fact_value,created_at,updated_at) VALUES(?,?,?,?) ON CONFLICT(fact_key) DO UPDATE SET fact_value=excluded.fact_value,updated_at=excluded.updated_at", (key, value, stamp, stamp))
         await db.commit()
+
+
+async def search_facts(query: str, limit: int = 5) -> list[dict[str, str]]:
+    """Keyword recall over the legacy facts table for prompt injection."""
+    words = [word for word in "".join(
+        ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in (query or "")
+    ).split() if len(word) > 2]
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if not words:
+            cursor = await db.execute(
+                "SELECT fact_key,fact_value FROM facts ORDER BY updated_at DESC LIMIT ?", (limit,))
+            return [dict(row) for row in await cursor.fetchall()]
+        clauses = " OR ".join(["(fact_key LIKE ? OR fact_value LIKE ?)"] * len(words))
+        params: list = []
+        for word in words:
+            like = f"%{word}%"
+            params.extend([like, like])
+        cursor = await db.execute(
+            f"SELECT fact_key,fact_value FROM facts WHERE {clauses} LIMIT ?",  # noqa: S608 - placeholders only
+            (*params, max(1, min(20, limit))),
+        )
+        return [dict(row) for row in await cursor.fetchall()]

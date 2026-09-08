@@ -34,6 +34,11 @@ enum class BrainStatus { CHECKING, STARTING, ONLINE, OFFLINE }
  * Owns the conversation lifecycle (brain startup, sending, command execution,
  * self-coding proposals, memory save, regenerate, feedback) and is shared by
  * the Home screen and the full Chat screen.
+ *
+ * Autonomous-OS core: when the Brain dispatches an [AgentAction], this
+ * controller executes it on-device and POSTs the observation back to
+ * /agent/result automatically — the ReAct loop continues with zero taps
+ * until the Brain returns final spoken text.
  */
 class ChatController(
     context: Context,
@@ -44,12 +49,18 @@ class ChatController(
     private val connection = BrainConnectionManager(appContext)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
+    /** Stable agent session so Brain continuations resolve to this chat. */
+    private val sessionId: String = UUID.randomUUID().toString()
+
     val messages = mutableStateListOf<ChatMessage>()
     var loading by mutableStateOf(false); private set
     var error by mutableStateOf<String?>(null); private set
     var proposal by mutableStateOf<UpdateProposal?>(null); private set
     var brainStatus by mutableStateOf(BrainStatus.CHECKING); private set
     var listening by mutableStateOf(false); private set
+
+    /** TTS-ready speech of the last completed turn (plain text, no tool tags). */
+    var lastSpeech by mutableStateOf<String?>(null); private set
 
     /** Text to prefill in the chat input (e.g. "Emergency: " from the orb long-press). */
     var prefill by mutableStateOf("")
@@ -83,12 +94,52 @@ class ChatController(
         val s = settingsProvider()
         return ApiClient.ask(
             message = prompt,
+            sessionId = sessionId,
             providers = providersProvider(),
             inputMode = if (fromVoice) "voice" else "text",
             toolsEnabled = s.toolsEnabled,
             personality = s.personality,
             responseMode = s.responseMode
         )
+    }
+
+    /** Legacy offline command path (synchronous, kept for backward compatibility). */
+    private fun runLegacyCommand(r: AskResponse) {
+        r.command?.let { command ->
+            val execution = CommandExecutor.execute(appContext, command)
+            val executed = execution.getOrDefault(false)
+            if (!executed) {
+                messages.add(ChatMessage(text = execution.exceptionOrNull()?.localizedMessage ?: "Android command could not run; check required permissions or Accessibility.", mine = false))
+            }
+        }
+    }
+
+    /**
+     * Autonomous loop: execute dispatched device actions and feed observations
+     * back until the Brain speaks its final answer. Returns the final response.
+     */
+    private suspend fun runAgentLoop(first: AskResponse): AskResponse {
+        var r = first
+        var guard = 0
+        while (r.needsToolResult && r.action != null && guard < MAX_AGENT_ROUNDTRIPS) {
+            guard++
+            val action = r.action!!
+            val interim = ChatMessage(text = "⚙️ Acting: ${action.tool}…", mine = false)
+            messages.add(interim)
+            val outcome = runCatching { CommandExecutor.executeAction(appContext, action) }
+                .getOrElse { e -> com.ronin.ai.network.AgentResult.fail("Execution failed: ${e.localizedMessage ?: "unknown error"}") }
+            messages.remove(interim)
+            r = ApiClient.submitToolResult(
+                sessionId = sessionId,
+                tool = action.tool,
+                result = outcome.text,
+                success = outcome.success,
+                toolCallId = action.toolCallId
+            )
+            // A continuation may also carry a legacy command (offline fallback).
+            runLegacyCommand(r)
+        }
+        return r
     }
 
     fun send(text: String, fromVoice: Boolean = false) {
@@ -104,14 +155,12 @@ class ChatController(
         error = null
         scope.launch {
             try {
-                val r = executeAsk(prompt, fromVoice)
-                messages.add(ChatMessage(text = r.response, mine = false))
-                r.command?.let { command ->
-                    val execution = CommandExecutor.execute(appContext, command)
-                    val executed = execution.getOrDefault(false)
-                    if (!executed) {
-                        messages.add(ChatMessage(text = execution.exceptionOrNull()?.localizedMessage ?: "Android command could not run; check required permissions or Accessibility.", mine = false))
-                    }
+                val first = executeAsk(prompt, fromVoice)
+                runLegacyCommand(first)
+                val r = runAgentLoop(first)
+                if (r.response.isNotBlank()) {
+                    messages.add(ChatMessage(text = r.response, mine = false))
+                    lastSpeech = r.response
                 }
                 proposal = r.update_proposal
                 if (r.error != null && r.error!!.isNotBlank()) error = r.error
@@ -134,9 +183,13 @@ class ChatController(
             loading = true
             error = null
             try {
-                val r = executeAsk(lastUser.text, fromVoice = false)
-                messages.add(ChatMessage(text = r.response, mine = false))
-                r.command?.let { command -> runCatching { CommandExecutor.execute(appContext, command) } }
+                val first = executeAsk(lastUser.text, fromVoice = false)
+                first.command?.let { command -> runCatching { CommandExecutor.execute(appContext, command) } }
+                val r = runAgentLoop(first)
+                if (r.response.isNotBlank()) {
+                    messages.add(ChatMessage(text = r.response, mine = false))
+                    lastSpeech = r.response
+                }
             } catch (e: Exception) {
                 error = e.message ?: "Regeneration failed."
             } finally {
@@ -183,5 +236,10 @@ class ChatController(
                 proposal = null
             }
         }
+    }
+
+    private companion object {
+        /** Max Body->Brain round-trips per user message (mirrors Brain's step budget). */
+        const val MAX_AGENT_ROUNDTRIPS = 8
     }
 }
