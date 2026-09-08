@@ -1,0 +1,9 @@
+{
+  "gemini": {
+    "enabled": true,
+    "model": "gemini-1.5-flash",
+    "endpoint": null,
+    "seen_key": false,
+    "metrics": {}
+  }
+}
