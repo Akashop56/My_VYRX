@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
@@ -53,6 +54,9 @@ fun VyRxBottomBar(
         Modifier
             .fillMaxWidth()
             .background(Color(0xFF0A0D14))
+            // Keep the bar's background edge-to-edge while its content stays
+            // above the gesture / navigation bar.
+            .navigationBarsPadding()
             .padding(top = 6.dp, bottom = 14.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {

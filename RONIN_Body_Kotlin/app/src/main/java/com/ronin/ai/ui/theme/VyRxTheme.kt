@@ -34,11 +34,12 @@ import androidx.compose.ui.unit.sp
 
 object VyRxColors {
     val Background = Color(0xFF05060A)
-    val Surface = Color(0xFF0E1118)
-    val SurfaceGlass = Color(0x29141A26)
-    val CardStroke = Color(0xFF1E2635)
-    val CardStrokeSoft = Color(0xFF161D2A)
-    val CardBackground = Color(0xFF10151F)
+    val Surface = Color(0xFF131A2A)
+    // Glass card fill — needs enough alpha to read as a panel against #05060A.
+    val SurfaceGlass = Color(0x991B2536)
+    val CardStroke = Color(0xFF33415C)
+    val CardStrokeSoft = Color(0xFF27324A)
+    val CardBackground = Color(0xFF141B2B)
     val Primary = Color(0xFF8B5CF6)
     val PrimaryBright = Color(0xFFA78BFA)
     val PrimaryDim = Color(0xFF4C3A85)
@@ -49,7 +50,7 @@ object VyRxColors {
     val Red = Color(0xFFF87171)
     val TextPrimary = Color(0xFFE8EAF0)
     val TextDim = Color(0xFF8A93A6)
-    val TextFaint = Color(0xFF5A6478)
+    val TextFaint = Color(0xFF74819A)
     val LogGreen = Color(0xFF34D399)
     val LogTime = Color(0xFF3E9C6E)
 
@@ -119,9 +120,12 @@ fun VyRxTheme(
             onPrimary = Color.White,
             secondary = VyRxColors.Blue,
             background = VyRxColors.Background,
-            surface = VyRxColors.Surface,
             onBackground = VyRxColors.TextPrimary,
+            surface = VyRxColors.Surface,
             onSurface = VyRxColors.TextPrimary,
+            surfaceVariant = VyRxColors.CardBackground,
+            onSurfaceVariant = VyRxColors.TextDim,
+            outline = VyRxColors.CardStroke,
             error = VyRxColors.Red
         )
     } else {
@@ -165,7 +169,16 @@ fun GlassCard(
                     .background(Brush.linearGradient(listOf(glow.copy(alpha = 0.10f), Color.Transparent, Color.Transparent)))
             )
         }
-        Column(Modifier.matchParentSize().padding(contentPadding), content = content)
+        Column(
+            // NOT matchParentSize(): a matchParentSize child never contributes to the
+            // parent Box's size, which collapsed every card to 0 height inside
+            // LazyColumns / weighted Rows (invisible screens). Let the content size
+            // the card; the background layers above stretch over it via matchParentSize.
+            Modifier
+                .fillMaxWidth()
+                .padding(contentPadding),
+            content = content
+        )
     }
 }
 

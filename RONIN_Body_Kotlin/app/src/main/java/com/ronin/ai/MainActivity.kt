@@ -30,6 +30,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -148,12 +149,38 @@ fun VyRxApp(activity: FragmentActivity) {
                 }
             }
         ) {
-            Box(Modifier.fillMaxSize().background(VyRxColors.Background)) {
-                Column(Modifier.fillMaxSize()) {
+            Scaffold(
+                containerColor = VyRxColors.Background,
+                bottomBar = {
+                    if (currentRoute !in listOf("provider_manager")) {
+                        VyRxBottomBar(
+                            currentRoute = currentRoute,
+                            onNavigate = onNavigate,
+                            onOrbTap = { mode ->
+                                if (mode == OrbTap.LONG) {
+                                    controller.prefill = "Emergency: "
+                                    toast("Emergency mode — tell VYRX what's wrong.")
+                                }
+                                onNavigate("chat")
+                            }
+                        )
+                    }
+                }
+            ) { innerPadding ->
+                // Apply the Scaffold's PaddingValues here so every screen
+                // (Home, Chat, Dashboard, Memory, Tools, Settings, Providers)
+                // lays out inside the padded area and never draws behind the
+                // top area / status bar or the bottom navigation bar.
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(VyRxColors.Background)
+                        .padding(innerPadding)
+                ) {
                     NavHost(
                         navController = navController,
                         startDestination = "home",
-                        modifier = Modifier.weight(1f)
+                        modifier = Modifier.fillMaxSize()
                     ) {
                         composable("home") {
                             HomeScreen(
@@ -220,19 +247,6 @@ fun VyRxApp(activity: FragmentActivity) {
                                 onToast = ::toast
                             )
                         }
-                    }
-                    if (currentRoute !in listOf("provider_manager")) {
-                        VyRxBottomBar(
-                            currentRoute = currentRoute,
-                            onNavigate = onNavigate,
-                            onOrbTap = { mode ->
-                                if (mode == OrbTap.LONG) {
-                                    controller.prefill = "Emergency: "
-                                    toast("Emergency mode — tell VYRX what's wrong.")
-                                }
-                                onNavigate("chat")
-                            }
-                        )
                     }
                 }
             }
