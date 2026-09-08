@@ -63,6 +63,28 @@ object ApiClient {
         ApprovalResponse(o.getBoolean("accepted"), o.getBoolean("success"), o.getString("message"))
     }
 
+    /**
+     * Hidden background callback: Body -> Brain execution observation.
+     * Called automatically after executing an AgentAction; the Brain replies
+     * with either the next pending action or the final spoken answer.
+     */
+    suspend fun submitToolResult(
+        sessionId: String,
+        tool: String,
+        result: String,
+        success: Boolean,
+        toolCallId: String? = null
+    ): AskResponse = withContext(Dispatchers.IO) {
+        val body = JSONObject()
+            .put("session_id", sessionId)
+            .put("tool", tool)
+            .put("result", result.take(20000))
+            .put("success", success)
+            .putOpt("tool_call_id", toolCallId)
+            .toString().toRequestBody(json)
+        execute("$BASE/agent/result", body).let(::parseAsk)
+    }
+
     suspend fun health(): Boolean = withContext(Dispatchers.IO) {
         try {
             client.newCall(Request.Builder().url("$BASE/health").get().build()).execute().use { response ->
@@ -273,11 +295,36 @@ object ApiClient {
     private fun parseAsk(raw: String): AskResponse {
         val o = JSONObject(raw)
         val c = o.optJSONObject("command")?.let {
-            AndroidCommand(it.getString("action"), it.optString("text").takeIf { value -> value.isNotBlank() }, it.optString("package_name").takeIf { value -> value.isNotBlank() })
+            AndroidCommand(
+                it.getString("action"),
+                it.optString("text").takeIf { value -> value.isNotBlank() },
+                it.optString("package_name").takeIf { value -> value.isNotBlank() },
+                it.opt("x")?.takeIf { v -> v != JSONObject.NULL }?.let { v -> (v as? Number)?.toFloat() },
+                it.opt("y")?.takeIf { v -> v != JSONObject.NULL }?.let { v -> (v as? Number)?.toFloat() },
+                it.optString("node_id").takeIf { value -> value.isNotBlank() },
+                it.optString("direction").takeIf { value -> value.isNotBlank() }
+            )
         }
         val p = o.optJSONObject("update_proposal")?.let {
             UpdateProposal(it.getString("proposal_id"), it.getString("file_path"), it.getString("module_name"), it.getString("new_code"), it.getString("summary"))
         }
-        return AskResponse(o.getString("response"), o.getString("route"), c, p, o.optString("error").takeIf { value -> value.isNotBlank() })
+        val a = o.optJSONObject("action")?.let {
+            AgentAction(
+                it.getString("tool"),
+                it.optJSONObject("args") ?: JSONObject(),
+                it.optString("tool_call_id").takeIf { value -> value.isNotBlank() },
+                it.optString("thought").takeIf { value -> value.isNotBlank() }
+            )
+        }
+        return AskResponse(
+            o.optString("response", ""),
+            o.optString("route", "llm"),
+            c, p,
+            o.optString("error").takeIf { value -> value.isNotBlank() },
+            a,
+            o.optBoolean("needs_tool_result", false),
+            o.optString("thought").takeIf { value -> value.isNotBlank() },
+            o.optInt("steps", 0)
+        )
     }
 }

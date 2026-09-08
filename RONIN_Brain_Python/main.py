@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 # VYRX core modules
 from core.action_log import ActionLog
 from core.llm_handler import SYSTEM_PROMPT, LLMError
-from core.planner import BrainContext, plan_request
+from core.planner import BrainContext, continue_with_tool_result, plan_request
 from core.provider_manager import KNOWN_PROVIDERS, ProviderManager
 from core.router import route_request
 from core.schemas import (
@@ -33,6 +33,7 @@ from core.schemas import (
     MemoryUpdate,
     ProviderRequest,
     ProviderUpdate,
+    ToolResultRequest,
     UpdateProposal,
 )
 from core.state_manager import StateManager
@@ -45,7 +46,7 @@ from memory.memory_engine import MemoryEngine
 from tools.system_control import AndroidCommand, command_for_request
 from tools.web_search import search
 
-BRAIN_VERSION = "1.1.0"
+BRAIN_VERSION = "2.0.0"
 BOOT_TIME = time.time()
 BASE_DIR = Path(__file__).resolve().parent
 DATABASE_PATH = BASE_DIR / "memory" / "ronin_brain.db"
@@ -169,8 +170,33 @@ async def health() -> dict:
 
 @app.post("/ask_ronin", response_model=AskResponse)
 async def ask_ronin(request: AskRequest) -> AskResponse:
-    """Full pipeline: Planner -> Intent Router -> Tool Execution (with logs)."""
+    """Full pipeline: Planner -> ReAct agent -> Tool Execution (with logs)."""
     return await plan_request(request, CTX)
+
+
+@app.post("/agent/result", response_model=AskResponse)
+async def agent_result(request: ToolResultRequest) -> AskResponse:
+    """Hidden Body -> Brain callback continuing the ReAct loop.
+
+    The Kotlin Body calls this automatically after executing a dispatched
+    ``AgentAction`` — no user tap involved. Returns either the next pending
+    action (``needs_tool_result=true``) or the final spoken answer.
+    """
+    return await continue_with_tool_result(request, CTX)
+
+
+@app.get("/agent/tools")
+async def agent_tools() -> dict:
+    """Inspect the agentic tool surface (server + device schemas)."""
+    from core.tools_catalog import BRAIN_TOOLS, DEVICE_TOOLS, device_tool_schemas
+
+    server = [tool.get("function", {}).get("name", "?") for tool in get_available_tools()]
+    return {
+        "server_tools": sorted(server),
+        "device_tools": sorted(DEVICE_TOOLS),
+        "brain_tool_names": sorted(BRAIN_TOOLS),
+        "device_schemas": device_tool_schemas(),
+    }
 
 
 @app.post("/approve_update", response_model=ApprovalResponse)
