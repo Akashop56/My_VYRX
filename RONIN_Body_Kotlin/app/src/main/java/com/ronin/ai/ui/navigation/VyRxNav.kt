@@ -53,6 +53,9 @@ fun VyRxBottomBar(
         Modifier
             .fillMaxWidth()
             .background(Color(0xFF0A0D14))
+            // Keep the bar's background edge-to-edge while its content stays
+            // above the gesture / navigation bar.
+            .navigationBarsPadding()
             .padding(top = 6.dp, bottom = 14.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {

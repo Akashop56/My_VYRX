@@ -188,7 +188,7 @@ fun SettingsScreen(
         )
 
         LazyColumn(
-            Modifier.fillMaxWidth(),
+            Modifier.fillMaxWidth().weight(1f),
             contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 24.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {

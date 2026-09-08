@@ -211,7 +211,7 @@ fun MemoryScreen(
             }
 
             LazyColumn(
-                Modifier.fillMaxWidth(),
+                Modifier.fillMaxWidth().weight(1f),
                 contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 6.dp, bottom = 96.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {

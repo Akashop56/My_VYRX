@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -110,7 +111,7 @@ fun DashboardScreen(onOpenDrawer: () -> Unit, onNavigate: (String) -> Unit) {
             }
         )
         LazyColumn(
-            Modifier.fillMaxWidth(),
+            Modifier.fillMaxWidth().weight(1f),
             contentPadding = PaddingValues(start = 12.dp, end = 12.dp, bottom = 16.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
@@ -138,7 +139,14 @@ fun DashboardScreen(onOpenDrawer: () -> Unit, onNavigate: (String) -> Unit) {
                                 repeat(6) { i -> NeonDot(orbColor(orbState), size = if (i < 4) 6 else 4) }
                             }
                         }
-                        Column(horizontalAlignment = Alignment.End) {
+                        Spacer(Modifier.width(12.dp))
+                        // Cap the trailing column so a long model name wraps inside
+                        // it instead of starving the weighted main column down to a
+                        // vertical column of letters.
+                        Column(
+                            Modifier.widthIn(max = 128.dp),
+                            horizontalAlignment = Alignment.End
+                        ) {
                             SectionLabel("ACTIVE MODEL")
                             Spacer(Modifier.height(4.dp))
                             Text(
