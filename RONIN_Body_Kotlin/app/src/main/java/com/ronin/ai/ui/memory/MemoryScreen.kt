@@ -247,16 +247,16 @@ fun MemoryScreen(
                                 modifier = Modifier.weight(1f).padding(vertical = 14.dp),
                                 textStyle = TextStyle(color = VyRxColors.TextPrimary, fontSize = 13.sp),
                                 cursorBrush = SolidColor(VyRxColors.PrimaryBright),
-                                singleLine = true
+                                singleLine = true,
+                                decorationBox = { innerTextField ->
+                                    Box(contentAlignment = Alignment.CenterStart) {
+                                        if (query.isEmpty()) {
+                                            Text("Search memories...", color = VyRxColors.TextFaint, fontSize = 13.sp)
+                                        }
+                                        innerTextField()
+                                    }
+                                }
                             )
-                            if (query.isEmpty()) {
-                                Text(
-                                    "Search memories...",
-                                    color = VyRxColors.TextFaint,
-                                    fontSize = 13.sp,
-                                    modifier = Modifier.align(Alignment.CenterStart).offset(x = 42.dp)
-                                )
-                            }
                         }
                     }
                 }

@@ -120,7 +120,7 @@ fun SecurityScreen(
                         Column(horizontalAlignment = Alignment.End) {
                             Text("Brain", color = VyRxColors.TextDim, fontSize = 10.sp)
                             Text(
-                                if (health != null) "v${health.version} ✓" else "Offline",
+                                health?.let { "v${it.version} ✓" } ?: "Offline",
                                 color = if (health != null) VyRxColors.Green else VyRxColors.Red,
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.SemiBold
