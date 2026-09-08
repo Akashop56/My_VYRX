@@ -1,5 +1,10 @@
 package com.ronin.ai
 
+import androidx.activity.compose.setContent
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.rememberDrawerState
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
 import android.os.Bundle
 import android.widget.Toast
 import androidx.biometric.BiometricManager
@@ -96,7 +101,8 @@ fun VyRxApp(activity: FragmentActivity) {
     val settings by settingsRepo.settings.collectAsState()
 
     val navController = rememberNavController()
-    val drawerState = remember { androidx.compose.material3.rememberDrawerState() }
+    val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
+    val scope = rememberCoroutineScope()
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route ?: "home"
 
@@ -116,7 +122,7 @@ fun VyRxApp(activity: FragmentActivity) {
                 restoreState = true
             }
         }
-        drawerState.close()
+        scope.launch { drawerState.close() }
     }
 
     if (settings.biometricLock && !AppLockState.sessionUnlocked) {
@@ -152,7 +158,7 @@ fun VyRxApp(activity: FragmentActivity) {
                         composable("home") {
                             HomeScreen(
                                 controller = controller,
-                                onOpenDrawer = { drawerState.open() },
+                                onOpenDrawer = { scope.launch { drawerState.open() } },
                                 onNavigate = onNavigate,
                                 onOrbTap = { onNavigate("chat") },
                                 onOrbLongPress = {
@@ -165,27 +171,27 @@ fun VyRxApp(activity: FragmentActivity) {
                         composable("chat") {
                             ChatScreen(
                                 controller = controller,
-                                onOpenDrawer = { drawerState.open() },
+                                onOpenDrawer = { scope.launch { drawerState.open() } },
                                 onNavigate = onNavigate,
                                 onVoiceStart = { toast("Speak now — listening…") }
                             )
                         }
                         composable("dashboard") {
                             DashboardScreen(
-                                onOpenDrawer = { drawerState.open() },
+                                onOpenDrawer = { scope.launch { drawerState.open() } },
                                 onNavigate = onNavigate
                             )
                         }
                         composable("memory") {
                             MemoryScreen(
-                                onOpenDrawer = { drawerState.open() },
+                                onOpenDrawer = { scope.launch { drawerState.open() } },
                                 onToast = ::toast
                             )
                         }
                         composable("tools") {
                             ToolsScreen(
                                 settingsRepo = settingsRepo,
-                                onOpenDrawer = { drawerState.open() }
+                                onOpenDrawer = { scope.launch { drawerState.open() } }
                             )
                         }
                         composable("settings") {
@@ -199,7 +205,7 @@ fun VyRxApp(activity: FragmentActivity) {
                         composable("providers") {
                             ApiProvidersScreen(
                                 settingsRepo = settingsRepo,
-                                onOpenDrawer = { drawerState.open() },
+                                onOpenDrawer = { scope.launch { drawerState.open() } },
                                 onNavigate = onNavigate,
                                 onToast = ::toast
                             )
@@ -210,7 +216,7 @@ fun VyRxApp(activity: FragmentActivity) {
                         composable("security") {
                             SecurityScreen(
                                 settingsRepo = settingsRepo,
-                                onOpenDrawer = { drawerState.open() },
+                                onOpenDrawer = { scope.launch { drawerState.open() } },
                                 onToast = ::toast
                             )
                         }

@@ -182,18 +182,18 @@ object ApiClient {
                 ProviderType.GEMINI -> "https://generativelanguage.googleapis.com/v1beta/models?key=${Uri.encode(config.apiKey)}"
                 ProviderType.CUSTOM -> config.endpoint.orEmpty()
             }
-            if (url.isBlank()) return@withContext Result.failure<Exception>(IOException("Endpoint is not configured"))
+            if (url.isBlank()) return@withContext Result.failure<Int>(IOException("Endpoint is not configured"))
             val builder = Request.Builder().url(url)
             if (config.type != ProviderType.GEMINI) {
                 builder.header("Authorization", "Bearer ${config.apiKey}")
             }
             val request = builder.get().build()
             client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) return@withContext Result.failure<Exception>(IOException("HTTP ${response.code}"))
+                if (!response.isSuccessful) return@withContext Result.failure<Int>(IOException("HTTP ${response.code}"))
                 Result.success((System.currentTimeMillis() - start).toInt())
             }
         } catch (e: Exception) {
-            Result.failure<Exception>(e)
+            Result.failure<Int>(e)
         }
     }
 

@@ -119,7 +119,7 @@ fun VyRxBottomBar(
         color = VyRxColors.Surface.copy(alpha = 0.92f),
         shadowElevation = 18.dp
     ) {
-        Box(Modifier.matchParentSize()) {
+        Box(Modifier.fillMaxWidth()) {
             // hairline on top
             Box(
                 Modifier

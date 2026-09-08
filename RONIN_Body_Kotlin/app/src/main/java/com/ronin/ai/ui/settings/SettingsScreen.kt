@@ -74,7 +74,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.fragment.app.FragmentActivity
-import com.ronin.ai.BuildConfig
+import androidx.core.content.pm.PackageInfoCompat
 import com.ronin.ai.data.AppSettings
 import com.ronin.ai.data.AppSettingsRepository
 import com.ronin.ai.data.BrainRepository
@@ -98,6 +98,11 @@ fun SettingsScreen(
 ) {
     val context = activity
     val scope = rememberCoroutineScope()
+    val packageInfo = remember(context) {
+        context.packageManager.getPackageInfo(context.packageName, 0)
+    }
+    val versionName = packageInfo.versionName ?: "Unknown"
+    val versionCode = PackageInfoCompat.getLongVersionCode(packageInfo)
     val settings by settingsRepo.settings.collectAsState()
     val health by BrainRepository.health.collectAsState()
 
@@ -197,7 +202,7 @@ fun SettingsScreen(
                             Text("VYRX", color = VyRxColors.TextPrimary, fontSize = 17.sp, fontWeight = FontWeight.Bold)
                             Text("AI Assistant", color = VyRxColors.TextDim, fontSize = 11.sp)
                             Text(
-                                "Version ${BuildConfig.VERSION_NAME} • Build ${BuildConfig.VERSION_CODE}",
+                                "Version ${versionName} • Build ${versionCode}",
                                 color = VyRxColors.TextFaint,
                                 fontSize = 10.sp
                             )
@@ -560,7 +565,7 @@ fun SettingsScreen(
                 Column {
                     Text("VYRX — Personal Autonomous AI Assistant", color = VyRxColors.TextPrimary, fontSize = 13.sp)
                     Spacer(Modifier.height(8.dp))
-                    Text("Version ${BuildConfig.VERSION_NAME} (build ${BuildConfig.VERSION_CODE})", color = VyRxColors.TextDim, fontSize = 12.sp)
+                    Text("Version ${versionName} (build ${versionCode})", color = VyRxColors.TextDim, fontSize = 12.sp)
                     Text("Body: Kotlin + Jetpack Compose (Android)", color = VyRxColors.TextDim, fontSize = 12.sp)
                     Text("Brain: Python FastAPI on 127.0.0.1:8000", color = VyRxColors.TextDim, fontSize = 12.sp)
                     Text("Architecture: Brain-Body (local, private, on-device)", color = VyRxColors.TextDim, fontSize = 12.sp)

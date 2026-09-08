@@ -42,7 +42,7 @@ fun RingProgress(value: Float, color: Color, modifier: Modifier, label: String =
             drawArc(
                 color = color,
                 startAngle = -90f, sweepAngle = 360f * value.coerceIn(0f, 1f), useCenter = false,
-                style = Stroke(sw, androidx.compose.ui.graphics.StrokeCap.Round), size = arc, topLeft = Offset(inset, inset)
+                style = Stroke(width = sw, cap = androidx.compose.ui.graphics.StrokeCap.Round), size = arc, topLeft = Offset(inset, inset)
             )
         }
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -137,7 +137,7 @@ fun Waveform(values: List<Float>, color: Color, modifier: Modifier = Modifier) {
             drawLine(color.copy(alpha = 0.9f), Offset(x0, y0), Offset(x1, y1), 2f)
         }
         // soft fill under the line
-        val path = android.graphics.Path()
+        val path = androidx.compose.ui.graphics.Path()
         path.moveTo(0f, size.height)
         values.forEachIndexed { i, v ->
             path.lineTo(i * step, size.height - (v / maxV) * size.height * 0.85f)
