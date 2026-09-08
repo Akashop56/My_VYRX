@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Callable
 import requests
 
 SYSTEM_PROMPT = """
@@ -600,14 +600,20 @@ def complete(
     system_prompt: str | None = None,
     tools: list[dict[str, Any]] | None = None,
     messages: list[dict[str, Any]] | None = None,
+    on_provider: Callable[[str, bool], None] | None = None,
 ) -> dict[str, Any]:
     configured = providers if providers else _environment_providers()
     if not configured: raise LLMError("No AI provider is configured")
     failures: list[str] = []
     for provider in configured:
+        name = (provider.get("provider") or "unknown").lower()
         try:
             request_messages = messages if messages is not None else _messages(message, history, system_prompt or SYSTEM_PROMPT)
-            provider_tools = tools if (provider.get("provider") or "").lower() in {"openai", "groq", "openrouter"} else None
-            return _complete_with(provider, request_messages, provider_tools)
-        except ProviderFailure as exc: failures.append(f"{provider.get('provider', 'unknown')}: {exc}")
+            provider_tools = tools if name in {"openai", "groq", "openrouter"} else None
+            result = _complete_with(provider, request_messages, provider_tools)
+            if on_provider is not None: on_provider(name, True)
+            return result
+        except ProviderFailure as exc:
+            if on_provider is not None: on_provider(name, False)
+            failures.append(f"{provider.get('provider', 'unknown')}: {exc}")
     raise LLMError("All configured providers failed: " + "; ".join(failures))
