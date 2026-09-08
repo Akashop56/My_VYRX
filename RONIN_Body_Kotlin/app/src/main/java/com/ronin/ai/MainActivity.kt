@@ -257,10 +257,22 @@ fun VyRxApp(activity: FragmentActivity) {
     }
 }
 
-/** Session-scoped unlock state (per app process, never persisted). */
+/**
+ * Session-scoped unlock state (per app process, never persisted).
+ *
+ * Uses Compose [mutableStateOf] so that any composable reading [sessionUnlocked]
+ * is automatically recomposed when the value changes — e.g. when the
+ * [BiometricPrompt] fires [onAuthenticationSucceeded] on the main thread.
+ *
+ * Previously this was a plain `@Volatile var`, which meant Compose never
+ * observed the write and the lock gate stayed on screen forever even after a
+ * successful authentication.
+ */
 object AppLockState {
-    @Volatile
-    var sessionUnlocked: Boolean = false
+    private val _sessionUnlocked = mutableStateOf(false)
+    var sessionUnlocked: Boolean
+        get() = _sessionUnlocked.value
+        set(value) { _sessionUnlocked.value = value }
 }
 
 /** Full-screen gate shown while App Lock (biometric) is enabled. */
@@ -299,6 +311,7 @@ private fun BiometricGate(activity: FragmentActivity, onToast: (String) -> Unit)
         Spacer(Modifier.size(24.dp))
         Button(
             onClick = {
+                failed = false // clear previous failure before new attempt
                 val manager = BiometricManager.from(activity)
                 if (manager.canAuthenticate(BIOMETRIC_STRONG or DEVICE_CREDENTIAL) != BiometricManager.BIOMETRIC_SUCCESS) {
                     onToast("No biometric enrolled — disable App Lock in Settings first.")
@@ -306,15 +319,21 @@ private fun BiometricGate(activity: FragmentActivity, onToast: (String) -> Unit)
                 }
                 val callback = object : BiometricPrompt.AuthenticationCallback() {
                     override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                        // Verified for this session — parent recomposes into the app.
+                        // Verified for this session.
+                        // Because AppLockState.sessionUnlocked is backed by a
+                        // Compose mutableStateOf, this write triggers a
+                        // recomposition of VyRxApp which dismisses the gate.
                         AppLockState.sessionUnlocked = true
                     }
 
                     override fun onAuthenticationFailed() {
+                        // Biometric was read but not recognized — the system
+                        // dialog stays open so the user can retry.
                         failed = true
                     }
 
                     override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                        // User cancelled or prompt errored out.
                         failed = true
                         onToast("App lock unavailable: $errString")
                     }

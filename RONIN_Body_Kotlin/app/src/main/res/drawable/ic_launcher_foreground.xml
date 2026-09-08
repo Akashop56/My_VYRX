@@ -1,0 +1,175 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    VYRX launcher icon — foreground layer (adaptive icon).
+
+    A glowing AI-core orb with concentric HUD rings, neon accent nodes
+    and a bold "V" chevron.  All content sits inside the 72 dp safe zone
+    (18 dp inset on each side) so every launcher mask (circle, squircle,
+    rounded-square) shows the full design.
+
+    Palette  (from VyRxColors):
+        Background  #05060A   (handled by the background layer)
+        Primary     #8B5CF6   purple
+        PrimaryBright #A78BFA light purple
+        Blue        #38BDF8   cyan
+        Green       #4ADE80   neon green accent
+
+    Viewport 108 × 108 dp  (adaptive-icon standard, centre 54,54).
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- ─── CONCENTRIC HUD RINGS ─────────────────────────────────── -->
+
+    <!-- Outer ring — faint purple boundary. -->
+    <path
+        android:strokeColor="#408B5CF6"
+        android:strokeWidth="1"
+        android:fillColor="#00000000"
+        android:pathData="M12,54 a42,42 0 1,1 84,0 a42,42 0 1,1 -84,0" />
+
+    <!-- Middle ring — cyan data ring. -->
+    <path
+        android:strokeColor="#5A38BDF8"
+        android:strokeWidth="1.2"
+        android:fillColor="#00000000"
+        android:pathData="M22,54 a32,32 0 1,1 64,0 a32,32 0 1,1 -64,0" />
+
+    <!-- Inner ring — bright purple proximity ring. -->
+    <path
+        android:strokeColor="#80A78BFA"
+        android:strokeWidth="1.4"
+        android:fillColor="#00000000"
+        android:pathData="M32,54 a22,22 0 1,1 44,0 a22,22 0 1,1 -44,0" />
+
+    <!-- ─── CORE GLOW (stacked translucent halos) ────────────────── -->
+
+    <!-- Wide ambient glow. -->
+    <path
+        android:fillColor="#1438BDF8"
+        android:pathData="M36,54 a18,18 0 1,1 36,0 a18,18 0 1,1 -36,0" />
+
+    <!-- ─── CORE ORB (layered fills simulate radial gradient) ────── -->
+
+    <!-- Outer shell — deep purple. -->
+    <path
+        android:fillColor="#FF8B5CF6"
+        android:pathData="M40,54 a14,14 0 1,1 28,0 a14,14 0 1,1 -28,0" />
+
+    <!-- Mid layer — bright purple. -->
+    <path
+        android:fillColor="#FFA78BFA"
+        android:pathData="M44,54 a10,10 0 1,1 20,0 a10,10 0 1,1 -20,0" />
+
+    <!-- Hot inner — lavender. -->
+    <path
+        android:fillColor="#FFC4B5FD"
+        android:pathData="M48,54 a6,6 0 1,1 12,0 a6,6 0 1,1 -12,0" />
+
+    <!-- Centre spark — near-white. -->
+    <path
+        android:fillColor="#FFE8DEFF"
+        android:pathData="M51,54 a3,3 0 1,1 6,0 a3,3 0 1,1 -6,0" />
+
+    <!-- ─── "V" CHEVRON  ──────────────────────────────────────────── -->
+
+    <!-- Bold white V — readable even at 48 px launcher size. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M43,43 L54,66 L65,43 L60.5,43 L54,57 L47.5,43 Z" />
+
+    <!-- ─── CARDINAL ACCENT NODES (outer ring, r = 42) ───────────── -->
+
+    <!-- North -->
+    <path
+        android:fillColor="#FF38BDF8"
+        android:pathData="M51.5,12 a2.5,2.5 0 1,1 5,0 a2.5,2.5 0 1,1 -5,0" />
+    <!-- East -->
+    <path
+        android:fillColor="#FF38BDF8"
+        android:pathData="M93.5,54 a2.5,2.5 0 1,1 5,0 a2.5,2.5 0 1,1 -5,0" />
+    <!-- South -->
+    <path
+        android:fillColor="#FF38BDF8"
+        android:pathData="M51.5,96 a2.5,2.5 0 1,1 5,0 a2.5,2.5 0 1,1 -5,0" />
+    <!-- West -->
+    <path
+        android:fillColor="#FF38BDF8"
+        android:pathData="M9.5,54 a2.5,2.5 0 1,1 5,0 a2.5,2.5 0 1,1 -5,0" />
+
+    <!-- ─── DIAGONAL ACCENT NODES (middle ring, r ≈ 32) ──────────── -->
+
+    <!-- NE  (54 + 32·cos 45°, 54 − 32·sin 45°) ≈ (76.6, 31.4) -->
+    <path
+        android:fillColor="#CCA78BFA"
+        android:pathData="M74.8,31.4 a1.8,1.8 0 1,1 3.6,0 a1.8,1.8 0 1,1 -3.6,0" />
+    <!-- SE -->
+    <path
+        android:fillColor="#CCA78BFA"
+        android:pathData="M74.8,76.6 a1.8,1.8 0 1,1 3.6,0 a1.8,1.8 0 1,1 -3.6,0" />
+    <!-- SW -->
+    <path
+        android:fillColor="#CCA78BFA"
+        android:pathData="M29.6,76.6 a1.8,1.8 0 1,1 3.6,0 a1.8,1.8 0 1,1 -3.6,0" />
+    <!-- NW -->
+    <path
+        android:fillColor="#CCA78BFA"
+        android:pathData="M29.6,31.4 a1.8,1.8 0 1,1 3.6,0 a1.8,1.8 0 1,1 -3.6,0" />
+
+    <!-- ─── CIRCUIT TRACE LINES (cardinal spokes) ─────────────────── -->
+
+    <!-- North spoke — outer ring → middle ring -->
+    <path
+        android:strokeColor="#6638BDF8"
+        android:strokeWidth="1"
+        android:fillColor="#00000000"
+        android:pathData="M54,12 L54,22" />
+    <!-- East spoke -->
+    <path
+        android:strokeColor="#6638BDF8"
+        android:strokeWidth="1"
+        android:fillColor="#00000000"
+        android:pathData="M96,54 L86,54" />
+    <!-- South spoke -->
+    <path
+        android:strokeColor="#6638BDF8"
+        android:strokeWidth="1"
+        android:fillColor="#00000000"
+        android:pathData="M54,96 L54,86" />
+    <!-- West spoke -->
+    <path
+        android:strokeColor="#6638BDF8"
+        android:strokeWidth="1"
+        android:fillColor="#00000000"
+        android:pathData="M12,54 L22,54" />
+
+    <!-- ─── INNER RING DATA MARKS (tiny ticks on the inner ring) ─── -->
+
+    <!-- Top tick -->
+    <path
+        android:strokeColor="#994ADE80"
+        android:strokeWidth="1"
+        android:fillColor="#00000000"
+        android:pathData="M54,32 L54,35" />
+    <!-- Bottom tick -->
+    <path
+        android:strokeColor="#994ADE80"
+        android:strokeWidth="1"
+        android:fillColor="#00000000"
+        android:pathData="M54,73 L54,76" />
+    <!-- Left tick -->
+    <path
+        android:strokeColor="#994ADE80"
+        android:strokeWidth="1"
+        android:fillColor="#00000000"
+        android:pathData="M32,54 L35,54" />
+    <!-- Right tick -->
+    <path
+        android:strokeColor="#994ADE80"
+        android:strokeWidth="1"
+        android:fillColor="#00000000"
+        android:pathData="M73,54 L76,54" />
+</vector>
