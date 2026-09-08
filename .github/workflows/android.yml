@@ -36,8 +36,8 @@ jobs:
         shell: bash
         run: |
           if [ -f "$RUNNER_TEMP/android-build.log" ]; then
-            grep -E '^e: |^\* What went wrong|^> [^T]|^Execution failed|^Could not|^Inconsistent' "$RUNNER_TEMP/android-build.log" | head -80 | while IFS= read -r line; do
-              line="${line//'%'/'%25'}"
-              echo "::error::$line"
-            done
+            diagnostics=$(grep -E '^e: |^\* What went wrong|^> [^T]|^Execution failed|^Could not|^Inconsistent' "$RUNNER_TEMP/android-build.log" | head -80 || true)
+            diagnostics="${diagnostics//'%'/'%25'}"
+            diagnostics="${diagnostics//$'\n'/'%0A'}"
+            echo "::error::$diagnostics"
           fi

@@ -248,7 +248,7 @@ fun ChatInputBar(
                 .background(
                     if (text.isNotBlank() && !controller.loading)
                         androidx.compose.ui.graphics.Brush.linearGradient(listOf(VyRxColors.Primary, VyRxColors.PrimaryDim))
-                    else Color(0xFF1A2030)
+                    else SolidColor(Color(0xFF1A2030))
                 )
                 .clickable(enabled = text.isNotBlank() && !controller.loading) {
                     controller.send(text)

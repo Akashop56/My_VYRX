@@ -72,7 +72,7 @@ class ChatController(
                 if (connection.requestStartupAndCheck()) BrainStatus.ONLINE else BrainStatus.OFFLINE
             }
             if (messages.isEmpty()) {
-                messages.add(ChatMessage("VYRX online. How can I help, Boss?", mine = false))
+                messages.add(ChatMessage(text = "VYRX online. How can I help, Boss?", mine = false))
             }
         }
     }
@@ -99,17 +99,17 @@ class ChatController(
             ensureBrainStarted()
             return
         }
-        messages.add(ChatMessage(prompt, mine = true))
+        messages.add(ChatMessage(text = prompt, mine = true))
         loading = true
         error = null
         scope.launch {
             try {
                 val r = executeAsk(prompt, fromVoice)
-                messages.add(ChatMessage(r.response, mine = false))
+                messages.add(ChatMessage(text = r.response, mine = false))
                 r.command?.let { command ->
                     val executed = CommandExecutor.execute(appContext, command).getOrDefault(false)
                     if (!executed) {
-                        messages.add(ChatMessage("Android command was prepared but could not run; enable Accessibility or required permissions.", mine = false))
+                        messages.add(ChatMessage(text = "Android command was prepared but could not run; enable Accessibility or required permissions.", mine = false))
                     }
                 }
                 proposal = r.update_proposal
@@ -134,7 +134,7 @@ class ChatController(
             error = null
             try {
                 val r = executeAsk(lastUser.text, fromVoice = false)
-                messages.add(ChatMessage(r.response, mine = false))
+                messages.add(ChatMessage(text = r.response, mine = false))
                 r.command?.let { command -> runCatching { CommandExecutor.execute(appContext, command) } }
             } catch (e: Exception) {
                 error = e.message ?: "Regeneration failed."
@@ -155,7 +155,7 @@ class ChatController(
                     source = "chat"
                 )
             }.onSuccess {
-                messages.add(ChatMessage("Memory saved.", mine = false))
+                messages.add(ChatMessage(text = "Memory saved.", mine = false))
             }.onFailure { error = it.message }
         }
     }
@@ -175,7 +175,7 @@ class ChatController(
         scope.launch {
             try {
                 val r = ApiClient.approve(approved, p)
-                messages.add(ChatMessage(r.message, mine = false))
+                messages.add(ChatMessage(text = r.message, mine = false))
             } catch (e: Exception) {
                 error = e.message
             } finally {
