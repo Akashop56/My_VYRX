@@ -76,7 +76,7 @@ import com.ronin.ai.ui.tools.ToolsScreen
  * FragmentActivity (not ComponentActivity) so AndroidX BiometricPrompt can be
  * used for the App Lock feature.
  */
-class MainActivity : FragmentActivity() {
+open class MainActivity : FragmentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -90,7 +90,7 @@ class MainActivity : FragmentActivity() {
 @Composable
 fun VyRxApp(activity: FragmentActivity) {
     val context = activity
-    val settingsRepo = remember { AppSettingsRepository(context) }
+    val settingsRepo = remember { (context.application as RoninApp).settingsRepository }
     val providerRepo = remember { ProviderRepository(context) }
     val controller = remember {
         ChatController(
@@ -98,6 +98,9 @@ fun VyRxApp(activity: FragmentActivity) {
             providersProvider = { providerRepo.load() },
             settingsProvider = { settingsRepo.settings.value }
         )
+    }
+    androidx.compose.runtime.DisposableEffect(controller) {
+        onDispose { controller.dispose() }
     }
     val settings by settingsRepo.settings.collectAsState()
 

@@ -261,8 +261,8 @@ fun SettingsScreen(
 
             // API Providers + App & System
             item {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    GlassCard(Modifier.weight(1f)) {
+                Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    GlassCard(Modifier.fillMaxWidth()) {
                         CardHeader(Icons.Filled.Cloud, "API PROVIDERS", "Manage your AI service keys")
                         Spacer(Modifier.height(4.dp))
                         MiniProviderRow(Icons.Filled.Bolt, Color(0xFFEF4444), "Groq API", "groq")
@@ -290,7 +290,7 @@ fun SettingsScreen(
                             }
                         }
                     }
-                    GlassCard(Modifier.weight(1f)) {
+                    GlassCard(Modifier.fillMaxWidth()) {
                         CardHeader(Icons.Filled.PhoneAndroid, "APP & SYSTEM", "Device and app permissions")
                         Spacer(Modifier.height(4.dp))
                         SettingsRow(
@@ -354,12 +354,12 @@ fun SettingsScreen(
 
             // Privacy & Security + Notifications
             item {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    GlassCard(Modifier.weight(1f)) {
+                Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    GlassCard(Modifier.fillMaxWidth()) {
                         CardHeader(Icons.Filled.Lock, "PRIVACY & SECURITY", "Your data, your control")
                         Spacer(Modifier.height(4.dp))
                         SettingsRow(
-                            Icons.Filled.Shield, "Data Encryption", "End-to-end encryption",
+                            Icons.Filled.Shield, "Data Encryption", "Encrypted local preferences",
                             trailing = {
                                 Text("Enabled", color = VyRxColors.Green, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                             }
@@ -399,7 +399,7 @@ fun SettingsScreen(
                             }
                         )
                     }
-                    GlassCard(Modifier.weight(1f)) {
+                    GlassCard(Modifier.fillMaxWidth()) {
                         CardHeader(Icons.Filled.Notifications, "NOTIFICATIONS", "Manage alerts and updates")
                         Spacer(Modifier.height(4.dp))
                         SettingsRow(
@@ -437,8 +437,8 @@ fun SettingsScreen(
 
             // Appearance + Support & About
             item {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    GlassCard(Modifier.weight(1f)) {
+                Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    GlassCard(Modifier.fillMaxWidth()) {
                         CardHeader(Icons.Filled.DarkMode, "APPEARANCE", "Customize the look and feel")
                         Spacer(Modifier.height(4.dp))
                         SettingsRow(
@@ -478,7 +478,7 @@ fun SettingsScreen(
                             }
                         )
                     }
-                    GlassCard(Modifier.weight(1f)) {
+                    GlassCard(Modifier.fillMaxWidth()) {
                         CardHeader(Icons.Filled.Info, "SUPPORT & ABOUT", "Help, legal and app information")
                         Spacer(Modifier.height(4.dp))
                         SettingsRow(Icons.Filled.Help, "Help & Support", "FAQ, troubleshooting", onClick = { onToast("Help: keep Termux running and check the Brain log in Termux.") })
@@ -646,7 +646,7 @@ private fun SettingsRow(
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Text(title, color = VyRxColors.TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-            Text(subtitle, color = VyRxColors.TextFaint, fontSize = 10.sp, maxLines = 1)
+            Text(subtitle, color = VyRxColors.TextFaint, fontSize = 10.sp)
         }
         trailing?.invoke()
     }

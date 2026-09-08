@@ -6,7 +6,7 @@ import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityEvent
 import com.ronin.ai.network.AndroidCommand
 
-class RoninAccessibilityService : AccessibilityService() {
+open class RoninAccessibilityService : AccessibilityService() {
  companion object { var instance: RoninAccessibilityService? = null; private set }
  override fun onServiceConnected() { instance=this }
  override fun onDestroy() { if(instance===this) instance=null; super.onDestroy() }

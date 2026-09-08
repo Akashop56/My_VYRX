@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Literal
 from pydantic import BaseModel, Field, model_validator
 
-Action = Literal["click", "set_text", "scroll_forward", "scroll_backward", "global_back", "global_home", "open_bubble"]
+Action = Literal["click", "set_text", "scroll_forward", "scroll_backward", "global_back", "global_home", "open_bubble", "open_app"]
 
 class AndroidCommand(BaseModel):
     action: Action
@@ -18,6 +18,10 @@ class AndroidCommand(BaseModel):
 def command_for_request(message: str) -> AndroidCommand | None:
     normalized = message.strip()
     lower = normalized.lower()
+    for prefix in ("open app ", "launch app ", "open ", "launch "):
+        if lower.startswith(prefix) and normalized[len(prefix):].strip():
+            target = normalized[len(prefix):].strip()
+            return AndroidCommand(action="open_app", text=target)
     if lower.startswith("click "):
         return AndroidCommand(action="click", text=normalized[6:].strip())
     if lower.startswith("type "):

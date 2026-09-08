@@ -1,5 +1,7 @@
 package com.ronin.ai.ui.home
 
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -76,7 +78,7 @@ fun HomeScreen(
     val orbState = orbStateFromName(state.state)
     var logExpanded by remember { mutableStateOf(true) }
 
-    Column(Modifier.fillMaxWidth()) {
+    Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
         VyRxTopBar(
             title = "VYRX",
             subtitle = "A I   A S S I S T A N T",
@@ -84,55 +86,30 @@ fun HomeScreen(
             trailing = { VyRxIconButton(Icons.Filled.Tune, onClick = { onNavigate("settings") }) }
         )
 
-        // Hero: Active Model | ORB + AI STATE | Today's Summary
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
-            verticalAlignment = Alignment.CenterVertically
+        // Stack the hero so no card competes with the orb for phone width.
+        Column(
+            Modifier.fillMaxWidth().padding(12.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            ActiveModelCard(
-                model = state.model ?: state.provider,
-                responseMs = state.responseMs,
-                online = state.online,
-                Modifier.weight(1f)
-            )
-            Spacer(Modifier.width(8.dp))
-            Column(Modifier.width(148.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                AiOrb(orbState, Modifier.size(112.dp))
-                Spacer(Modifier.height(4.dp))
-                SectionLabel("AI STATE")
-                Text(
-                    orbStateLabel(orbState),
-                    color = orbColor(orbState),
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                Text(
-                    if (state.online) state.message else "Brain offline",
-                    color = VyRxColors.TextDim,
-                    fontSize = 10.sp,
-                    maxLines = 1
-                )
-                Spacer(Modifier.height(6.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
-                    repeat(6) { i ->
-                        NeonDot(orbColor(orbState), size = if (i < 4) 6 else 4)
-                    }
-                }
-            }
-            Spacer(Modifier.width(8.dp))
-            TodaySummaryCard(
-                tasks = summary?.today?.tasksCompleted ?: 0,
-                auto = summary?.today?.autoTasks ?: 0,
-                learned = summary?.today?.learned ?: 0,
-                Modifier.weight(1f)
-            )
+            AiOrb(orbState, Modifier.size(112.dp))
+            SectionLabel("AI STATE")
+            Text(orbStateLabel(orbState), color = orbColor(orbState), fontSize = 16.sp,
+                fontWeight = FontWeight.Bold)
+            Text(if (state.online) state.message else "Brain offline",
+                color = VyRxColors.TextDim, fontSize = 12.sp)
+            ActiveModelCard(state.model ?: state.provider, state.responseMs, state.online,
+                Modifier.fillMaxWidth())
+            TodaySummaryCard(summary?.today?.tasksCompleted ?: 0,
+                summary?.today?.autoTasks ?: 0, summary?.today?.learned ?: 0,
+                Modifier.fillMaxWidth())
         }
 
         // Action log (real-time stream)
         ActionLogPanel(logs = logs, expanded = logExpanded, onToggle = { logExpanded = !logExpanded })
 
         // Chat (shared panel)
-        ChatPanel(controller, onVoiceStart, Modifier.weight(1f))
+        ChatPanel(controller, onVoiceStart, Modifier.fillMaxWidth().height(420.dp))
 
         // Health card
         HealthCard(health, state, cpuHistory, onNavigate)

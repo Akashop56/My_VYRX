@@ -127,12 +127,9 @@ def _filter_tools(tools: list[dict], tools_enabled: dict[str, bool]) -> list[dic
     """Map UI tool toggles onto registry tool names."""
     if not tools_enabled:
         return tools
-    blocked = {name for name, enabled in tools_enabled.items() if not enabled}
-    if "web_search" in blocked:
-        tools = [t for t in tools if t.get("function", {}).get("name") != "search"]
-    if "app_control" in blocked:
-        tools = [t for t in tools if t.get("function", {}).get("name") != "command_for_request"]
-    return tools
+    return [tool for tool in tools if tools_enabled.get(
+        _tool_catalog_id(tool.get("function", {}).get("name", "")), True
+    )]
 
 
 def _tool_catalog_id(function_name: str) -> str:
@@ -245,6 +242,20 @@ async def _run_tool_creation(request: AskRequest, ctx: BrainContext) -> AskRespo
 
 
 async def _run_llm(request: AskRequest, ctx: BrainContext) -> AskResponse:
+    """Contain provider failures, including failures after a tool result."""
+    try:
+        return await _run_llm_unchecked(request, ctx)
+    except LLMError:
+        ctx.log.log("All configured AI providers failed", "error")
+        ctx.state.set("idle", "AI unavailable. Please retry.")
+        return AskResponse(
+            response="The AI service is temporarily unavailable. Please check your provider settings and try again.",
+            route="llm",
+            error="llm_unavailable",
+        )
+
+
+async def _run_llm_unchecked(request: AskRequest, ctx: BrainContext) -> AskResponse:
     log, stats, pm, state = ctx.log, ctx.stats, ctx.provider_manager, ctx.state
     history = await recent_history(request.session_id)
     system_prompt = build_system_prompt(request.personality, request.response_mode)
@@ -397,12 +408,13 @@ async def plan_request(request: AskRequest, ctx: BrainContext, settings_path: Pa
         result = AskResponse(response="RONIN could not complete that request.", route=decision.route, error=str(exc))
 
     await save_conversation(request.session_id, message, result.response)
-    await stats.bump("tasks_completed")
+    if result.error is None:
+        await stats.bump("tasks_completed")
     if str(request.input_mode or "text").lower() == "voice":
         await stats.bump("voice_commands")
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
-    log.log(f"Request complete in {elapsed_ms} ms", "success")
+    log.log(f"Request complete in {elapsed_ms} ms", "warning" if result.error else "success")
     state.set("idle", "Ready. Waiting for your command.",
               provider=ctx.provider_manager.active_name([p.model_dump() for p in request.providers]),
               response_ms=elapsed_ms)
