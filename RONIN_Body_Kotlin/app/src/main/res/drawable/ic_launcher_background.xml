@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    VYRX launcher icon — background layer (adaptive icon).
+    Deep space-dark base with a subtle radial glow so the foreground orb
+    reads as "lit from within" on any launcher shape (circle, squircle, …).
+
+    Viewport 108 × 108 dp  (Android adaptive-icon standard).
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Solid dark base — matches VyRxColors.Background (#05060A). -->
+    <path
+        android:fillColor="#FF05060A"
+        android:pathData="M0,0h108v108H0z" />
+
+    <!-- Soft purple ambient glow behind the core. -->
+    <path
+        android:fillColor="#148B5CF6"
+        android:pathData="M54,54m-36,0a36,36 0,1 1,72 0a36,36 0,1 1,-72 0" />
+
+    <!-- Tighter cyan glow — gives the core its "powered-up" halo. -->
+    <path
+        android:fillColor="#0F38BDF8"
+        android:pathData="M54,54m-22,0a22,22 0,1 1,44 0a22,22 0,1 1,-44 0" />
+</vector>
