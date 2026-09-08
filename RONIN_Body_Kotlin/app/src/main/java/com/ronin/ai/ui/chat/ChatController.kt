@@ -107,9 +107,10 @@ class ChatController(
                 val r = executeAsk(prompt, fromVoice)
                 messages.add(ChatMessage(text = r.response, mine = false))
                 r.command?.let { command ->
-                    val executed = CommandExecutor.execute(appContext, command).getOrDefault(false)
+                    val execution = CommandExecutor.execute(appContext, command)
+                    val executed = execution.getOrDefault(false)
                     if (!executed) {
-                        messages.add(ChatMessage(text = "Android command was prepared but could not run; enable Accessibility or required permissions.", mine = false))
+                        messages.add(ChatMessage(text = execution.exceptionOrNull()?.localizedMessage ?: "Android command could not run; check required permissions or Accessibility.", mine = false))
                     }
                 }
                 proposal = r.update_proposal

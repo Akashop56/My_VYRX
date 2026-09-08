@@ -175,15 +175,15 @@ fun DashboardScreen(onOpenDrawer: () -> Unit, onNavigate: (String) -> Unit) {
                 GlassCard(Modifier.fillMaxWidth()) {
                     SectionHeader("SYSTEM HEALTH", "View Details", null)
                     Spacer(Modifier.height(10.dp))
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        HealthMiniTile(Modifier.weight(1f)) {
+                    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        HealthMiniTile(Modifier.fillMaxWidth()) {
                             SectionLabel("Memory Usage")
                             Spacer(Modifier.height(6.dp))
                             RingProgress(
                                 (health?.memoryPercent ?: 0f) / 100f, VyRxColors.Green, Modifier.size(52.dp), "RAM"
                             )
                         }
-                        HealthMiniTile(Modifier.weight(1f)) {
+                        HealthMiniTile(Modifier.fillMaxWidth()) {
                             SectionLabel("Storage")
                             Spacer(Modifier.height(6.dp))
                             Text("${fmt1(health?.storageUsedGb ?: 0f)} GB", color = VyRxColors.TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.Bold)
@@ -199,7 +199,7 @@ fun DashboardScreen(onOpenDrawer: () -> Unit, onNavigate: (String) -> Unit) {
                                 color = VyRxColors.Green, fontSize = 9.sp
                             )
                         }
-                        HealthMiniTile(Modifier.weight(1f)) {
+                        HealthMiniTile(Modifier.fillMaxWidth()) {
                             SectionLabel("CPU Load")
                             Spacer(Modifier.height(6.dp))
                             Text("${(health?.cpuPercent ?: 0f).toInt()}%", color = VyRxColors.TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.Bold)
@@ -212,12 +212,12 @@ fun DashboardScreen(onOpenDrawer: () -> Unit, onNavigate: (String) -> Unit) {
                                 fontSize = 9.sp
                             )
                         }
-                        HealthMiniTile(Modifier.weight(1f)) {
+                        HealthMiniTile(Modifier.fillMaxWidth()) {
                             SectionLabel("API Status")
                             Spacer(Modifier.height(6.dp))
                             Text(
                                 (state.provider ?: "No API").replaceFirstChar { it.uppercase() } + " API",
-                                color = VyRxColors.TextPrimary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1
+                                color = VyRxColors.TextPrimary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold
                             )
                             Spacer(Modifier.height(6.dp))
                             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -253,16 +253,16 @@ fun DashboardScreen(onOpenDrawer: () -> Unit, onNavigate: (String) -> Unit) {
                             Text("Loading activity...", color = VyRxColors.TextDim, fontSize = 12.sp)
                         }
                     } else {
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            ActivityTile(Modifier.weight(1f), VyRxColors.Green, "${today.tasksCompleted}", "Tasks Completed", today, yesterday, { it.tasksCompleted })
-                            ActivityTile(Modifier.weight(1f), VyRxColors.Blue, "${today.autoTasks}", "Auto Tasks", today, yesterday, { it.autoTasks })
-                            ActivityTile(Modifier.weight(1f), VyRxColors.Amber, "${today.learned}", "Things Learned", today, yesterday, { it.learned })
+                        Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            ActivityTile(Modifier.fillMaxWidth(), VyRxColors.Green, "${today.tasksCompleted}", "Tasks Completed", today, yesterday, { it.tasksCompleted })
+                            ActivityTile(Modifier.fillMaxWidth(), VyRxColors.Blue, "${today.autoTasks}", "Auto Tasks", today, yesterday, { it.autoTasks })
+                            ActivityTile(Modifier.fillMaxWidth(), VyRxColors.Amber, "${today.learned}", "Things Learned", today, yesterday, { it.learned })
                         }
                         Spacer(Modifier.height(8.dp))
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            ActivityTile(Modifier.weight(1f), VyRxColors.PrimaryBright, "${today.voiceCommands}", "Voice Commands", today, yesterday, { it.voiceCommands })
-                            ActivityTile(Modifier.weight(1f), VyRxColors.Blue, "${today.appsOpened}", "Apps Opened", today, yesterday, { it.appsOpened })
-                            ActivityTile(Modifier.weight(1f), VyRxColors.Green, "${today.webSearches}", "Web Searches", today, yesterday, { it.webSearches })
+                        Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            ActivityTile(Modifier.fillMaxWidth(), VyRxColors.PrimaryBright, "${today.voiceCommands}", "Voice Commands", today, yesterday, { it.voiceCommands })
+                            ActivityTile(Modifier.fillMaxWidth(), VyRxColors.Blue, "${today.appsOpened}", "Apps Opened", today, yesterday, { it.appsOpened })
+                            ActivityTile(Modifier.fillMaxWidth(), VyRxColors.Green, "${today.webSearches}", "Web Searches", today, yesterday, { it.webSearches })
                         }
                     }
                 }
@@ -270,8 +270,8 @@ fun DashboardScreen(onOpenDrawer: () -> Unit, onNavigate: (String) -> Unit) {
 
             // TASKS OVER TIME + TOP TOOLS
             item {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    GlassCard(Modifier.weight(1f)) {
+                Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    GlassCard(Modifier.fillMaxWidth()) {
                         SectionHeader("TASKS OVER TIME")
                         Spacer(Modifier.height(10.dp))
                         val overTime = summary?.tasksOverTime
@@ -283,7 +283,7 @@ fun DashboardScreen(onOpenDrawer: () -> Unit, onNavigate: (String) -> Unit) {
                             TaskBarChart(overTime, Modifier.fillMaxWidth().height(150.dp))
                         }
                     }
-                    GlassCard(Modifier.weight(1f)) {
+                    GlassCard(Modifier.fillMaxWidth()) {
                         SectionHeader("TOP TOOLS USED", "See All", { onNavigate("tools") })
                         Spacer(Modifier.height(10.dp))
                         val top = summary?.topTools.orEmpty()
@@ -300,8 +300,8 @@ fun DashboardScreen(onOpenDrawer: () -> Unit, onNavigate: (String) -> Unit) {
 
             // RECENT AUTOMATIONS + LEARNING
             item {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    GlassCard(Modifier.weight(1f)) {
+                Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    GlassCard(Modifier.fillMaxWidth()) {
                         SectionHeader("RECENT AUTOMATIONS", "See All", null)
                         Spacer(Modifier.height(10.dp))
                         val events = summary?.recentAutomations.orEmpty()
@@ -313,7 +313,7 @@ fun DashboardScreen(onOpenDrawer: () -> Unit, onNavigate: (String) -> Unit) {
                             Spacer(Modifier.height(8.dp))
                         }
                     }
-                    GlassCard(Modifier.weight(1f)) {
+                    GlassCard(Modifier.fillMaxWidth()) {
                         SectionHeader("LEARNING STATUS", "See All", { onNavigate("memory") })
                         Spacer(Modifier.height(12.dp))
                         val learning = summary?.learning
@@ -376,7 +376,7 @@ private fun HealthMiniTile(modifier: Modifier = Modifier, content: @Composable (
             .border(1.dp, VyRxColors.CardStrokeSoft, RoundedCornerShape(14.dp))
             .padding(10.dp)
     ) {
-        Column { content() }
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) { content() }
     }
 }
 
@@ -398,7 +398,7 @@ private fun ActivityTile(
             .border(1.dp, VyRxColors.CardStrokeSoft, RoundedCornerShape(14.dp))
             .padding(10.dp)
     ) {
-        Column {
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Box(
                 Modifier
                     .size(24.dp)
@@ -418,12 +418,12 @@ private fun ActivityTile(
             }
             Spacer(Modifier.height(6.dp))
             Text(value, color = VyRxColors.TextPrimary, fontSize = 17.sp, fontWeight = FontWeight.Bold)
-            Text(label, color = VyRxColors.TextDim, fontSize = 8.5.sp, maxLines = 2)
+            Text(label, color = VyRxColors.TextDim, fontSize = 13.sp)
             Text(
                 if (shownDelta > 0) "↑ ${shownDelta} vs yesterday" else "— vs yesterday",
                 color = if (shownDelta > 0) VyRxColors.Green else VyRxColors.TextFaint,
-                fontSize = 8.sp,
-                maxLines = 1
+                fontSize = 12.sp,
+                softWrap = true
             )
         }
     }
@@ -456,8 +456,8 @@ private fun AutomationRow(event: AutomationEvent) {
         }
         Spacer(Modifier.width(10.dp))
         Column(Modifier.weight(1f)) {
-            Text(event.label, color = VyRxColors.TextPrimary, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
-            Text("Automation • ${event.time}", color = VyRxColors.TextFaint, fontSize = 9.sp, maxLines = 1)
+            Text(event.label, color = VyRxColors.TextPrimary, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+            Text("Automation • ${event.time}", color = VyRxColors.TextFaint, fontSize = 9.sp)
         }
         Row(
             Modifier

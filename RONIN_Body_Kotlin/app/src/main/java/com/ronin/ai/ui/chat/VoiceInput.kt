@@ -46,7 +46,7 @@ object VoiceInput {
             override fun onRmsChanged(rmsdB: Float) {}
             override fun onBufferReceived(buffer: ByteArray?) {}
             override fun onEndOfSpeech() {
-                isListening = false
+                // Keep the session active while final transcription is pending.
             }
             override fun onError(error: Int) {
                 isListening = false
@@ -67,7 +67,7 @@ object VoiceInput {
         })
         val intent = android.content.Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toLanguageTag())
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
         }
         rec.startListening(intent)
@@ -75,7 +75,7 @@ object VoiceInput {
 
     fun stop() {
         try {
-            recognizer?.stopListening()
+            recognizer?.cancel()
             recognizer?.destroy()
         } catch (_: Exception) { /* already destroyed */ }
         recognizer = null

@@ -4,6 +4,8 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.provider.Settings
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -199,19 +201,18 @@ fun ToolsScreen(
                 .clip(RoundedCornerShape(16.dp))
                 .background(Color(0xFF0B0F17))
                 .border(1.dp, VyRxColors.CardStrokeSoft, RoundedCornerShape(16.dp))
-                .padding(4.dp),
+                .padding(4.dp).horizontalScroll(rememberScrollState()),
             horizontalArrangement = Arrangement.spacedBy(2.dp)
         ) {
             TABS.forEach { (value, label) ->
                 val active = tab == value
                 Box(
                     Modifier
-                        .weight(1f)
                         .clip(RoundedCornerShape(12.dp))
                         .background(if (active) VyRxColors.Primary.copy(alpha = 0.22f) else Color.Transparent)
                         .border(1.dp, if (active) VyRxColors.Primary.copy(alpha = 0.55f) else Color.Transparent, RoundedCornerShape(12.dp))
                         .clickable { tab = value }
-                        .padding(vertical = 8.dp),
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
                     contentAlignment = Alignment.Center
                 ) {
                     Text(label, color = if (active) VyRxColors.PrimaryBright else VyRxColors.TextDim, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
@@ -300,7 +301,7 @@ fun ToolsScreen(
                     }
                 if (visible.isEmpty()) return@forEach
                 item(key = "header_${section.title}") {
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(
                                 when (section.title) {
@@ -318,23 +319,15 @@ fun ToolsScreen(
                         Text(section.subtitle, color = VyRxColors.TextFaint, fontSize = 10.sp)
                     }
                 }
-                visible.chunked(2).forEach { row ->
-                    item(key = "row_${row.joinToString(",")}"){
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                            row.forEach { id ->
-                                val tool = byId[id] ?: return@forEach
-                                ToolCard(
-                                    tool = tool,
-                                    enabled = settings.toolsEnabled[id] ?: true,
-                                    onToggle = { enabled ->
-                                        settingsRepo.setToolEnabled(id, enabled)
-                                        scope.launch { refreshTools() }
-                                    },
-                                    modifier = Modifier.weight(1f)
-                                )
-                            }
-                            if (row.size == 1) Spacer(Modifier.weight(1f))
-                        }
+                visible.forEach { id ->
+                    item(key = id) {
+                        val tool = byId[id]
+                        if (tool != null) ToolCard(
+                            tool = tool,
+                            enabled = settings.toolsEnabled[id] ?: true,
+                            onToggle = { settingsRepo.setToolEnabled(id, it) },
+                            modifier = Modifier.fillMaxWidth()
+                        )
                     }
                 }
             }
@@ -351,7 +344,7 @@ private fun ToolCard(tool: ToolInfo, enabled: Boolean, onToggle: (Boolean) -> Un
             .clip(RoundedCornerShape(18.dp))
             .background(Color(0xFF0D1220))
             .border(1.dp, if (active) tint.copy(alpha = 0.35f) else VyRxColors.CardStrokeSoft, RoundedCornerShape(18.dp))
-            .clickable { /* detail: toggled below; reserved for tool settings */ }
+            .clickable { onToggle(!enabled) }
             .padding(14.dp),
         verticalAlignment = Alignment.Top
     ) {
@@ -368,12 +361,12 @@ private fun ToolCard(tool: ToolInfo, enabled: Boolean, onToggle: (Boolean) -> Un
         Spacer(Modifier.width(10.dp))
         Column(Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(tool.name, color = VyRxColors.TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                Text(tool.name, color = VyRxColors.TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
                 Spacer(Modifier.weight(1f))
                 Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = VyRxColors.TextFaint, modifier = Modifier.size(16.dp))
             }
             Spacer(Modifier.height(3.dp))
-            Text(tool.description, color = VyRxColors.TextDim, fontSize = 10.sp, maxLines = 2)
+            Text(tool.description, color = VyRxColors.TextDim, fontSize = 12.sp)
             Spacer(Modifier.height(8.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(
@@ -407,7 +400,10 @@ private fun ToolCard(tool: ToolInfo, enabled: Boolean, onToggle: (Boolean) -> Un
 private fun isNotificationListenerEnabled(context: Context): Boolean {
     return try {
         val enabled = Settings.Secure.getString(context.contentResolver, "enabled_notification_listeners") ?: ""
-        enabled.contains(RoninNotificationListener::class.java.name.substringAfterLast("."))
+        enabled.split(':').any {
+            android.content.ComponentName.unflattenFromString(it)?.className ==
+                "com.ronin.ai.service.RoninNotificationService"
+        }
     } catch (_: Exception) {
         false
     }

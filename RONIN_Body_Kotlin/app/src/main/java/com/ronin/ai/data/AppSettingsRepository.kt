@@ -42,15 +42,13 @@ data class AppSettings(
 
 class AppSettingsRepository(context: Context) {
 
-    private val prefs: SharedPreferences = runCatching {
+    private val prefs: SharedPreferences = run {
         EncryptedSharedPreferences.create(
             context, "vyrx_settings",
             MasterKey.Builder(context).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),
             EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
             EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
         )
-    }.getOrElse {
-        context.getSharedPreferences("vyrx_settings_plain", Context.MODE_PRIVATE)
     }
 
     private val _settings = MutableStateFlow(load())

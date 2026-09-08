@@ -159,6 +159,39 @@ fun ChatInputBar(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val settingsRepo = (context.applicationContext as com.ronin.ai.RoninApp).settingsRepository
+    fun startVoice() {
+        if (!settingsRepo.settings.value.voiceEnabled) {
+            Toast.makeText(context, "Enable Voice Assistant in Settings first.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val receiver = object : android.os.ResultReceiver(android.os.Handler(android.os.Looper.getMainLooper())) {
+            override fun onReceiveResult(code: Int, data: android.os.Bundle?) {
+                val result = data?.getString("text").orEmpty()
+                if (code == 1 && result.isNotBlank()) controller.send(result, fromVoice = true)
+                else Toast.makeText(context, result, Toast.LENGTH_SHORT).show()
+            }
+        }
+        try {
+            androidx.core.content.ContextCompat.startForegroundService(context,
+                android.content.Intent(context, com.ronin.ai.services.ForegroundVoiceService::class.java)
+                    .putExtra("receiver", receiver))
+            onVoiceStart()
+        } catch (e: Exception) {
+            Toast.makeText(context, "Cannot start voice input: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+        }
+    }
+    val permissionLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) startVoice()
+        else Toast.makeText(context, "Microphone permission denied.", Toast.LENGTH_SHORT).show()
+    }
+    androidx.compose.runtime.DisposableEffect(context) {
+        onDispose {
+            context.stopService(android.content.Intent(context, com.ronin.ai.services.ForegroundVoiceService::class.java))
+        }
+    }
     var text by remember { mutableStateOf("") }
     androidx.compose.runtime.LaunchedEffect(controller.prefill) {
         if (controller.prefill.isNotEmpty()) {
@@ -217,25 +250,18 @@ fun ChatInputBar(
                 .border(1.dp, VyRxColors.CardStroke, CircleShape)
                 .clickable {
                     if (VoiceInput.isListening) {
-                        VoiceInput.stop()
+                        context.stopService(android.content.Intent(context, com.ronin.ai.services.ForegroundVoiceService::class.java))
+                    } else if (VoiceInput.hasPermission(context)) {
+                        startVoice()
                     } else {
-                        VoiceInput.requestPermission(context)
-                        VoiceInput.start(
-                            context,
-                            onResult = { recognized ->
-                                if (recognized.isNotBlank()) controller.send(recognized, fromVoice = true)
-                            },
-                            onError = { message ->
-                                Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
-                            }
-                        )
+                        permissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
                     }
                 },
             contentAlignment = Alignment.Center
         ) {
             Icon(
                 Icons.Filled.Mic,
-                null,
+                if (VoiceInput.isListening) "Stop voice input" else "Start voice input",
                 tint = if (VoiceInput.isListening) VyRxColors.Green else VyRxColors.TextPrimary,
                 modifier = Modifier.size(20.dp)
             )
