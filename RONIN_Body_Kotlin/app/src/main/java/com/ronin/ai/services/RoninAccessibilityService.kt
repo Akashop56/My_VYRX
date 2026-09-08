@@ -158,7 +158,7 @@ open class RoninAccessibilityService : AccessibilityService() {
                     val text = node.text?.toString()
                     val desc = node.contentDescription?.toString()
                     // Keep nodes that carry signal; skip empty layout containers.
-                    if (!text.isNullOrBlank() || !desc.isNullOrBlank() || node.isClickable || node.isEditableText) {
+                    if (!text.isNullOrBlank() || !desc.isNullOrBlank() || node.isClickable || node.isEditable) {
                         val bounds = Rect()
                         node.getBoundsInScreen(bounds)
                         val id = "n${nodeCounter++}"
@@ -166,7 +166,7 @@ open class RoninAccessibilityService : AccessibilityService() {
                             id = id, text = text, contentDescription = desc,
                             className = node.className?.toString(), bounds = Rect(bounds),
                             clickable = node.isClickable || node.isCheckable,
-                            editable = node.isEditableText || node.isFocusable,
+                            editable = node.isEditable || node.isFocusable,
                             scrollable = node.isScrollable
                         )
                         out.add(d)
@@ -327,7 +327,7 @@ open class RoninAccessibilityService : AccessibilityService() {
         stack.add(root)
         while (stack.isNotEmpty()) {
             val node = stack.removeLast()
-            if (node.isEditableText || node.actionList.any { it.id == AccessibilityNodeInfo.ACTION_SET_TEXT }) return node
+            if (node.isEditable || node.actionList.any { it.id == AccessibilityNodeInfo.ACTION_SET_TEXT }) return node
             for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
         }
         return null
