@@ -403,7 +403,8 @@ private fun markdownAnnotatedString(source: String): AnnotatedString {
                         appendInlineMarkdown(builder, bullet.groupValues[1])
                     }
                     numbered != null -> {
-                        builder.append(numbered.groupValues[1]).append(". ")
+                        builder.append(numbered.groupValues[1])
+                        builder.append(". ")
                         appendInlineMarkdown(builder, numbered.groupValues[2])
                     }
                     else -> appendInlineMarkdown(builder, rawLine)
