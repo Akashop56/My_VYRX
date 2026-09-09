@@ -38,7 +38,13 @@ import com.ronin.ai.ui.components.HeartbeatOrb
 import com.ronin.ai.ui.theme.VyRxColors
 import com.ronin.ai.ui.theme.orbStateFromName
 
-/** Orb gesture modes for the center bottom-bar orb. */
+/**
+ * Orb gesture modes for the center bottom-bar orb.
+ *
+ * The bottom navigation is only a route selector. Screen content is owned by
+ * the single NavHost in VyRxApp; in particular, this bar never composes a
+ * ChatPanel alongside Home or Dashboard.
+ */
 enum class OrbTap { SHORT, LONG }
 
 @OptIn(ExperimentalFoundationApi::class)

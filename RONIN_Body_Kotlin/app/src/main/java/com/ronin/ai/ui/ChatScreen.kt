@@ -3,13 +3,11 @@ package com.ronin.ai.ui
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import com.ronin.ai.ui.chat.ChatController
 import com.ronin.ai.ui.chat.ChatPanel
 import com.ronin.ai.ui.components.VyRxTopBar
-import com.ronin.ai.ui.theme.VyRxColors
 
 /**
  * Full-screen conversation. Reuses the shared [ChatController] (brain startup,
@@ -19,7 +17,6 @@ import com.ronin.ai.ui.theme.VyRxColors
 fun ChatScreen(
     controller: ChatController,
     onOpenDrawer: () -> Unit,
-    onNavigate: (String) -> Unit,
     onVoiceStart: () -> Unit
 ) {
     Column(Modifier.fillMaxSize()) {

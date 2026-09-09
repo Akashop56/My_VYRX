@@ -424,7 +424,9 @@ object ApiClient {
             o.optString("response", ""),
             o.optString("route", "llm"),
             c, p,
-            o.optString("error").takeIf { value -> value.isNotBlank() },
+            o.optString("error").takeIf {
+                it.isNotBlank() && !it.equals("null", ignoreCase = true)
+            },
             a,
             o.optBoolean("needs_tool_result", false),
             o.optString("thought").takeIf { value -> value.isNotBlank() },

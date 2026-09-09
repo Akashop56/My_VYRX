@@ -8,7 +8,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -43,8 +42,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.ronin.ai.data.BrainRepository
 import com.ronin.ai.network.HealthInfo
-import com.ronin.ai.ui.chat.ChatController
-import com.ronin.ai.ui.chat.ChatPanel
 import com.ronin.ai.ui.components.AiOrb
 import com.ronin.ai.ui.components.LinearBar
 import com.ronin.ai.ui.components.RingProgress
@@ -63,12 +60,8 @@ import kotlin.math.roundToLong
 
 @Composable
 fun HomeScreen(
-    controller: ChatController,
     onOpenDrawer: () -> Unit,
-    onNavigate: (String) -> Unit,
-    onOrbTap: () -> Unit,
-    onOrbLongPress: () -> Unit,
-    onVoiceStart: () -> Unit
+    onNavigate: (String) -> Unit
 ) {
     val state by BrainRepository.state.collectAsState()
     val logs by BrainRepository.logs.collectAsState()
@@ -107,9 +100,6 @@ fun HomeScreen(
 
         // Action log (real-time stream)
         ActionLogPanel(logs = logs, expanded = logExpanded, onToggle = { logExpanded = !logExpanded })
-
-        // Chat (shared panel)
-        ChatPanel(controller, onVoiceStart, Modifier.fillMaxWidth().height(420.dp))
 
         // Health card
         HealthCard(health, state, cpuHistory, onNavigate)
