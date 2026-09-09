@@ -31,6 +31,9 @@ class AskRequest(BaseModel):
     tools_enabled: dict[str, bool] = Field(default_factory=dict)
     personality: str | None = Field(default=None, max_length=32)
     response_mode: str | None = Field(default=None, max_length=32)
+    #: Force the SSE agent stream (thinking / tool_call / observation / token).
+    #: ``None`` = negotiate from the request's ``Accept`` header.
+    stream: bool | None = None
 
 
 class UpdateProposal(BaseModel):
@@ -65,6 +68,9 @@ class AskResponse(BaseModel):
     needs_tool_result: bool = False
     thought: str | None = None
     steps: int = 0
+    #: True when the answer was (or will be) delivered over the live SSE
+    #: stream instead of this JSON body — a streamed turn ends with `done`.
+    streamed: bool = False
 
 
 class ToolResultRequest(BaseModel):

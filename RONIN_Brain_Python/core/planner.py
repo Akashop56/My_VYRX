@@ -15,6 +15,15 @@ Each step emits an action-log entry and a state change, which the body
 consumes through ``GET /api/state``, ``GET /api/action_logs`` and the SSE
 stream ``GET /api/events``.
 
+``POST /ask_ronin`` can additionally run the whole loop *inside* a live SSE
+stream (see :mod:`core.streaming`): ``thinking`` / ``thought`` / ``tool_call``
+/ ``observation`` / ``self_correction`` frames are emitted as they happen, the
+final plain-text answer is streamed chunk-by-chunk for the Body's typing
+effect, and a dispatched device tool is awaited over the same connection
+(:data:`core.streaming.TOOL_RESULT_BRIDGE`) instead of ending the request.
+Streaming is purely additive: with no stream bound, every function below behaves
+exactly as it always did.
+
 Legacy keyword routes (``legacy_route``) survive as offline fallbacks when no
 AI provider is reachable, so explicit commands keep working with zero keys.
 """
@@ -28,7 +37,7 @@ import traceback
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 from core.action_log import ActionLog
 from core.llm_handler import (
@@ -44,6 +53,22 @@ from core.router import legacy_route, route_request
 from core.schemas import AgentAction, AskRequest, AskResponse, ToolResultRequest, UpdateProposal
 from core.state_manager import StateManager
 from core.stats import StatsTracker
+from core.streaming import (
+    EVENT_DONE,
+    EVENT_ERROR,
+    EVENT_OBSERVATION,
+    EVENT_SELF_CORRECTION,
+    EVENT_START,
+    EVENT_THINKING,
+    EVENT_TOOL_CALL,
+    TOOL_RESULT_BRIDGE,
+    TOOL_RESULT_TIMEOUT_SECONDS,
+    AgentStreamer,
+    bind_stream,
+    current_stream,
+    emit_event,
+    unbind_stream,
+)
 from core.tool_registry import execute_tool, get_available_tools
 from core.tools_catalog import (
     HIDDEN_LEGACY_TOOLS,
@@ -62,6 +87,16 @@ MAX_AGENT_STEPS = 8
 
 #: Truncation for tool observations fed back into the context window.
 MAX_OBSERVATION_CHARS = 6000
+
+#: Politeness gap between ReAct steps (GROQ rate limit bypass). Kept as a
+#: module constant so tests and local runs can retune it without patching
+#: ``asyncio.sleep`` globally.
+RATE_LIMIT_PAUSE_SECONDS: float = 2.0
+
+
+async def _rate_limit_pause() -> None:
+    if RATE_LIMIT_PAUSE_SECONDS > 0:
+        await asyncio.sleep(RATE_LIMIT_PAUSE_SECONDS)
 
 
 def _clip(text: str, limit: int = 64) -> str:
@@ -171,6 +206,66 @@ class BrainContext:
 
 
 # ---------------------------------------------------------------------------
+# Live stream helpers
+#
+# A request either owns an AgentStreamer (streamed /ask_ronin) or none at all
+# (legacy JSON contract). Every helper below degrades to a no-op in the second
+# case, which is what keeps the pre-existing behaviour byte-for-byte identical.
+# ---------------------------------------------------------------------------
+
+def _stream() -> AgentStreamer | None:
+    return current_stream()
+
+
+def _thinking(text: str, *, step: int = 0, phase: str = "plan") -> None:
+    emit_event(EVENT_THINKING, step=step, phase=phase, text=text)
+
+
+def _tool_call(step: int, tool: str, arguments: dict, *, device: bool,
+               label: str | None = None, thought: str | None = None,
+               action: dict | None = None) -> None:
+    emit_event(
+        EVENT_TOOL_CALL,
+        step=step,
+        tool=tool,
+        label=label or tool_label(_tool_catalog_id(tool)),
+        args=arguments,
+        device=device,
+        thought=thought or None,
+        action=action,
+    )
+
+
+def _observation(step: int, tool: str, ok: bool, result: str, ms: int) -> None:
+    emit_event(EVENT_OBSERVATION, step=step, tool=tool, ok=bool(ok), ms=int(ms),
+               result=_clip(str(result), 320))
+
+
+def _self_correction(step: int, tool: str | None, reason: str, strategy: str,
+                     attempt: int = 0) -> None:
+    """One frame per healing attempt; ``reflexion`` is the semantic alias."""
+    emit_event(
+        EVENT_SELF_CORRECTION,
+        step=step,
+        tool=tool,
+        reason=_clip(reason, 240),
+        strategy=strategy,
+        attempt=attempt,
+        reflexion=_clip(reason, 240),
+    )
+
+
+def _correction_for_failure(result_text: str, tool_name: str) -> str:
+    """Turn a raw tool failure into the agent's stated recovery strategy."""
+    lowered = str(result_text or "").casefold()
+    if "timeout" in lowered:
+        return "retry with a shorter timeout, then degrade gracefully"
+    if "not found" in lowered or "no such" in lowered or "error" in lowered:
+        return f"change strategy instead of repeating {tool_name} (re-inspect, different args, or another tool)"
+    return "re-read the state and try a different approach"
+
+
+# ---------------------------------------------------------------------------
 # Pending device-action sessions (Body executes, then calls back)
 # ---------------------------------------------------------------------------
 
@@ -267,6 +362,11 @@ async def _run_android_command(request: AskRequest, ctx: BrainContext) -> AskRes
     command = command_for_request(request.message)
     ctx.state.set("executing", f"Executing: {command.action}...")
     ctx.log.log(f"Executing device command: {command.action}", "tool")
+    # The offline/legacy path hands the command to the Body in the response, so
+    # there is no observation to wait for — still surface the intent in the log.
+    _tool_call(0, command.action, command.model_dump(mode="json", exclude_none=True), device=True,
+               label=f"Device command · {command.action}")
+    _observation(0, command.action, True, "Queued on the Body for execution.", 0)
     await ctx.stats.bump("apps_opened")
     await ctx.stats.record_tool_usage("app_control", command.action, True)
     return AskResponse(
@@ -285,16 +385,20 @@ async def _run_web_search(request: AskRequest, ctx: BrainContext) -> AskResponse
     query = request.message.split(" ", 2)[-1]
     ctx.state.set("executing", "Searching web...")
     ctx.log.log(f"Searching web for: \"{_clip(query, 48)}\"", "tool")
+    _tool_call(0, "search", {"query": query}, device=False, label="Web Search")
     started = time.monotonic()
     try:
         data = await asyncio.to_thread(search, query)
     except Exception as exc:
         await ctx.stats.record_tool_usage("web_search", query, False)
         ctx.log.log(f"Web search failed: {exc}", "error")
+        _observation(0, "search", False, str(exc), int((time.monotonic() - started) * 1000))
+        _self_correction(0, "search", str(exc), "answer from memory/reasoning instead of search")
         return AskResponse(response=f"Web search failed: {exc}", route="web_search", error=str(exc))
     latency_ms = int((time.monotonic() - started) * 1000)
     results = data.get("results") or []
     ctx.log.log(f"Parsing {len(results)} results...", "info")
+    _observation(0, "search", len(results) > 0, f"{len(results)} results parsed", latency_ms)
     await ctx.stats.bump("web_searches")
     await ctx.stats.record_tool_usage("web_search", query, len(results) > 0)
     response = "\n".join(f"{x['title']}: {x['snippet']}" for x in results) or "No web results were returned."
@@ -305,6 +409,7 @@ async def _run_local_tool(request: AskRequest, ctx: BrainContext) -> AskResponse
     fact = request.message.split(" ", 1)[-1]
     ctx.state.set("learning", "Saving memory...")
     ctx.log.log("Saving memory...", "info")
+    _tool_call(0, "save_memory", {"content": _clip(fact, 120)}, device=False, label="Agent Memory")
     await store_fact(fact[:120].lower(), fact)
     title = _clip(fact, 48)
     await ctx.memory_engine.add(category="knowledge", title=title, content=fact,
@@ -312,6 +417,7 @@ async def _run_local_tool(request: AskRequest, ctx: BrainContext) -> AskResponse
     await ctx.stats.bump("learned")
     await ctx.stats.record_tool_usage("note_creator", title, True)
     ctx.log.log(f"Memory saved: \"{title}\"", "success")
+    _observation(0, "save_memory", True, f"Stored as \"{title}\"", 0)
     return AskResponse(response="Stored in persistent memory.", route="local_tool")
 
 
@@ -327,13 +433,18 @@ async def _run_tool_creation(request: AskRequest, ctx: BrainContext) -> AskRespo
     )
     ctx.state.set("thinking", "Generating code...")
     ctx.log.log("Generating new tool code...", "info")
+    _thinking("Developer agent: writing a new Python tool", phase="call")
     provider_payload = [provider.model_dump() for provider in request.providers]
     started = time.monotonic()
+    stream = _stream()
     completion = await asyncio.to_thread(
         complete, request.message, [], provider_payload,
         system_prompt=tool_creation_system_prompt,
+        on_delta=stream.delta_forwarder(0) if stream is not None else None,
     )
     elapsed_ms = int((time.monotonic() - started) * 1000)
+    if stream is not None:
+        stream.flush_delta(0)
     _record_provider_latency(ctx, completion, elapsed_ms, provider_payload)
     generated_code = _response_text(_assistant_message(completion))
     cleaned_code = generated_code.replace("```python", "").replace("```", "").strip()
@@ -365,6 +476,8 @@ async def _run_llm(request: AskRequest, ctx: BrainContext) -> AskResponse:
     except LLMError:
         ctx.log.log("All configured AI providers failed", "error")
         ctx.state.set("idle", "AI unavailable. Please retry.")
+        _self_correction(0, None, "all configured AI providers failed",
+                          "offline legacy route (keyword commands without a key)")
         return AskResponse(
             response="The AI service is temporarily unavailable. Please check your provider settings and try again.",
             route="llm",
@@ -374,9 +487,20 @@ async def _run_llm(request: AskRequest, ctx: BrainContext) -> AskResponse:
 
 async def _run_llm_unchecked(request: AskRequest, ctx: BrainContext) -> AskResponse:
     log, stats, pm, state = ctx.log, ctx.stats, ctx.provider_manager, ctx.state
+    stream = _stream()
     history = await recent_history(request.session_id)
+    if stream is not None and history:
+        stream.emit(EVENT_THINKING, step=0, phase="recall",
+                    text=f"Recalling {len(history)} previous turn(s) for this session")
     system_prompt = build_system_prompt(request.personality, request.response_mode)
-    system_prompt += await _memory_context(ctx, request.message)
+    memory_block = await _memory_context(ctx, request.message)
+    if memory_block:
+        injected = max(0, len([line for line in memory_block.splitlines() if line.startswith("- ")]))
+        log.log(f"Injecting {injected} standing order(s) from memory", "info")
+        if stream is not None:
+            stream.emit(EVENT_THINKING, step=0, phase="recall",
+                        text=f"{injected} standing order(s) recalled from long-term memory")
+    system_prompt += memory_block
     provider_payload = [provider.model_dump() for provider in request.providers]
     settings = _runtime_settings(Path(__file__).resolve().parent.parent / "config" / "settings.json")
 
@@ -393,22 +517,39 @@ async def _run_llm_unchecked(request: AskRequest, ctx: BrainContext) -> AskRespo
     if available_tools:
         log.log(f"{len(available_tools)} tools available for this request", "info")
         system_prompt += build_tool_instructions(available_tools)
+        if stream is not None:
+            names = ", ".join(tool.get("function", {}).get("name", "?") for tool in available_tools[:8])
+            stream.emit(EVENT_THINKING, step=0, phase="prompt",
+                        text=f"{len(available_tools)} tools armed: {names}"
+                              + ("…" if len(available_tools) > 8 else ""))
 
     state.set("thinking", "Calling API...")
     active = pm.active_name(provider_payload)
     if active:
         log.log(f"Calling {active} model...", "info")
+    if stream is not None:
+        stream.emit(EVENT_THINKING, step=0, phase="call",
+                    text=f"Calling {active or 'default'} provider"
+                         + (f" ({pm.model_for(active)})" if active else "") + " — reasoning…")
     provider_calls: dict[str, bool] = {}
 
     def _on_provider(name: str, ok: bool) -> None:
         provider_calls[name] = ok
+        if not ok:
+            # Failover is self-healing the user should see happening.
+            emit_event(EVENT_SELF_CORRECTION, step=0, tool=None, reason=f"provider {name} failed",
+                       strategy="failing over to the next configured provider", attempt=0,
+                       reflexion=f"{name} failed — rotating provider")
 
     started = time.monotonic()
     messages = _conversation_messages(request.message, history, system_prompt)
     completion = await asyncio.to_thread(
         complete, request.message, history, provider_payload,
         system_prompt=system_prompt, tools=available_tools, on_provider=_on_provider,
+        on_delta=stream.delta_forwarder(0) if stream is not None else None,
     )
+    if stream is not None:
+        stream.flush_delta(0, text=_stream_visible_thought(_assistant_message(completion)))
     assistant_message = _assistant_message(completion)
     return await _react_loop(
         ctx, provider_payload=provider_payload, available_tools=available_tools,
@@ -418,6 +559,46 @@ async def _run_llm_unchecked(request: AskRequest, ctx: BrainContext) -> AskRespo
         original_message=request.message, started=started,
         input_mode=str(request.input_mode or "text"),
     )
+
+
+def _stream_visible_thought(message: dict) -> str:
+    """The model's own words for this step, safe to show in the terminal."""
+    raw = message.get("reasoning_content") or message.get("content")
+    if not isinstance(raw, str):
+        return ""
+    return strip_tool_tags(raw)[:1200]
+
+
+def _arguments_preview(arguments: dict) -> str:
+    try:
+        return _clip(json.dumps(arguments, ensure_ascii=False, default=str), 120)
+    except (TypeError, ValueError):
+        return "{}"
+
+
+async def _await_device_observation(
+    session_id: str, tool_name: str, timeout: float | None = None,
+) -> tuple[str, bool, str, bool]:
+    """Park the live stream until the Body POSTs /agent/result for this session.
+
+    Returns ``(observation_text, success, tool, timed_out)``. The legacy
+    (non-streamed) contract never gets here: it ends the request and resumes
+    from the saved agent session instead.
+    """
+    limit = timeout if timeout is not None else TOOL_RESULT_TIMEOUT_SECONDS
+    future = TOOL_RESULT_BRIDGE.register(session_id)
+    try:
+        payload = await asyncio.wait_for(future, timeout=limit)
+    except asyncio.TimeoutError:
+        return ("", False, tool_name, True)
+    finally:
+        TOOL_RESULT_BRIDGE.release(session_id, future)
+    result = str(payload.get("result") or "")
+    success = bool(payload.get("success", True))
+    tool = str(payload.get("tool") or tool_name)
+    status = "succeeded" if success else "FAILED"
+    return (f"[{tool} {status}]: {result.strip() or '(empty result)'}", success, tool, False)
+
 
 
 async def _react_loop(
@@ -437,8 +618,17 @@ async def _react_loop(
     started: float,
     input_mode: str = "text",
 ) -> AskResponse:
-    """Thought -> Action -> Observation until final speech or device dispatch."""
+    """Thought -> Action -> Observation until final speech or device dispatch.
+
+    With a live stream attached, dispatched device tools are awaited *inside*
+    the loop (the Body answers on /agent/result, which resolves the bridge), so
+    the whole ReAct run rides one SSE connection. Without a stream the dispatch
+    returns a pending ``AgentAction`` exactly as before.
+    """
     log, stats, state = ctx.log, ctx.stats, ctx.state
+    stream = _stream()
+    #: True once a dispatched device tool has been observed inside this stream.
+    resume_after_dispatch = False
 
     while True:
         tool_calls = extract_tool_calls(assistant_message) if available_tools else []
@@ -446,11 +636,14 @@ async def _react_loop(
             break
         if steps >= MAX_AGENT_STEPS:
             log.log("Agent step budget exhausted; summarizing", "warning")
+            _self_correction(steps, None, f"step budget ({MAX_AGENT_STEPS}) exhausted",
+                             "stop acting and summarize what is verified so far", attempt=steps)
             break
 
         messages.append(_assistant_replay_message(assistant_message, tool_calls))
         replay_index = len(messages) - 1
         brain_done = 0
+        resume_after_dispatch = False
 
         for tool_call in tool_calls:
             function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
@@ -459,12 +652,18 @@ async def _react_loop(
             if not isinstance(arguments, dict):
                 arguments = {}
 
+            raw_thought = assistant_message.get("content")
+            thought = strip_tool_tags(raw_thought)[:2000] if isinstance(raw_thought, str) else None
+
             # --- Device tool: dispatch to the Kotlin Body, await callback ---
             if is_device_tool(tool_name):
                 trimmed = tool_calls[: brain_done + 1]
                 messages[replay_index] = _assistant_replay_message(assistant_message, trimmed)
-                raw_thought = assistant_message.get("content")
-                thought = strip_tool_tags(raw_thought)[:2000] if isinstance(raw_thought, str) else None
+                action_payload = {
+                    "tool": tool_name, "args": arguments,
+                    "tool_call_id": tool_call.get("id") if isinstance(tool_call, dict) else None,
+                    "thought": thought or None,
+                }
                 _save_agent_session(session_id, {
                     "messages": messages,
                     "provider_payload": provider_payload,
@@ -481,22 +680,59 @@ async def _react_loop(
                 catalog_id = _tool_catalog_id(tool_name)
                 state.set("executing", f"Running {tool_label(catalog_id)} on device...")
                 log.log(f"Dispatching device tool: {tool_name} { _clip(json.dumps(arguments, ensure_ascii=False), 80)}", "tool")
-                return AskResponse(
-                    response="",
-                    route="agent_action",
-                    action=AgentAction(
-                        tool=tool_name, args=arguments,
-                        tool_call_id=tool_call.get("id") if isinstance(tool_call, dict) else None,
+                _tool_call(steps, tool_name, arguments, device=True, thought=thought,
+                           label=f"Executing {tool_name} on the Body", action=action_payload)
+                if stream is None:
+                    return AskResponse(
+                        response="",
+                        route="agent_action",
+                        action=AgentAction(**action_payload),
+                        needs_tool_result=True,
                         thought=thought or None,
-                    ),
-                    needs_tool_result=True,
-                    thought=thought or None,
-                    steps=steps,
-                )
+                        steps=steps,
+                    )
+                # Live stream: keep the connection and wait for the observation.
+                dispatch_started = time.monotonic()
+                observation_text, device_ok, observed_tool, timed_out = await _await_device_observation(
+                    session_id, tool_name)
+                device_ms = int((time.monotonic() - dispatch_started) * 1000)
+                if timed_out:
+                    observation_text = f"[{tool_name} TIMEOUT]: no result from the Body in " \
+                                       f"{int(TOOL_RESULT_TIMEOUT_SECONDS)} s"
+                    log.log(f"Device tool {tool_name} timed out waiting for the Body", "error")
+                    # Nobody is coming with an answer: drop the resume session so a
+                    # late callback cannot run the loop a second time.
+                    _clear_agent_session(session_id)
+                if device_ok:
+                    log.log(f"Device tool {tool_name} finished in {device_ms} ms", "success")
+                else:
+                    log.log(f"Device tool {tool_name} failed in {device_ms} ms — agent will self-correct",
+                            "warning")
+                _observation(steps, tool_name, device_ok, observation_text, device_ms)
+                if not device_ok:
+                    _self_correction(
+                        steps, tool_name,
+                        "device action timed out; retry with another strategy" if timed_out
+                        else _clip(observation_text, 200),
+                        _correction_for_failure(observation_text if not timed_out else "timeout", tool_name),
+                        attempt=steps)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": action_payload.get("tool_call_id") or "",
+                    "name": observed_tool or tool_name,
+                    "content": observation_text[:MAX_OBSERVATION_CHARS],
+                })
+                await stats.record_tool_usage(_tool_catalog_id(observed_tool or tool_name),
+                                              _clip(observation_text, 80), device_ok)
+                # One dispatched action per step: reason over its observation now.
+                resume_after_dispatch = True
+                break
 
             # --- Brain tool: execute inline, feed observation back ---
             state.set("executing", f"Running {tool_label(_tool_catalog_id(tool_name))}...")
             log.log(f"Executing tool: {tool_name}", "tool")
+            _tool_call(steps, tool_name, arguments, device=False, thought=thought,
+                       label=f"Executing {tool_name} in the Brain")
             tool_started = time.monotonic()
             try:
                 result_text = await asyncio.to_thread(execute_tool, tool_name, arguments)
@@ -513,11 +749,14 @@ async def _react_loop(
             if catalog_id in {"agent_memory", "note_creator"} and success:
                 await stats.bump("learned")
             brain_tools_called.append(tool_name)
+            _observation(steps, tool_name, success, result_text, tool_ms)
             if success:
                 log.log(f"Tool {tool_name} finished in {tool_ms} ms", "success")
             else:
                 # Self-correction fuel: the next Thought sees the error and adapts.
                 log.log(f"Tool {tool_name} failed in {tool_ms} ms — agent will self-correct", "warning")
+                _self_correction(steps, tool_name, _clip(result_text, 200),
+                                 _correction_for_failure(result_text, tool_name), attempt=steps)
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.get("id", "") if isinstance(tool_call, dict) else "",
@@ -527,11 +766,17 @@ async def _react_loop(
             brain_done += 1
 
         # GROQ RATE LIMIT BYPASS: 2 second ka pause
-        await asyncio.sleep(2)
+        await _rate_limit_pause()
         state.set("thinking", "Reasoning over tool results...")
+        _thinking("Reasoning over tool results…", step=steps + 1,
+                  phase="reason" if not resume_after_dispatch else "verify")
+        next_delta = stream.delta_forwarder(steps + 1) if stream is not None else None
         completion = await asyncio.to_thread(
             complete, "", [], provider_payload, tools=available_tools, messages=messages,
+            on_delta=next_delta,
         )
+        if stream is not None:
+            stream.flush_delta(steps + 1, text=_stream_visible_thought(_assistant_message(completion)))
         assistant_message = _assistant_message(completion)
         steps += 1
 
@@ -543,8 +788,11 @@ async def _react_loop(
     # the model forgot to call save_memory in this task.
     await _ensure_remember_persisted(ctx, original_message, brain_tools_called)
 
-    acted = bool(brain_tools_called) or steps > 0
+    acted = bool(brain_tools_called) or steps > 0 or resume_after_dispatch
     log.log("Response ready", "success")
+    if stream is not None:
+        # The task completed on this connection: no resume session to keep.
+        _clear_agent_session(session_id)
     return AskResponse(
         response=final_text, route="agent_final" if acted else "llm", steps=steps,
     )
@@ -617,7 +865,7 @@ async def continue_with_tool_result(request: ToolResultRequest, ctx: BrainContex
         provider_calls[name] = ok
 
     state.set("thinking", "Reasoning over device result...")
-    await asyncio.sleep(2)  # GROQ RATE LIMIT BYPASS
+    await _rate_limit_pause()  # GROQ RATE LIMIT BYPASS
     try:
         completion = await asyncio.to_thread(
             complete, "", [], provider_payload, tools=available_tools,
@@ -700,8 +948,40 @@ def _tool_disabled(request: AskRequest, tool_id: str) -> bool:
 # Entry point
 # ---------------------------------------------------------------------------
 
-async def plan_request(request: AskRequest, ctx: BrainContext, settings_path: Path | None = None) -> AskResponse:
-    """Full pipeline for one user request (state + logs + stats + answer)."""
+async def plan_request(request: AskRequest, ctx: BrainContext,
+                       settings_path: Path | None = None,
+                       *, stream: AgentStreamer | None = None) -> AskResponse:
+    """Full pipeline for one user request (state + logs + stats + answer).
+
+    Pass ``stream`` to also publish the loop's internal monologue in real time
+    and to stream the final answer chunk-by-chunk; ``None`` keeps the original
+    single-shot JSON behaviour untouched.
+    """
+    log, state, stats = ctx.log, ctx.state, ctx.stats
+    token = bind_stream(stream) if stream is not None else None
+    if stream is not None:
+        stream.bind_loop()
+    try:
+        return await _plan_request_inner(request, ctx, stream=stream)
+    except Exception as exc:  # a stream must always end with a terminal frame
+        if stream is not None:
+            stream.emit(EVENT_ERROR, code="brain_error", message=_clip(str(exc), 300),
+                        fatal=True, elapsed_ms=_elapsed(stream))
+        raise
+    finally:
+        if token is not None:
+            unbind_stream(token)
+
+
+def _elapsed(stream: AgentStreamer | None) -> int:
+    if stream is None:
+        return 0
+    return int((time.monotonic() - stream.started_at) * 1000)
+
+
+async def _plan_request_inner(request: AskRequest, ctx: BrainContext, *,
+                              stream: AgentStreamer | None) -> AskResponse:
+    """The routing + execution half of :func:`plan_request` (stream-aware)."""
     log, state, stats = ctx.log, ctx.state, ctx.stats
     message = request.message
     started = time.monotonic()
@@ -712,9 +992,13 @@ async def plan_request(request: AskRequest, ctx: BrainContext, settings_path: Pa
     active = ctx.provider_manager.active_name([p.model_dump() for p in request.providers])
     state.set("thinking", "Analyzing request...", provider=active,
               model=ctx.provider_manager.model_for(active) if active else None)
+    _thinking("Analyzing prompt…", phase="plan")
 
     decision = route_request(message)  # Planner -> Intent Router (agent-first)
     log.log(f"Intent routed to {decision.route} — {decision.reason}", "info")
+    if stream is not None:
+        stream.emit(EVENT_THINKING, step=0, phase="route",
+                    text=f"Intent → {decision.route} ({decision.reason})")
 
     try:
         route = decision.route
@@ -733,6 +1017,8 @@ async def plan_request(request: AskRequest, ctx: BrainContext, settings_path: Pa
                 fallback = legacy_route(message)
                 if fallback.route not in {"llm", "tool_creation"}:
                     log.log(f"LLM unavailable — offline fallback: {fallback.route}", "warning")
+                    _self_correction(0, None, "no AI provider reachable",
+                                     f"offline legacy route → {fallback.route}", attempt=0)
                     if fallback.route == "android_command":
                         result = await _run_android_command(request, ctx)
                     elif fallback.route == "web_search":
@@ -752,6 +1038,12 @@ async def plan_request(request: AskRequest, ctx: BrainContext, settings_path: Pa
     # finalizes the turn. Stay in executing state so the orb shows acting.
     if result.needs_tool_result and result.action is not None:
         log.log(f"Waiting for device result: {result.action.tool}", "info")
+        if stream is not None:
+            # A legacy Body on a streaming connection still needs a terminal frame.
+            stream.emit(EVENT_DONE, response=result.response, route=result.route,
+                        steps=result.steps, thought=result.thought, error=result.error,
+                        needs_tool_result=True, action=result.action.model_dump(mode="json"),
+                        elapsed_ms=_elapsed(stream))
         return result
 
     await save_conversation(request.session_id, message, result.response)
@@ -760,9 +1052,70 @@ async def plan_request(request: AskRequest, ctx: BrainContext, settings_path: Pa
     if str(request.input_mode or "text").lower() == "voice":
         await stats.bump("voice_commands")
 
+    # Typewriter: the finalized, tag-free answer is streamed to the Body before
+    # the terminal `done` frame so the bubble can render it as it is "typed".
+    if stream is not None and result.response:
+        await stream.stream_answer(result.response, step=result.steps)
+
     elapsed_ms = int((time.monotonic() - started) * 1000)
     log.log(f"Request complete in {elapsed_ms} ms", "warning" if result.error else "success")
     state.set("idle", "Ready. Waiting for your command.",
               provider=ctx.provider_manager.active_name([p.model_dump() for p in request.providers]),
               response_ms=elapsed_ms)
+    if stream is not None:
+        stream.emit(EVENT_DONE, response=result.response, route=result.route,
+                    steps=result.steps, thought=result.thought, error=result.error,
+                    needs_tool_result=False, streamed=True, elapsed_ms=elapsed_ms,
+                    command=result.command.model_dump(mode="json") if result.command else None,
+                    update_proposal=result.update_proposal.model_dump(mode="json")
+                    if result.update_proposal else None)
     return result
+
+
+async def plan_request_stream(request: AskRequest, ctx: BrainContext) -> AsyncIterator[str]:
+    """SSE frame generator for one autonomous-agent turn.
+
+    The agent runs as an independent task so a disconnected client never kills
+    the loop (memory, stats and history still get written); the generator only
+    forwards frames while the Body is listening.
+    """
+    streamer = AgentStreamer()
+    streamer.bind_loop()
+
+    async def _drive() -> None:
+        try:
+            # plan_request() owns the terminal `done` frame (it holds the result),
+            # and the `error` frame for contained failures.
+            await plan_request(request, ctx, stream=streamer)
+        except asyncio.CancelledError:
+            streamer.emit(EVENT_ERROR, code="cancelled", message="stream cancelled", fatal=True)
+            raise
+        except Exception:
+            # plan_request re-raises only unexpected blow-ups after emitting `error`.
+            pass
+        finally:
+            streamer.close()
+
+    task = asyncio.create_task(_drive(), name=f"vyrx-stream-{streamer.request_id}")
+    _DETACHED_TASKS.add(task)
+    task.add_done_callback(_DETACHED_TASKS.discard)
+    streamer.emit(
+        EVENT_START,
+        request_id=streamer.request_id,
+        session_id=request.session_id,
+        message=_clip(request.message, 200),
+        input_mode=request.input_mode,
+        state=ctx.state.get(),
+    )
+    try:
+        async for frame in streamer.frames():
+            yield frame
+    finally:
+        # Client gone (or stream exhausted): stop generating frames, let the
+        # agent finish its work in the background.
+        streamer.detach()
+
+
+#: In-flight streamed turns that outlived their HTTP connection.
+_DETACHED_TASKS: set[asyncio.Task] = set()
+

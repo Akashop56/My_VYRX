@@ -26,6 +26,14 @@ User ──POST /ask_ronin──▶ Planner
                     │ ③ verify → self-correct → next step (max 8)
                     ▼
               Final plain-text speech (TTS-ready, no JSON/tags)
+                    │ ④ streamed chunk-by-chunk (typing effect)
+                    ▼
+              {"type":"done"} — terminal frame
+
+While the loop runs, every step is also pushed to the caller as SSE
+(`thinking` / `thought` / `tool_call` / `observation` / `self_correction`), so the
+Body renders the internal monologue live instead of waiting. See
+[REALTIME_STREAMING.md](REALTIME_STREAMING.md).
 ```
 
 Key files:
@@ -37,7 +45,8 @@ Key files:
 | `RONIN_Brain_Python/core/tools_catalog.py` | `DEVICE_TOOLS` vs `BRAIN_TOOLS` routing + OpenAI schemas for all 11 device tools |
 | `RONIN_Brain_Python/core/router.py` | Agent-first routing; `legacy_route()` = offline fallback (no keys needed) |
 | `RONIN_Brain_Python/core/schemas.py` | `AgentAction`, `ToolResultRequest`, `AskResponse.needs_tool_result` |
-| `RONIN_Brain_Python/main.py` | `POST /agent/result` (hidden callback), `GET /agent/tools` (inspect surface) |
+| `RONIN_Brain_Python/core/streaming.py` | SSE event protocol, `AgentStreamer` (thread-safe emit, typewriter pacing, delta throttling), `ToolResultBridge` |
+| `RONIN_Brain_Python/main.py` | `POST /agent/result` (hidden callback), `POST /ask_ronin` (JSON *or* SSE), `GET /agent/tools`, `GET /agent/stream/protocol` |
 
 ## 2. Action Protocol
 
@@ -112,8 +121,10 @@ and re-verifies. All executions are echoed to the Brain process log.
 
 ```bash
 cd RONIN_Brain_Python
-python3 -m pytest tests/ -q          # 21 tests: ReAct, tools, memory, bridge contract
+python3 -m pytest tests/ -q          # ReAct, tools, memory, streaming, bridge contract
 curl localhost:8000/agent/tools      # live tool surface
+curl localhost:8000/agent/stream/protocol   # SSE event vocabulary the Body must parse
+python3 devtools/stream_preview.py "open youtube" --fake-llm  # watch a whole turn stream
 ```
 
 Android: `./gradlew :app:assembleDebug`, enable VYRX in Accessibility +

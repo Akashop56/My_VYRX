@@ -2,6 +2,11 @@ package com.ronin.ai.network
 
 import android.net.Uri
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
@@ -18,12 +23,54 @@ import java.util.concurrent.atomic.AtomicBoolean
 object ApiClient {
     private val client = OkHttpClient.Builder().connectTimeout(8, TimeUnit.SECONDS).readTimeout(45, TimeUnit.SECONDS).build()
     private val sseClient = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS).readTimeout(0, TimeUnit.SECONDS).build()
+
+    /**
+     * Live agent stream: no *total* read timeout (an agent turn legitimately idles
+     * while a device tool runs), but the Brain sends a keep-alive comment every
+     * ~10 s so a stalled socket is still detectable.
+     */
+    private val streamClient = sseClient.newBuilder()
+        .readTimeout(120, TimeUnit.SECONDS)
+        .callTimeout(0, TimeUnit.SECONDS)
+        .build()
+
     private const val BASE = "http://127.0.0.1:8000"
     private val json = "application/json; charset=utf-8".toMediaType()
 
     // ------------------------------------------------------------------
     // Original RONIN endpoints
     // ------------------------------------------------------------------
+
+    private fun askBody(
+        message: String,
+        sessionId: String,
+        providers: List<ProviderConfig>,
+        inputMode: String,
+        toolsEnabled: Map<String, Boolean>,
+        personality: String?,
+        responseMode: String?,
+        stream: Boolean?
+    ): RequestBody {
+        val configuredProviders = JSONArray()
+        providers.filter { it.enabled }.forEach { configuredProviders.put(
+            JSONObject().put("provider", it.type.wireName)
+                .put("api_key", it.apiKey)
+                .putOpt("endpoint", it.endpoint)
+                .putOpt("model", it.model)
+        ) }
+        val toolsJson = JSONObject()
+        toolsEnabled.forEach { (k, v) -> toolsJson.put(k, v) }
+        return JSONObject()
+            .put("message", message)
+            .put("session_id", sessionId)
+            .put("providers", configuredProviders)
+            .put("input_mode", inputMode)
+            .put("tools_enabled", toolsJson)
+            .putOpt("personality", personality)
+            .putOpt("response_mode", responseMode)
+            .apply { if (stream != null) put("stream", stream) }
+            .toString().toRequestBody(json)
+    }
 
     suspend fun ask(
         message: String,
@@ -34,26 +81,81 @@ object ApiClient {
         personality: String? = null,
         responseMode: String? = null
     ): AskResponse = withContext(Dispatchers.IO) {
-        val configuredProviders = JSONArray()
-        providers.filter { it.enabled }.forEach { configuredProviders.put(
-            JSONObject().put("provider", it.type.wireName)
-                .put("api_key", it.apiKey)
-                .putOpt("endpoint", it.endpoint)
-                .putOpt("model", it.model)
-        ) }
-        val toolsJson = JSONObject()
-        toolsEnabled.forEach { (k, v) -> toolsJson.put(k, v) }
-        val body = JSONObject()
-            .put("message", message)
-            .put("session_id", sessionId)
-            .put("providers", configuredProviders)
-            .put("input_mode", inputMode)
-            .put("tools_enabled", toolsJson)
-            .putOpt("personality", personality)
-            .putOpt("response_mode", responseMode)
-            .toString().toRequestBody(json)
+        val body = askBody(message, sessionId, providers, inputMode, toolsEnabled, personality, responseMode, false)
         execute("$BASE/ask_ronin", body).let(::parseAsk)
     }
+
+    /**
+     * The agentic turn as a cold [Flow] of [AgentEvent]s (Server-Sent Events).
+     *
+     * Collecting starts the request; cancelling the collection closes the socket
+     * (the Brain keeps finishing the turn and persists it regardless). If the
+     * Brain predates SSE it answers with one JSON object, which is delivered as a
+     * single [AgentEvent.Legacy] so callers have exactly one code path.
+     */
+    fun askStream(
+        message: String,
+        sessionId: String = "default",
+        providers: List<ProviderConfig> = emptyList(),
+        inputMode: String = "text",
+        toolsEnabled: Map<String, Boolean> = emptyMap(),
+        personality: String? = null,
+        responseMode: String? = null
+    ): Flow<AgentEvent> = flow {
+        val body = askBody(message, sessionId, providers, inputMode, toolsEnabled, personality, responseMode, true)
+        val request = Request.Builder().url("$BASE/ask_ronin").post(body)
+            .header("Accept", "text/event-stream")
+            .header("Cache-Control", "no-cache")
+            .build()
+        val response = streamClient.newCall(request).execute()
+        try {
+            if (!response.isSuccessful) {
+                val detail = response.body?.string().orEmpty().take(300)
+                throw IOException("HTTP ${response.code}${if (detail.isBlank()) "" else ": $detail"}")
+            }
+            val contentType = response.header("Content-Type").orEmpty()
+            if (!contentType.contains("text/event-stream", ignoreCase = true)) {
+                // Legacy/bridged Brain: a single monolithic AskResponse.
+                emit(AgentEvent.Legacy(parseAsk(response.body?.string().orEmpty())))
+                return@flow
+            }
+            val source = response.body?.source() ?: throw IOException("Empty SSE body")
+            var eventName: String? = null
+            var dataLines: StringBuilder? = null
+            // Cooperative cancellation: the read below blocks on a socket, so the
+            // loop bails out as soon as the collecting scope goes away.
+            val job = currentCoroutineContext()[Job]
+            while (job?.isActive != false) {
+                val line = source.readUtf8Line() ?: break
+                when {
+                    line.isEmpty() -> {
+                        val name = eventName
+                        val payload = dataLines
+                        eventName = null
+                        dataLines = null
+                        if (payload != null && payload.isNotEmpty()) {
+                            AgentEventCodec.decode(name, payload.toString())?.let { emit(it) }
+                        }
+                    }
+                    // `: keep-alive` and other comment lines.
+                    line.startsWith(":") -> Unit
+                    line.startsWith("event:") -> eventName = line.substring(6).trim()
+                    line.startsWith("data:") -> {
+                        val builder = dataLines ?: StringBuilder().also { dataLines = it }
+                        if (builder.isNotEmpty()) builder.append('\n')
+                        builder.append(line.substring(5).trim())
+                    }
+                    else -> Unit // unknown SSE field (id:/retry:): ignored per spec
+                }
+            }
+            // A stream cut off mid-frame still dispatches what was buffered.
+            dataLines?.takeIf { it.isNotEmpty() }?.let { payload ->
+                AgentEventCodec.decode(eventName, payload.toString())?.let { emit(it) }
+            }
+        } finally {
+            response.close()
+        }
+    }.flowOn(Dispatchers.IO)
 
     suspend fun approve(approved: Boolean, proposal: UpdateProposal): ApprovalResponse = withContext(Dispatchers.IO) {
         val p = JSONObject().put("proposal_id", proposal.proposal_id).put("file_path", proposal.file_path)
@@ -292,8 +394,10 @@ object ApiClient {
             t
         }
 
-    private fun parseAsk(raw: String): AskResponse {
-        val o = JSONObject(raw)
+    /** Parses both `/ask_ronin` JSON bodies and `done` stream frames (same wire shape). */
+    internal fun parseAsk(raw: String): AskResponse = parseAsk(JSONObject(raw))
+
+    internal fun parseAsk(o: JSONObject): AskResponse {
         val c = o.optJSONObject("command")?.let {
             AndroidCommand(
                 it.getString("action"),
@@ -324,7 +428,8 @@ object ApiClient {
             a,
             o.optBoolean("needs_tool_result", false),
             o.optString("thought").takeIf { value -> value.isNotBlank() },
-            o.optInt("steps", 0)
+            o.optInt("steps", 0),
+            o.optBoolean("streamed", false)
         )
     }
 }

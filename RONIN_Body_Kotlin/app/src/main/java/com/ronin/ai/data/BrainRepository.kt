@@ -45,6 +45,27 @@ object BrainRepository {
         sseAlive = false
     }
 
+    /**
+     * Push the turn's state straight from the chat stream: the orb reacts in the
+     * same frame the Brain thought it, instead of waiting for the next poll.
+     */
+    fun pushState(state: BrainState) {
+        if (!connected) return
+        _state.value = state.copy(online = true)
+    }
+
+    /**
+     * Mirror an action-log line the chat stream already delivered. Deduped
+     * against the global /api/events feed so the dashboard never doubles up.
+     */
+    fun pushLog(entry: ActionLogEntry) {
+        if (!connected) return
+        val logs = _logs.value
+        val last = logs.lastOrNull()
+        if (last != null && last.time == entry.time && last.text == entry.text) return
+        _logs.value = (logs + entry).takeLast(200)
+    }
+
     private suspend fun refreshSnapshot() {
         try {
             _state.value = ApiClient.state().copy(online = true)

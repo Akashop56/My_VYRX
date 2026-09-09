@@ -22,6 +22,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -39,6 +41,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -56,7 +59,11 @@ import androidx.compose.ui.unit.sp
 import com.ronin.ai.ui.theme.VyRxColors
 
 // ---------------------------------------------------------------------------
-// Message bubble (mockup style) with long-press actions + feedback row
+// Message bubble (mockup style) with long-press actions + feedback row.
+//
+// The active (streaming) bubble also hosts the [ThoughtTerminal] block and the
+// typewriter caret: VYRX's CoT / tool calls / observations stream into it while
+// the answer is typed underneath.
 // ---------------------------------------------------------------------------
 
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
@@ -65,8 +72,23 @@ fun VyRxMessageBubble(message: ChatMessage, controller: ChatController, modifier
     val context = LocalContext.current
     var menuOpen by remember { mutableStateOf(false) }
     val bubbleBg = if (message.mine) Color(0xFF12233A) else Color(0xFF171226)
-    val strokeColor = if (message.mine) VyRxColors.BlueDeep.copy(alpha = 0.35f) else VyRxColors.Primary.copy(alpha = 0.35f)
+    val strokeColor = when {
+        message.streaming -> VyRxColors.LogGreen.copy(alpha = 0.45f)
+        message.failed -> VyRxColors.Red.copy(alpha = 0.4f)
+        message.mine -> VyRxColors.BlueDeep.copy(alpha = 0.35f)
+        else -> VyRxColors.Primary.copy(alpha = 0.35f)
+    }
     val authorColor = if (message.mine) VyRxColors.Blue else VyRxColors.PrimaryBright
+
+    // Live turns read the controller's state; finished ones keep their snapshot.
+    val live = message.streaming
+    val thoughts = if (live) controller.turnLines.toList() else message.thoughts
+    var openHistory by remember(message.id) { mutableStateOf(false) }
+    val expanded = if (live) controller.turnExpanded else openHistory
+    val phase = if (live) controller.agentPhase else message.phase
+    val phaseLabel = if (live) controller.phaseLabel else phase.label()
+    val elapsed = if (live) controller.turnElapsedMs else message.elapsedMs
+    val steps = if (live) controller.turnStepCount else message.steps
 
     Box(modifier.fillMaxWidth().padding(vertical = 5.dp), contentAlignment = if (message.mine) Alignment.CenterEnd else Alignment.CenterStart) {
         Column(
@@ -82,17 +104,67 @@ fun VyRxMessageBubble(message: ChatMessage, controller: ChatController, modifier
                 .padding(14.dp)
         ) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    if (message.mine) "You" else "VYRX",
-                    color = authorColor,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Bold
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        if (message.mine) "You" else "VYRX",
+                        color = authorColor,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    if (live) {
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            "◉ LIVE",
+                            color = VyRxColors.LogGreen,
+                            fontSize = 8.5.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.SemiBold,
+                            letterSpacing = 0.6.sp
+                        )
+                    }
+                }
                 Text(message.time, color = VyRxColors.TextFaint, fontSize = 10.sp)
             }
+
+            if (!message.mine && (thoughts.isNotEmpty() || live)) {
+                Spacer(Modifier.height(8.dp))
+                ThoughtTerminal(
+                    lines = thoughts,
+                    phase = phase,
+                    phaseLabel = phaseLabel,
+                    running = live,
+                    elapsedMs = elapsed,
+                    steps = steps,
+                    expanded = expanded,
+                    onToggle = {
+                        if (live) controller.toggleTerminal() else openHistory = !openHistory
+                    },
+                    modifier = Modifier.padding(top = 2.dp, bottom = 2.dp)
+                )
+            }
+
             Spacer(Modifier.height(6.dp))
-            Text(message.text, color = VyRxColors.TextPrimary, fontSize = 13.5.sp, lineHeight = 19.sp)
-            if (!message.mine) {
+            if (message.text.isBlank() && live) {
+                // Nothing typed yet: the terminal + this line carry the turn.
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        phaseLabel.ifBlank { "Thinking" },
+                        color = VyRxColors.TextDim,
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    Spacer(Modifier.width(3.dp))
+                    BlockCursor(color = VyRxColors.PrimaryBright)
+                }
+            } else {
+                Text(
+                    typedAnswer(message.text, live),
+                    color = VyRxColors.TextPrimary,
+                    fontSize = 13.5.sp,
+                    lineHeight = 19.sp
+                )
+            }
+            if (!message.mine && !live) {
                 Spacer(Modifier.height(8.dp))
                 Row(horizontalArrangement = Arrangement.End) {
                     BubbleAction(Icons.Filled.ContentCopy) {
@@ -293,13 +365,37 @@ fun ChatInputBar(
 
 @Composable
 fun ChatPanel(controller: ChatController, onVoiceStart: () -> Unit, modifier: Modifier = Modifier) {
+    val listState = rememberLazyListState()
+    // Follow the agent while it types, but never hijack a manual scroll-up.
+    LaunchedEffect(controller.messages.size, controller.streamSeq) {
+        val last = controller.messages.lastIndex
+        if (last < 0) return@LaunchedEffect
+        val pinnedToBottom = !listState.canScrollForward ||
+            listState.layoutInfo.visibleItemsInfo.any { it.index == last }
+        if (pinnedToBottom) listState.scrollToItem(last)
+    }
     Column(modifier) {
         LazyColumn(
-            Modifier.weight(1f).fillMaxWidth(),
+            state = listState,
+            modifier = Modifier.weight(1f).fillMaxWidth(),
             contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 12.dp, end = 12.dp, bottom = 4.dp)
         ) {
             items(controller.messages, key = { it.id }) { message ->
                 VyRxMessageBubble(message, controller)
+            }
+        }
+        if (controller.loading && controller.agentPhase.busy) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "⟳ ${controller.phaseLabel}",
+                    color = VyRxColors.LogGreen,
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    letterSpacing = 0.4.sp
+                )
             }
         }
         controller.error?.let { error ->
