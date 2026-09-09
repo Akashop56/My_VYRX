@@ -315,7 +315,7 @@ class ChatController(
                 // The `done` frame repeats the full answer: use it only if no
                 // token ever arrived, so the typewriter never restarts or jumps.
                 if (answerTarget.isEmpty() && event.ask.response.isNotBlank()) {
-                    setAnswerTarget(event.ask.response)
+                    replaceAnswerTarget(event.ask.response)
                 }
                 finishWithAsk(event.ask, typedIn = true, elapsedMs = event.elapsedMs)
             }
@@ -331,7 +331,7 @@ class ChatController(
                 agentPhase = AgentPhase.REASONING
                 addLine(ThoughtLine.LEVEL_NOTE, "Brain answered without streaming — running the loop classically.")
                 val settled = runCatching { runAgentLoop(event.ask) }.getOrElse { event.ask }
-                setAnswerTarget(settled.response)
+                replaceAnswerTarget(settled.response)
                 finishWithAsk(settled, typedIn = true)
             }
         }
@@ -476,7 +476,7 @@ class ChatController(
         if (r.update_proposal != null) proposal = r.update_proposal
         uiMessageOrNull(r.error)?.let { error = it }
         if (r.response.isNotBlank()) {
-            if (!typedIn) setAnswerTarget(r.response)
+            if (!typedIn) replaceAnswerTarget(r.response)
             lastSpeech = r.response
         }
         if (elapsedMs > 0) turnElapsedMs = elapsedMs
@@ -510,14 +510,14 @@ class ChatController(
         streamSeq++
     }
 
-    private fun setAnswerTarget(text: String) {
+    private fun replaceAnswerTarget(text: String) {
         answerTarget = text
         if (text.isNotEmpty()) streamSeq++
     }
 
     private fun beginTurn() {
         turnLines.clear()
-        setAnswerTarget("")
+        replaceAnswerTarget("")
         thoughtDelta = ""
         revealed = 0
         typingStarted = false
