@@ -360,57 +360,68 @@ private fun markdownAnnotatedString(source: String): AnnotatedString {
             return@forEachIndexed
         }
         if (inCodeFence) {
-            builder.withStyle(
-                SpanStyle(fontFamily = FontFamily.Monospace, color = VyRxColors.TextDim)
-            ) {
-                append(rawLine)
+            appendStyled(builder, SpanStyle(fontFamily = FontFamily.Monospace, color = VyRxColors.TextDim)) { target ->
+                target.append(rawLine)
             }
             return@forEachIndexed
         }
 
-        val heading = Regex("^#{1,6}\s+(.+?)\s*#*\s*$").matchEntire(line)
+        val heading = Regex("^#{1,6}\\s+(.+?)\\s*#*\\s*$").matchEntire(line)
         when {
-            heading != null -> builder.withStyle(
+            heading != null -> appendStyled(
+                builder,
                 SpanStyle(fontWeight = FontWeight.Bold, color = VyRxColors.PrimaryBright)
-            ) {
-                appendInlineMarkdown(this, heading.groupValues[1])
+            ) { target ->
+                appendInlineMarkdown(target, heading.groupValues[1])
             }
 
             // Do not flash an incomplete heading marker while the next token is
             // still on the wire.
-            line.matches(Regex("^#{1,6}\s*")) -> Unit
+            line.matches(Regex("^#{1,6}\\s*")) -> Unit
 
-            line.matches(Regex("[-*_]{3,}\s*")) -> builder.withStyle(
+            line.matches(Regex("[-*_]{3,}\\s*")) -> appendStyled(
+                builder,
                 SpanStyle(color = VyRxColors.TextFaint)
-            ) {
-                append("────────")
+            ) { target ->
+                target.append("────────")
             }
 
-            line.startsWith("> ") || line == ">" -> builder.withStyle(
+            line.startsWith("> ") || line == ">" -> appendStyled(
+                builder,
                 SpanStyle(color = VyRxColors.TextDim)
-            ) {
-                append("│ ")
-                appendInlineMarkdown(this, line.removePrefix("> "))
+            ) { target ->
+                target.append("│ ")
+                appendInlineMarkdown(target, line.removePrefix("> "))
             }
 
             else -> {
-                val bullet = Regex("^[-*+]\s+(.+)$").matchEntire(line)
-                val numbered = Regex("^(\d+)[.)]\s+(.+)$").matchEntire(line)
+                val bullet = Regex("^[-*+]\\s+(.+)$").matchEntire(line)
+                val numbered = Regex("^(\\d+)[.)]\\s+(.+)$").matchEntire(line)
                 when {
                     bullet != null -> {
-                        append("• ")
-                        appendInlineMarkdown(this, bullet.groupValues[1])
+                        builder.append("• ")
+                        appendInlineMarkdown(builder, bullet.groupValues[1])
                     }
                     numbered != null -> {
-                        append(numbered.groupValues[1]).append(". ")
-                        appendInlineMarkdown(this, numbered.groupValues[2])
+                        builder.append(numbered.groupValues[1]).append(". ")
+                        appendInlineMarkdown(builder, numbered.groupValues[2])
                     }
-                    else -> appendInlineMarkdown(this, rawLine)
+                    else -> appendInlineMarkdown(builder, rawLine)
                 }
             }
         }
     }
     return builder.toAnnotatedString()
+}
+
+private fun appendStyled(
+    builder: AnnotatedString.Builder,
+    style: SpanStyle,
+    content: (AnnotatedString.Builder) -> Unit
+) {
+    val start = builder.length
+    content(builder)
+    if (builder.length > start) builder.addStyle(style, start, builder.length)
 }
 
 /** Append inline Markdown while keeping the parser deliberately lightweight. */
@@ -464,8 +475,8 @@ private fun appendInlineMarkdown(builder: AnnotatedString.Builder, source: Strin
                 background = Color(0x221E293B)
             )
         }
-        builder.withStyle(style) {
-            if (marker == "`") append(inner) else appendInlineMarkdown(this, inner)
+        appendStyled(builder, style) { target ->
+            if (marker == "`") target.append(inner) else appendInlineMarkdown(target, inner)
         }
         cursor = close + marker.length
     }
