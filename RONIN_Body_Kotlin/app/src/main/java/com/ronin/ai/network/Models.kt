@@ -51,7 +51,9 @@ data class AskResponse(
     val action: AgentAction? = null,
     val needsToolResult: Boolean = false,
     val thought: String? = null,
-    val steps: Int = 0
+    val steps: Int = 0,
+    /** True when the answer rode the live SSE stream instead of this JSON body. */
+    val streamed: Boolean = false
 )
 data class ApprovalRequest(val approved: Boolean, val proposal: UpdateProposal)
 data class ApprovalResponse(val accepted: Boolean, val success: Boolean, val message: String)

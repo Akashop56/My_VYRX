@@ -12,15 +12,27 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 # VYRX core modules
 from core.action_log import ActionLog
 from core.llm_handler import SYSTEM_PROMPT, LLMError
-from core.planner import BrainContext, continue_with_tool_result, plan_request
+from core.planner import (
+    BrainContext,
+    continue_with_tool_result,
+    plan_request,
+    plan_request_stream,
+)
 from core.provider_manager import KNOWN_PROVIDERS, ProviderManager
+from core.streaming import (
+    MEDIA_TYPE_SSE,
+    SSE_HEADERS,
+    STREAM_EVENT_TYPES,
+    TOOL_RESULT_BRIDGE,
+    TOOL_RESULT_TIMEOUT_SECONDS,
+)
 from core.router import route_request
 from core.schemas import (
     ApprovalRequest,
@@ -168,10 +180,45 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
-@app.post("/ask_ronin", response_model=AskResponse)
-async def ask_ronin(request: AskRequest) -> AskResponse:
-    """Full pipeline: Planner -> ReAct agent -> Tool Execution (with logs)."""
+def _wants_event_stream(request: Request, explicit: bool | None) -> bool:
+    """Negotiate the transport: SSE stream vs the classic monolithic JSON.
+
+    ``{"stream": true}`` forces the stream, ``{"stream": false}`` forces JSON,
+    and otherwise a request that advertises ``Accept: text/event-stream`` (what
+    the VYRX Body sends) gets the stream. Anything else keeps the pre-stream
+    contract, so old bodies and curl behave exactly as before.
+    """
+    if explicit is not None:
+        return bool(explicit)
+    return "text/event-stream" in (request.headers.get("accept") or "").lower()
+
+
+def _sse_response(frames) -> StreamingResponse:
+    return StreamingResponse(frames, media_type=MEDIA_TYPE_SSE, headers=SSE_HEADERS)
+
+
+@app.post("/ask_ronin", response_model=None)
+async def ask_ronin(request: AskRequest, http_request: Request) -> Response:
+    """Full pipeline: Planner -> ReAct agent -> Tool Execution (with logs).
+
+    Two transports, one loop:
+
+    * ``Accept: text/event-stream`` (or ``{"stream": true}``) -> **SSE stream**:
+      ``thinking`` / ``thought`` / ``tool_call`` / ``observation`` /
+      ``self_correction`` frames while the loop runs, the final answer as
+      ``token`` chunks (typing effect), then ``done``.
+    * anything else -> the original single-shot ``AskResponse`` JSON.
+    """
+    if _wants_event_stream(http_request, request.stream):
+        return _sse_response(plan_request_stream(request, CTX))
     return await plan_request(request, CTX)
+
+
+@app.post("/ask_ronin/stream", response_model=None)
+async def ask_ronin_stream(request: AskRequest) -> Response:
+    """Always-stream alias (handy for ``curl -N`` and debugging the CoT)."""
+    request.stream = True
+    return _sse_response(plan_request_stream(request, CTX))
 
 
 @app.post("/agent/result", response_model=AskResponse)
@@ -181,7 +228,20 @@ async def agent_result(request: ToolResultRequest) -> AskResponse:
     The Kotlin Body calls this automatically after executing a dispatched
     ``AgentAction`` — no user tap involved. Returns either the next pending
     action (``needs_tool_result=true``) or the final spoken answer.
+
+    When the turn is running inside a live SSE stream, the matching
+    ``/ask_ronin`` connection is still parked on this observation: hand the
+    result to it (``streamed=true`` ack) instead of resuming a second copy of
+    the loop from the saved session.
     """
+    if TOOL_RESULT_BRIDGE.resolve(request.session_id, {
+        "tool": request.tool,
+        "result": request.result,
+        "success": request.success,
+        "tool_call_id": request.tool_call_id,
+    }):
+        ACTION_LOG.log(f"Observation consumed by live stream: {request.tool}", "tool")
+        return AskResponse(response="", route="agent_action", streamed=True)
     return await continue_with_tool_result(request, CTX)
 
 
@@ -196,6 +256,24 @@ async def agent_tools() -> dict:
         "device_tools": sorted(DEVICE_TOOLS),
         "brain_tool_names": sorted(BRAIN_TOOLS),
         "device_schemas": device_tool_schemas(),
+    }
+
+
+@app.get("/agent/stream/protocol")
+async def agent_stream_protocol() -> dict:
+    """The live CoT SSE contract (what a Body must be able to parse)."""
+    return {
+        "endpoint": "POST /ask_ronin",
+        "negotiation": 'send "Accept: text/event-stream" or {"stream": true}; '
+                       "otherwise the legacy monolithic AskResponse is returned",
+        "media_type": MEDIA_TYPE_SSE,
+        "frame": "event: <type>\\ndata: <json with type/seq>\\n\\n",
+        "events": list(STREAM_EVENT_TYPES),
+        "answer_streaming": 'final text arrives as {"type":"token","i":n,"text":"…"} chunks',
+        "device_actions": "tool_call(device=true) is answered by POST /agent/result, which "
+                          "resolves the parked stream instead of starting a new turn",
+        "keepalive_comment_seconds": 10,
+        "tool_result_timeout_seconds": TOOL_RESULT_TIMEOUT_SECONDS,
     }
 
 

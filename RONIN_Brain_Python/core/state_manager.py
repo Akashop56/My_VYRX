@@ -3,12 +3,18 @@
 The body polls `GET /api/state` and receives push updates over SSE.
 States: idle (blue), listening (blue), thinking (purple),
 executing (green), learning (amber).
+
+Every transition is additionally mirrored onto the live agent stream of the
+request that triggered it (`core.streaming`), so the Body can drive the orb and
+the "Thought Process" phase chip from a single connection.
 """
 from __future__ import annotations
 
 import threading
 from datetime import datetime, timezone
 from typing import Callable, Literal
+
+from core.streaming import current_stream
 
 StateName = Literal["idle", "listening", "thinking", "executing", "learning"]
 
@@ -66,6 +72,9 @@ class StateManager:
             except Exception:
                 # Listeners must never break the state machine.
                 pass
+        stream = current_stream()
+        if stream is not None:
+            stream.forward_state(snapshot)
         return snapshot
 
     def get(self) -> dict:

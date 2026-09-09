@@ -5,6 +5,10 @@ This module is the Brain's voice box with a strict contract:
 * ``complete()`` speaks to OpenAI / OpenRouter / Groq / Gemini / custom
   endpoints with **native function calling** whenever the provider supports
   it (Gemini included, via ``functionDeclarations`` translation).
+* Passing ``on_delta=`` re-requests the same call with ``stream: true`` and
+  forwards prose/reasoning deltas live (used by the agent SSE stream) while
+  folding the stream back into the normal completion shape. Providers that
+  reject streaming fall back to the buffered call transparently.
 * Providers without tool support fall back to a strict ``<tool>`` JSON tag
   protocol that :func:`extract_tool_calls` parses back into normalized
   tool calls, so the ReAct loop in ``core.planner`` works identically on
@@ -19,7 +23,7 @@ import json
 import os
 import re
 import uuid
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 import requests
 
 # ============================================================================
@@ -179,6 +183,10 @@ class ProviderFailure(LLMError):
     pass
 
 
+class StreamingUnavailable(ProviderFailure):
+    """Raised when a provider refuses ``stream: true`` — caller falls back."""
+
+
 # ---------------------------------------------------------------------------
 # Message helpers
 # ---------------------------------------------------------------------------
@@ -218,6 +226,230 @@ def _post(url: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[st
         return response.json()
     except (requests.RequestException, ValueError) as exc:
         raise ProviderFailure("provider returned an invalid response") from exc
+
+
+# ---------------------------------------------------------------------------
+# Streaming transport — real-time reasoning deltas for the agent stream
+#
+# ``stream: true`` is used only to give the UI a live look at the model while
+# it reasons. The ReAct contract is untouched: deltas are accumulated back into
+# the exact OpenAI completion shape the planner already consumes, so streamed
+# and non-streamed turns drive the loop identically. Any provider that rejects
+# streaming raises StreamingUnavailable and the caller retries non-streamed.
+# ---------------------------------------------------------------------------
+
+def iter_sse_payloads(response: requests.Response) -> Iterator[str]:
+    """Yield the ``data:`` payloads of an SSE response (``[DONE]`` ends it)."""
+    for raw in response.iter_lines(decode_unicode=True):
+        if not raw:
+            continue
+        line = raw.strip()
+        if line.startswith(":"):  # comment / keep-alive
+            continue
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload:
+            continue
+        if payload == "[DONE]":
+            return
+        yield payload
+
+
+def new_stream_state() -> dict[str, Any]:
+    """Accumulator shared by every provider's delta folding."""
+    return {"content": [], "reasoning": [], "calls": {}, "finish": "stop"}
+
+
+def fold_openai_delta(state: dict[str, Any], chunk: dict[str, Any]) -> tuple[str, str]:
+    """Fold one chat-completion *delta* chunk into ``state``.
+
+    Returns ``(visible_text_delta, tool_trace_delta)`` so callers can stream the
+    model's prose while silently assembling a possible tool call. Handles the
+    OpenAI/Groq/OpenRouter fragment styles (split ids, stringly-typed args) and
+    reasoning models (``reasoning_content``).
+    """
+    choices = chunk.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return "", ""
+    choice = choices[0]
+    if choice.get("finish_reason"):
+        state["finish"] = str(choice["finish_reason"])
+    delta = choice.get("delta")
+    if not isinstance(delta, dict):
+        delta = {}
+    text = delta.get("content")
+    text = text if isinstance(text, str) else ""
+    if text:
+        state["content"].append(text)
+    reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+    reasoning = reasoning if isinstance(reasoning, str) else ""
+    if reasoning:
+        state["reasoning"].append(reasoning)
+    calls: dict[int, dict[str, Any]] = state["calls"]
+    fragments = delta.get("tool_calls")
+    if isinstance(fragments, list):
+        for entry in fragments:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                index = int(entry.get("index", len(calls)))
+            except (TypeError, ValueError):
+                index = len(calls)
+            slot = calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
+            if entry.get("id"):
+                slot["id"] = str(entry["id"])
+            function = entry.get("function") or {}
+            if isinstance(function, dict):
+                if isinstance(function.get("name"), str):
+                    slot["name"] += function["name"]
+                if isinstance(function.get("arguments"), str):
+                    slot["arguments"] += function["arguments"]
+    return text, reasoning
+
+
+def build_completion(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Normalize an accumulated stream into an OpenAI-shaped completion."""
+    text = "".join(state.get("content") or [])
+    reasoning = "".join(state.get("reasoning") or [])
+    calls = state.get("calls") or {}
+    message: dict[str, Any] = {"role": "assistant", "content": text or None}
+    if reasoning:
+        # Keep the raw chain of thought for the terminal block.
+        message["reasoning_content"] = reasoning
+    if calls:
+        wire_calls = []
+        for index in sorted(calls):
+            slot = calls[index]
+            if not str(slot.get("name", "")).strip():
+                continue
+            wire_calls.append({
+                "id": slot.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": {"name": str(slot["name"]).strip(),
+                             "arguments": slot.get("arguments", "") or "{}"},
+            })
+        if wire_calls:
+            message["tool_calls"] = wire_calls
+            return {"choices": [{"message": message, "finish_reason": "tool_calls"}],
+                    "streamed": True}
+    if not text:
+        message["content"] = "No response generated."
+    return {"choices": [{"message": message, "finish_reason": state.get("finish") or "stop"}],
+            "streamed": True}
+
+
+def _stream_post(
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    on_delta: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """OpenAI-compatible ``stream: true`` call folded back into a completion."""
+    body = dict(payload)
+    body["stream"] = True
+    try:
+        response = requests.post(url, headers=headers, json=body, timeout=45, stream=True)
+    except requests.RequestException as exc:
+        raise StreamingUnavailable("provider streaming unavailable") from exc
+    try:
+        if response.status_code >= 400:
+            # A provider that does not know `stream` usually 400s here.
+            raise StreamingUnavailable(f"provider rejected streaming (HTTP {response.status_code})")
+        state = new_stream_state()
+        for raw in iter_sse_payloads(response):
+            try:
+                chunk = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(chunk, dict):
+                continue
+            text, reasoning = fold_openai_delta(state, chunk)
+            piece = text or reasoning
+            if piece and on_delta is not None:
+                on_delta(piece)
+        completion = build_completion(state)
+        if completion is None:
+            raise StreamingUnavailable("provider stream returned no usable delta")
+        return completion
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise StreamingUnavailable("provider stream was not valid SSE") from exc
+    finally:
+        response.close()
+
+
+def _stream_gemini(
+    url: str,
+    payload: dict[str, Any],
+    on_delta: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Gemini ``streamGenerateContent?alt=sse`` folded into the OpenAI shape."""
+    endpoint = url.replace(":generateContent", ":streamGenerateContent?alt=sse")
+    try:
+        response = requests.post(endpoint, headers={"Content-Type": "application/json"},
+                                 json=payload, timeout=45, stream=True)
+    except requests.RequestException as exc:
+        raise StreamingUnavailable("gemini streaming unavailable") from exc
+    try:
+        if response.status_code >= 400:
+            raise StreamingUnavailable(f"gemini rejected streaming (HTTP {response.status_code})")
+        state = new_stream_state()
+        for raw in iter_sse_payloads(response):
+            try:
+                chunk = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(chunk, dict):
+                continue
+            try:
+                candidate = (chunk.get("candidates") or [])[0]
+            except (IndexError, TypeError, AttributeError):
+                continue
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get("finishReason"):
+                state["finish"] = "tool_calls" if state["calls"] else "stop"
+            parts = ((candidate.get("content") or {}).get("parts") or [])
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                text = part.get("text")
+                if isinstance(text, str) and text:
+                    state["content"].append(text)
+                    if on_delta is not None:
+                        on_delta(text)
+                call = part.get("functionCall")
+                if isinstance(call, dict) and call.get("name"):
+                    normalized = _normalize_tool_call(str(call["name"]), call.get("args", {}))
+                    if normalized is not None:
+                        state["calls"][len(state["calls"])] = {
+                            "id": normalized["id"],
+                            "name": normalized["function"]["name"],
+                            "arguments": json.dumps(normalized["function"]["arguments"], ensure_ascii=False),
+                        }
+        text = "".join(state["content"])
+        # A streamed <tool> tag only becomes parsable once the whole line is in.
+        calls = dict(state["calls"])
+        if not calls and text:
+            for offset, parsed in enumerate(parse_tool_tag_calls(text)):
+                calls[len(calls) + offset] = {
+                    "id": parsed["id"], "name": parsed["function"]["name"],
+                    "arguments": json.dumps(parsed["function"]["arguments"], ensure_ascii=False),
+                }
+        message: dict[str, Any] = {"role": "assistant", "content": text or None}
+        if calls:
+            message["tool_calls"] = [
+                {"id": calls[index]["id"] or f"call_{uuid.uuid4().hex[:12]}", "type": "function",
+                 "function": {"name": calls[index]["name"], "arguments": calls[index]["arguments"] or "{}"}}
+                for index in sorted(calls)
+            ]
+            return {"choices": [{"message": message, "finish_reason": "tool_calls"}], "streamed": True}
+        if not text:
+            message["content"] = "No response generated."
+        return {"choices": [{"message": message, "finish_reason": state["finish"] or "stop"}],
+                "streamed": True}
+    finally:
+        response.close()
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +711,7 @@ def _complete_with(
     provider: dict[str, str | None],
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
+    on_delta: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     name, key, model = (provider.get("provider") or "").lower(), provider.get("api_key") or "", provider.get("model")
     if not key:
@@ -495,6 +728,14 @@ def _complete_with(
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        if on_delta is not None:
+            # Live reasoning tokens; a provider that rejects streaming falls back
+            # to the buffered call below, so the agent loop never depends on it.
+            try:
+                return _stream_post(endpoint, {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                                    payload, on_delta)
+            except StreamingUnavailable:
+                pass
         data = _post(endpoint, {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, payload)
         if not data.get("choices"):
             raise ProviderFailure("provider returned no choices")
@@ -509,6 +750,11 @@ def _complete_with(
         if declarations:
             payload_g["tools"] = [{"function_declarations": declarations}]
             payload_g["tool_config"] = {"function_calling_config": {"mode": "AUTO"}}
+        if on_delta is not None:
+            try:
+                return _stream_gemini(endpoint, payload_g, on_delta)
+            except StreamingUnavailable:
+                pass
         data = _post(endpoint, {"Content-Type": "application/json"}, payload_g)
         return _gemini_response_to_openai(data)
     raise ProviderFailure(f"unsupported provider: {name}")
@@ -522,6 +768,7 @@ def complete(
     tools: list[dict[str, Any]] | None = None,
     messages: list[dict[str, Any]] | None = None,
     on_provider: Callable[[str, bool], None] | None = None,
+    on_delta: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     configured = providers if providers else _environment_providers()
     if not configured:
@@ -537,7 +784,7 @@ def complete(
                 provider_tools = tools
             else:
                 provider_tools = None
-            result = _complete_with(provider, request_messages, provider_tools)
+            result = _complete_with(provider, request_messages, provider_tools, on_delta)
             if on_provider is not None:
                 on_provider(name, True)
             return result

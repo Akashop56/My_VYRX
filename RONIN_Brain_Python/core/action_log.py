@@ -6,6 +6,12 @@ Every planner/tool step is recorded here; the body consumes it through
 Publishing happens from worker threads, so subscriber queues are the
 thread-safe stdlib `queue.Queue`; SSE generators poll them via
 `asyncio.to_thread`.
+
+Because the planner already logs *everything* it does, `log()` doubles as the
+per-request CoT feed: when a request owns a live agent stream (see
+`core.streaming`), the same entry is forwarded to it as a `log` event. That is
+what makes the Body's "Thought Process" terminal show the real internal
+monologue without adding a second instrumentation layer to the loop.
 """
 from __future__ import annotations
 
@@ -16,6 +22,8 @@ from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any, Literal
+
+from core.streaming import current_stream
 
 LogLevel = Literal["info", "success", "warning", "error", "tool"]
 
@@ -48,7 +56,13 @@ class ActionLog:
         entry = ActionLogEntry(ts=_utc_now_iso(), time=_local_time_hms(), level=level, text=text)
         with self._lock:
             self._entries.append(entry)
-        self._publish({"type": "log", "log": asdict(entry)})
+        event = {"type": "log", "log": asdict(entry)}
+        self._publish(event)
+        # Request-scoped feed: the live agent stream (if this task owns one)
+        # gets the exact same line, in order, with no extra call sites.
+        stream = current_stream()
+        if stream is not None:
+            stream.forward_log(asdict(entry))
         return entry
 
     def recent(self, limit: int = 50) -> list[dict]:
