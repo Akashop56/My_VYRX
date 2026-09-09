@@ -102,7 +102,7 @@ def render(event: dict, state: dict) -> None:
         print(stamp + " " + paint("⚠ " + str(event.get("message")), RED))
 
 
-async def preview(message: str, base: str, session: str, typing: bool) -> int:
+async def preview(message: str, base: str, session: str, typing: bool, raw: bool = False) -> int:
     import httpx
 
     state = {"t0": time.perf_counter()}
@@ -126,6 +126,10 @@ async def preview(message: str, base: str, session: str, typing: bool) -> int:
                 if not data_lines:
                     return
                 event = json.loads("\n".join(data_lines))
+                if raw:
+                    # Wire format, exactly as the Brain framed it.
+                    print(FAINT + "    " + json.dumps(event, ensure_ascii=False,
+                                                       separators=(",", ":"))[:300] + RESET)
                 if event.get("type") == "token":
                     chunk = event.get("text", "")
                     answer.append(chunk)
@@ -164,7 +168,7 @@ async def preview(message: str, base: str, session: str, typing: bool) -> int:
     return exit_code
 
 
-def run_fake_brain(message: str, session: str, typing: bool) -> None:
+def run_fake_brain(message: str, session: str, typing: bool, raw: bool = False) -> None:
     """Boot the Brain in-process with a scripted model (no keys, no port juggling)."""
     import httpx
 
@@ -213,7 +217,7 @@ def run_fake_brain(message: str, session: str, typing: bool) -> None:
                     print(paint("Brain did not come up on :8199", RED))
                     return 1
             print(paint("fake-llm mode: scripted open_app → observation → final answer\n", AMBER))
-            return await preview(message, "http://127.0.0.1:8199", session, typing)
+            return await preview(message, "http://127.0.0.1:8199", session, typing, raw)
         finally:
             server.should_exit = True
             await serving
@@ -228,11 +232,13 @@ def main() -> None:
     parser.add_argument("--session", default="devtools-preview")
     parser.add_argument("--no-typing", action="store_true", help="print answer chunks instantly")
     parser.add_argument("--fake-llm", action="store_true", help="run the Brain in-process with a scripted model")
+    parser.add_argument("--raw", action="store_true", help="also print every decoded frame as JSON")
     args = parser.parse_args()
     if args.fake_llm:
-        run_fake_brain(args.message, args.session, not args.no_typing)
+        run_fake_brain(args.message, args.session, not args.no_typing, args.raw)
         return
-    raise SystemExit(asyncio.run(preview(args.message, args.base, args.session, not args.no_typing)))
+    raise SystemExit(asyncio.run(preview(args.message, args.base, args.session,
+                                       not args.no_typing, args.raw)))
 
 
 if __name__ == "__main__":

@@ -135,9 +135,13 @@ but the agent finishes, persists the conversation, updates memory and stats anyw
 
 ```bash
 cd RONIN_Brain_Python
-python3 devtools/stream_preview.py "open youtube" --fake-llm   # scripted model, zero keys
-python3 devtools/stream_preview.py "search for the latest android 15 changes"  # live Brain
+python3 devtools/stream_preview.py "open youtube" --fake-llm        # scripted model, zero keys
+python3 devtools/stream_preview.py "search for android 15 changes"  # against a live Brain
+python3 devtools/stream_preview.py "hi" --fake-llm --raw            # also dump every frame as JSON
 ```
+
+`--no-typing` prints answer chunks instantly; `--raw` interleaves each decoded frame as
+compact JSON, which is the quickest way to check what the Brain actually framed.
 
 It is a text-mode Body: same SSE client, same terminal rendering, and it answers
 `tool_call(device=true)` by POSTing `/agent/result` like the real one.
