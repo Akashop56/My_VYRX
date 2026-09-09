@@ -294,7 +294,7 @@ class ChatController(
                     // Get out of the way so Boss can read; the header stays tappable.
                     if (!userPinnedTerminal) turnExpanded = false
                 }
-                answerTarget.append(event.text)
+                answerTarget += event.text
             }
 
             is AgentEvent.AnswerEnd -> {
@@ -309,7 +309,7 @@ class ChatController(
                 // The `done` frame repeats the full answer: use it only if no
                 // token ever arrived, so the typewriter never restarts or jumps.
                 if (answerTarget.isEmpty() && event.ask.response.isNotBlank()) {
-                    answerTarget.append(event.ask.response)
+                    answerTarget = event.ask.response
                 }
                 finishWithAsk(event.ask, typedIn = true, elapsedMs = event.elapsedMs)
             }
@@ -325,7 +325,7 @@ class ChatController(
                 agentPhase = AgentPhase.REASONING
                 addLine(ThoughtLine.LEVEL_NOTE, "Brain answered without streaming — running the loop classically.")
                 val settled = runCatching { runAgentLoop(event.ask) }.getOrElse { event.ask }
-                answerTarget.setLength(0).append(settled.response)
+                answerTarget = settled.response
                 finishWithAsk(settled, typedIn = true)
             }
         }
@@ -353,14 +353,14 @@ class ChatController(
             val authoritative = event.text
             if (authoritative != null) {
                 // Authoritative text wins over whatever partial deltas arrived.
-                thoughtDelta.setLength(0)
+                thoughtDelta = ""
                 val id = liveThoughtId
                 if (id == null) liveThoughtId = addLine(ThoughtLine.LEVEL_THINK, oneLine(authoritative, 600))
                 else updateLine(id) { it.copy(text = oneLine(authoritative, 600)) }
             }
             return
         }
-        if (event.delta.isNotEmpty()) thoughtDelta.append(event.delta)
+        if (event.delta.isNotEmpty()) thoughtDelta += event.delta
     }
 
     private suspend fun onToolCall(event: AgentEvent.ToolCall) {
@@ -470,7 +470,7 @@ class ChatController(
         if (r.update_proposal != null) proposal = r.update_proposal
         if (!r.error.isNullOrBlank()) error = r.error
         if (r.response.isNotBlank()) {
-            if (!typedIn) answerTarget.setLength(0).append(r.response)
+            if (!typedIn) answerTarget = r.response
             lastSpeech = r.response
         }
         if (elapsedMs > 0) turnElapsedMs = elapsedMs
@@ -480,8 +480,11 @@ class ChatController(
     // Typewriter ticker — decouples network arrival from reveal speed
     // ------------------------------------------------------------------
 
-    private val answerTarget = StringBuilder()
-    private val thoughtDelta = StringBuilder()
+    // Plain immutable buffers: the reveal ticker and the event handlers all run
+    // on the controller's single dispatcher, and reassignment recomposes
+    // cleanly - unlike in-place mutation of a shared builder.
+    private var answerTarget: String = ""
+    private var thoughtDelta: String = ""
     private var revealed = 0
     private var typingStarted = false
     private var userPinnedTerminal = false
@@ -493,8 +496,8 @@ class ChatController(
 
     private fun beginTurn() {
         turnLines.clear()
-        answerTarget.setLength(0)
-        thoughtDelta.setLength(0)
+        answerTarget = ""
+        thoughtDelta = ""
         revealed = 0
         typingStarted = false
         userPinnedTerminal = false
@@ -522,8 +525,8 @@ class ChatController(
         var changed = false
 
         if (thoughtDelta.isNotEmpty()) {
-            val text = thoughtDelta.toString()
-            thoughtDelta.setLength(0)
+            val text = thoughtDelta
+            thoughtDelta = ""
             val id = liveThoughtId
             if (id != null) updateLine(id) { line -> line.copy(text = oneLine(line.text + text, 600)) }
             else liveThoughtId = addLine(ThoughtLine.LEVEL_THINK, oneLine(text, 600))
@@ -577,7 +580,7 @@ class ChatController(
         activeId = null
         if (index < 0) return
         val current = messages[index]
-        val text = answerTarget.toString().ifBlank { current.text }
+        val text = answerTarget.ifBlank { current.text }
         val failed = !error.isNullOrBlank() && text.isBlank()
         messages[index] = current.copy(
             text = text,
@@ -698,7 +701,10 @@ class ChatController(
         const val MAX_TERMINAL_LINES = 140
 
         fun oneLine(text: String, limit: Int = 420): String {
-            val flat = " ".join(text.split("\n", "\r").flatMap { it.split(" ") }.filter { it.isNotBlank() })
+            val flat = text.split("\n", "\r")
+                .flatMap { it.split(" ") }
+                .filter { it.isNotBlank() }
+                .joinToString(" ")
             return if (flat.length <= limit) flat else flat.take(limit - 1) + "…"
         }
 
