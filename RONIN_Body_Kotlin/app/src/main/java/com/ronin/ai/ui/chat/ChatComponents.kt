@@ -163,12 +163,17 @@ fun VyRxMessageBubble(message: ChatMessage, controller: ChatController, modifier
                     Spacer(Modifier.width(3.dp))
                     BlockCursor(color = VyRxColors.PrimaryBright)
                 }
-            } else {
+            } else if (message.mine) {
                 Text(
-                    typedAnswer(message.text, live),
+                    message.text,
                     color = VyRxColors.TextPrimary,
-                    fontSize = 13.5.sp,
-                    lineHeight = 19.sp
+                    fontSize = 14.sp,
+                    lineHeight = 21.sp
+                )
+            } else {
+                ChatMarkdownText(
+                    text = message.text,
+                    streaming = live
                 )
             }
             if (!message.mine && !live) {
