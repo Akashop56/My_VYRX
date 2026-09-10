@@ -33,7 +33,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.ronin.ai.ui.theme.VyRxColors
@@ -310,10 +312,21 @@ fun BlockCursor(color: Color, modifier: Modifier = Modifier) {
     )
 }
 
-/** Text with a live neon caret appended — the answer being typed into a bubble. */
+/**
+ * Format the answer as it is being typed and append a live neon caret.
+ *
+ * The Brain deliberately sends the final answer as plain text containing common
+ * Markdown. Rendering the raw token stream with [Text] makes headings and bold
+ * markers visible, so this small dependency-free formatter runs on every
+ * revealed snapshot instead. It intentionally covers the Markdown used in chat
+ * (headings, lists, quotes, emphasis, code and links) without changing the
+ * streaming transport.
+ */
 @Composable
 fun typedAnswer(text: String, streaming: Boolean): AnnotatedString {
-    if (!streaming) return AnnotatedString(text)
+    val formatted = remember(text) { markdownAnnotatedString(text) }
+    if (!streaming) return formatted
+
     val transition = rememberInfiniteTransition(label = "type-caret")
     val fraction by transition.animateFloat(
         initialValue = 1f,
@@ -321,11 +334,152 @@ fun typedAnswer(text: String, streaming: Boolean): AnnotatedString {
         animationSpec = infiniteRepeatable(tween(480), RepeatMode.Reverse),
         label = "caret"
     )
-    return remember(text, fraction) {
-        AnnotatedString.Builder(text).apply {
+    return remember(formatted, fraction) {
+        AnnotatedString.Builder().apply {
+            append(formatted)
             append("▊")
-            addStyle(SpanStyle(color = VyRxColors.LogGreen.copy(alpha = fraction)), text.length, text.length + 1)
+            addStyle(
+                SpanStyle(color = VyRxColors.LogGreen.copy(alpha = fraction)),
+                formatted.length,
+                formatted.length + 1
+            )
         }.toAnnotatedString()
+    }
+}
+
+private fun markdownAnnotatedString(source: String): AnnotatedString {
+    val builder = AnnotatedString.Builder()
+    val lines = source.replace("\r\n", "\n").replace('\r', '\n').split('\n')
+    var inCodeFence = false
+
+    lines.forEachIndexed { index, rawLine ->
+        if (index > 0) builder.append('\n')
+        val line = rawLine.trimStart()
+        if (line.startsWith("```")) {
+            inCodeFence = !inCodeFence
+            return@forEachIndexed
+        }
+        if (inCodeFence) {
+            appendStyled(builder, SpanStyle(fontFamily = FontFamily.Monospace, color = VyRxColors.TextDim)) { target ->
+                target.append(rawLine)
+            }
+            return@forEachIndexed
+        }
+
+        val heading = Regex("^#{1,6}\\s+(.+?)\\s*#*\\s*$").matchEntire(line)
+        when {
+            heading != null -> appendStyled(
+                builder,
+                SpanStyle(fontWeight = FontWeight.Bold, color = VyRxColors.PrimaryBright)
+            ) { target ->
+                appendInlineMarkdown(target, heading.groupValues[1])
+            }
+
+            // Do not flash an incomplete heading marker while the next token is
+            // still on the wire.
+            line.matches(Regex("^#{1,6}\\s*")) -> Unit
+
+            line.matches(Regex("[-*_]{3,}\\s*")) -> appendStyled(
+                builder,
+                SpanStyle(color = VyRxColors.TextFaint)
+            ) { target ->
+                target.append("────────")
+            }
+
+            line.startsWith("> ") || line == ">" -> appendStyled(
+                builder,
+                SpanStyle(color = VyRxColors.TextDim)
+            ) { target ->
+                target.append("│ ")
+                appendInlineMarkdown(target, line.removePrefix("> "))
+            }
+
+            else -> {
+                val bullet = Regex("^[-*+]\\s+(.+)$").matchEntire(line)
+                val numbered = Regex("^(\\d+)[.)]\\s+(.+)$").matchEntire(line)
+                when {
+                    bullet != null -> {
+                        builder.append("• ")
+                        appendInlineMarkdown(builder, bullet.groupValues[1])
+                    }
+                    numbered != null -> {
+                        builder.append(numbered.groupValues[1])
+                        builder.append(". ")
+                        appendInlineMarkdown(builder, numbered.groupValues[2])
+                    }
+                    else -> appendInlineMarkdown(builder, rawLine)
+                }
+            }
+        }
+    }
+    return builder.toAnnotatedString()
+}
+
+private fun appendStyled(
+    builder: AnnotatedString.Builder,
+    style: SpanStyle,
+    content: (AnnotatedString.Builder) -> Unit
+) {
+    val start = builder.length
+    content(builder)
+    if (builder.length > start) builder.addStyle(style, start, builder.length)
+}
+
+/** Append inline Markdown while keeping the parser deliberately lightweight. */
+private fun appendInlineMarkdown(builder: AnnotatedString.Builder, source: String) {
+    var cursor = 0
+    while (cursor < source.length) {
+        // Links are displayed as their label; the URL is not useful in a chat
+        // bubble and should never leak through as raw Markdown syntax.
+        if (source[cursor] == '[') {
+            val closeLabel = source.indexOf("](", cursor + 1)
+            val closeUrl = if (closeLabel >= 0) source.indexOf(')', closeLabel + 2) else -1
+            if (closeLabel > cursor && closeUrl > closeLabel) {
+                appendInlineMarkdown(builder, source.substring(cursor + 1, closeLabel))
+                cursor = closeUrl + 1
+                continue
+            }
+        }
+
+        val marker = when {
+            source.startsWith("**", cursor) -> "**"
+            source.startsWith("__", cursor) -> "__"
+            source.startsWith("~~", cursor) -> "~~"
+            source[cursor] == '`' -> "`"
+            source[cursor] == '*' -> "*"
+            source[cursor] == '_' && (cursor == 0 || !source[cursor - 1].isLetterOrDigit()) -> "_"
+            else -> null
+        }
+        if (marker == null) {
+            builder.append(source[cursor])
+            cursor++
+            continue
+        }
+
+        val close = source.indexOf(marker, cursor + marker.length)
+        if (close <= cursor + marker.length) {
+            // An unfinished stream chunk may contain only an opening marker.
+            // Hide that marker for now; the next snapshot will format it once
+            // its closing marker arrives.
+            cursor += marker.length
+            continue
+        }
+
+        val inner = source.substring(cursor + marker.length, close)
+        val style = when (marker) {
+            "**", "__" -> SpanStyle(fontWeight = FontWeight.Bold)
+            "*", "_" -> SpanStyle(fontStyle = FontStyle.Italic)
+            "~~" -> SpanStyle(textDecoration = TextDecoration.LineThrough)
+            else -> SpanStyle(
+                fontFamily = FontFamily.Monospace,
+                color = VyRxColors.PrimaryBright,
+                background = Color(0x221E293B)
+            )
+        }
+        appendStyled(builder, style) { target ->
+            if (marker == "`") target.append(inner) else appendInlineMarkdown(target, inner)
+        }
+        cursor = close + marker.length
     }
 }
 

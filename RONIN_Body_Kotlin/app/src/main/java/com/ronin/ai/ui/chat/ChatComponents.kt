@@ -81,8 +81,15 @@ fun VyRxMessageBubble(message: ChatMessage, controller: ChatController, modifier
     val authorColor = if (message.mine) VyRxColors.Blue else VyRxColors.PrimaryBright
 
     // Live turns read the controller's state; finished ones keep their snapshot.
+    // Reading streamSeq here is intentional: it invalidates this keyed LazyColumn
+    // item when a thought frame changes, even if the answer text has not moved.
     val live = message.streaming
-    val thoughts = if (live) controller.turnLines.toList() else message.thoughts
+    val thoughts = if (live) {
+        controller.streamSeq
+        controller.turnLines.toList()
+    } else {
+        message.thoughts
+    }
     var openHistory by remember(message.id) { mutableStateOf(false) }
     val expanded = if (live) controller.turnExpanded else openHistory
     val phase = if (live) controller.agentPhase else message.phase
@@ -250,7 +257,11 @@ fun ChatInputBar(
                     .putExtra("receiver", receiver))
             onVoiceStart()
         } catch (e: Exception) {
-            Toast.makeText(context, "Cannot start voice input: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+            Toast.makeText(
+                context,
+                "Cannot start voice input: ${e.localizedMessage ?: "unknown error"}",
+                Toast.LENGTH_SHORT
+            ).show()
         }
     }
     val permissionLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
@@ -360,7 +371,7 @@ fun ChatInputBar(
 }
 
 // ---------------------------------------------------------------------------
-// Shared chat panel (message list + input), reused by Home and Chat screens
+// Chat-only panel (message list + input). It is mounted exclusively by ChatScreen.
 // ---------------------------------------------------------------------------
 
 @Composable
@@ -398,26 +409,36 @@ fun ChatPanel(controller: ChatController, onVoiceStart: () -> Unit, modifier: Mo
                 )
             }
         }
-        controller.error?.let { error ->
-            Text(
-                error,
-                color = VyRxColors.Red,
-                fontSize = 11.sp,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
-                textAlign = TextAlign.Start
-            )
+        // Never pass a nullable state value directly to Text. In particular,
+        // Compose would display the string "null" if a nullable error/status
+        // value were converted to text before it was checked.
+        controller.error
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() && !it.equals("null", ignoreCase = true) }
+            ?.let { message ->
+                Text(
+                    message,
+                    color = VyRxColors.Red,
+                    fontSize = 11.sp,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                    textAlign = TextAlign.Start
+                )
+            }
+
+        val startupMessage = when (controller.brainStatus) {
+            BrainStatus.STARTING -> "Starting local Brain (Termux)..."
+            BrainStatus.CHECKING -> "Checking local Brain..."
+            BrainStatus.ONLINE, BrainStatus.OFFLINE -> null
         }
-        AnimatedVisibility(visible = controller.brainStatus == BrainStatus.STARTING || controller.brainStatus == BrainStatus.CHECKING) {
-            Text(
-                when (controller.brainStatus) {
-                    BrainStatus.STARTING -> "Starting local Brain (Termux)..."
-                    BrainStatus.CHECKING -> "Checking local Brain..."
-                    else -> ""
-                },
-                color = VyRxColors.TextDim,
-                fontSize = 11.sp,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp)
-            )
+        AnimatedVisibility(visible = startupMessage != null) {
+            startupMessage?.let { message ->
+                Text(
+                    message,
+                    color = VyRxColors.TextDim,
+                    fontSize = 11.sp,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp)
+                )
+            }
         }
         if (controller.brainStatus == BrainStatus.OFFLINE) {
             Row(Modifier.padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {

@@ -90,6 +90,11 @@ data class ChatMessage(
 
 enum class BrainStatus { CHECKING, STARTING, ONLINE, OFFLINE }
 
+/** Treat JSON null sent as a string as absent UI state, not user-visible text. */
+private fun uiMessageOrNull(value: String?): String? = value
+    ?.trim()
+    ?.takeIf { it.isNotEmpty() && !it.equals("null", ignoreCase = true) }
+
 /**
  * Owns the conversation lifecycle (brain startup, sending, command execution,
  * self-coding proposals, memory save, regenerate, feedback) and is shared by
@@ -261,11 +266,12 @@ class ChatController(
                     .onSuccess { ask -> finishWithAsk(ask, typedIn = false) }
                     .onFailure { fail ->
                         brainStatus = BrainStatus.OFFLINE
-                        error = fail.message ?: e.message ?: "Connection to VYRX Brain failed."
+                        error = uiMessageOrNull(fail.message ?: e.message)
+                            ?: "Connection to VYRX Brain failed."
                         addLine(ThoughtLine.LEVEL_FAIL, error.orEmpty())
                     }
             } else {
-                error = e.message ?: "Stream interrupted."
+                error = uiMessageOrNull(e.message) ?: "Stream interrupted."
                 addLine(ThoughtLine.LEVEL_FAIL, "Stream interrupted — showing what arrived.")
             }
         } finally {
@@ -294,7 +300,7 @@ class ChatController(
                     // Get out of the way so Boss can read; the header stays tappable.
                     if (!userPinnedTerminal) turnExpanded = false
                 }
-                answerTarget += event.text
+                appendAnswerChunk(event.text)
             }
 
             is AgentEvent.AnswerEnd -> {
@@ -309,14 +315,14 @@ class ChatController(
                 // The `done` frame repeats the full answer: use it only if no
                 // token ever arrived, so the typewriter never restarts or jumps.
                 if (answerTarget.isEmpty() && event.ask.response.isNotBlank()) {
-                    answerTarget = event.ask.response
+                    replaceAnswerTarget(event.ask.response)
                 }
                 finishWithAsk(event.ask, typedIn = true, elapsedMs = event.elapsedMs)
             }
 
             is AgentEvent.Failed -> {
                 agentPhase = AgentPhase.CORRECTING
-                error = event.message.ifBlank { "Brain stream error: ${event.code}" }
+                error = uiMessageOrNull(event.message) ?: "Brain stream error: ${event.code}"
                 addLine(ThoughtLine.LEVEL_FAIL, "${event.code}: ${event.message}")
             }
 
@@ -325,7 +331,7 @@ class ChatController(
                 agentPhase = AgentPhase.REASONING
                 addLine(ThoughtLine.LEVEL_NOTE, "Brain answered without streaming — running the loop classically.")
                 val settled = runCatching { runAgentLoop(event.ask) }.getOrElse { event.ask }
-                answerTarget = settled.response
+                replaceAnswerTarget(settled.response)
                 finishWithAsk(settled, typedIn = true)
             }
         }
@@ -393,7 +399,7 @@ class ChatController(
                 toolCallId = action.toolCallId
             )
         }.onFailure { e ->
-            error = e.message ?: "Could not report the device result to the Brain."
+            error = uiMessageOrNull(e.message) ?: "Could not report the device result to the Brain."
             addLine(ThoughtLine.LEVEL_FAIL, "Observation callback failed: ${error.orEmpty()}")
         }
     }
@@ -468,9 +474,9 @@ class ChatController(
     private fun finishWithAsk(r: AskResponse, typedIn: Boolean, elapsedMs: Int = 0) {
         runLegacyCommand(r)
         if (r.update_proposal != null) proposal = r.update_proposal
-        if (!r.error.isNullOrBlank()) error = r.error
+        uiMessageOrNull(r.error)?.let { error = it }
         if (r.response.isNotBlank()) {
-            if (!typedIn) answerTarget = r.response
+            if (!typedIn) replaceAnswerTarget(r.response)
             lastSpeech = r.response
         }
         if (elapsedMs > 0) turnElapsedMs = elapsedMs
@@ -480,10 +486,11 @@ class ChatController(
     // Typewriter ticker — decouples network arrival from reveal speed
     // ------------------------------------------------------------------
 
-    // Plain immutable buffers: the reveal ticker and the event handlers all run
-    // on the controller's single dispatcher, and reassignment recomposes
-    // cleanly - unlike in-place mutation of a shared builder.
-    private var answerTarget: String = ""
+    // The server can deliver several answer chunks between 32 ms reveal ticks.
+    // Keep the received buffer in Compose state and append each token instead of
+    // replacing the previous one. The active ChatMessage is then updated by the
+    // ticker, so every visible slice is an observable SnapshotStateList update.
+    private var answerTarget by mutableStateOf("")
     private var thoughtDelta: String = ""
     private var revealed = 0
     private var typingStarted = false
@@ -494,9 +501,23 @@ class ChatController(
     private var ticker: Job? = null
     private var turnStartedAt = 0L
 
+    /** Append one SSE token without losing text already received. */
+    private fun appendAnswerChunk(chunk: String) {
+        if (chunk.isEmpty()) return
+        answerTarget += chunk
+        // Keep the scroll-follow effect responsive even when the network sends
+        // a large token burst before the next typewriter tick.
+        streamSeq++
+    }
+
+    private fun replaceAnswerTarget(text: String) {
+        answerTarget = text
+        if (text.isNotEmpty()) streamSeq++
+    }
+
     private fun beginTurn() {
         turnLines.clear()
-        answerTarget = ""
+        replaceAnswerTarget("")
         thoughtDelta = ""
         revealed = 0
         typingStarted = false
@@ -535,9 +556,16 @@ class ChatController(
 
         val remaining = answerTarget.length - revealed
         if (remaining > 0) {
-            // Reveal faster when far behind, slower near the end: reads like typing
-            // even when the network delivered the text in bursts.
-            val step = maxOf(2, minOf(14, (remaining + 5) / 6))
+            // Always wait for the 32 ms ticker between visible updates. A small
+            // bounded catch-up keeps long answers from taking minutes, while a
+            // short answer is still revealed one character at a time rather than
+            // being replaced by the full server response.
+            val step = when {
+                remaining > 160 -> 4
+                remaining > 80 -> 3
+                remaining > 24 -> 2
+                else -> 1
+            }
             revealed = (revealed + step).coerceAtMost(answerTarget.length)
             updateActiveMessage(answerTarget.substring(0, revealed))
             changed = true
@@ -554,12 +582,21 @@ class ChatController(
     private suspend fun endTurn() {
         // Let the effect finish (bounded) so the bubble never jumps to the full text.
         val deadline = System.currentTimeMillis() + TYPING_GRACE_MS
-        while (revealed < answerTarget.length && System.currentTimeMillis() < deadline) {
+        while (
+            (revealed < answerTarget.length || thoughtDelta.isNotEmpty()) &&
+            System.currentTimeMillis() < deadline
+        ) {
             delay(TICK_MS)
         }
+        // Stop the background ticker before the final drain. If the network
+        // delivered a long answer near the stream end, continue revealing it at
+        // the same cadence instead of committing the whole string in one frame.
         ticker?.cancel()
         ticker = null
-        if (revealed < answerTarget.length) revealed = answerTarget.length
+        while (revealed < answerTarget.length || thoughtDelta.isNotEmpty()) {
+            revealTick()
+            if (revealed < answerTarget.length || thoughtDelta.isNotEmpty()) delay(TICK_MS)
+        }
         commitActiveMessage()
         agentPhase = AgentPhase.IDLE
         phaseLabel = "Ready"

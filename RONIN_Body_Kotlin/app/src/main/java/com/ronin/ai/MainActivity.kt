@@ -187,22 +187,14 @@ fun VyRxApp(activity: FragmentActivity) {
                     ) {
                         composable("home") {
                             HomeScreen(
-                                controller = controller,
                                 onOpenDrawer = { scope.launch { drawerState.open() } },
-                                onNavigate = onNavigate,
-                                onOrbTap = { onNavigate("chat") },
-                                onOrbLongPress = {
-                                    controller.prefill = "Emergency: "
-                                    onNavigate("chat")
-                                },
-                                onVoiceStart = { toast("Speak now — listening…") }
+                                onNavigate = onNavigate
                             )
                         }
                         composable("chat") {
                             ChatScreen(
                                 controller = controller,
                                 onOpenDrawer = { scope.launch { drawerState.open() } },
-                                onNavigate = onNavigate,
                                 onVoiceStart = { toast("Speak now — listening…") }
                             )
                         }
