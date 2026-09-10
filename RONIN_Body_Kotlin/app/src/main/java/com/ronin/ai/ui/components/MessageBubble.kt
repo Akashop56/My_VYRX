@@ -9,4 +9,5 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
-@Composable fun MessageBubble(text:String, mine:Boolean){ Box(Modifier.fillMaxWidth().padding(vertical=4.dp), if(mine) Alignment.CenterEnd else Alignment.CenterStart){Text(text,Modifier.background(if(mine) Color(0xFF5B21B6) else Color(0xFF20242D),RoundedCornerShape(16.dp)).padding(12.dp),color=Color.White,style=MaterialTheme.typography.bodyLarge)} }
+import androidx.compose.ui.unit.sp
+@Composable fun MessageBubble(text:String, mine:Boolean){ Box(Modifier.fillMaxWidth().padding(vertical=4.dp), if(mine) Alignment.CenterEnd else Alignment.CenterStart){Text(text,Modifier.background(if(mine) Color(0xFF5B21B6) else Color(0xFF20242D),RoundedCornerShape(16.dp)).padding(horizontal=14.dp,vertical=11.dp),color=Color.White,fontSize=14.sp,lineHeight=21.sp,style=MaterialTheme.typography.bodyLarge)} }
