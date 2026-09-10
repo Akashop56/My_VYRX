@@ -46,6 +46,31 @@ class ToolProtocolTests(unittest.TestCase):
         text = '<tool>{"tool": "open_app", "args": {}}</tool> Done, Boss.'
         self.assertEqual(strip_tool_tags(text), "Done, Boss.")
 
+    def test_action_payload_parsed_as_tool_call(self):
+        # A model that echoes the [ACTION] wire format back as plain content
+        # (instead of using native function calling) must be intercepted as a
+        # real tool call, not leaked as raw JSON to the UI.
+        text = ('[ACTION] [{"id": "call_535b", "type": "function", '
+                '"function": {"name": "run_termux_command", '
+                '"arguments": "{\\"command\\": \\"ls\\"}"}}]')
+        calls = extract_tool_calls({"role": "assistant", "content": text})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "run_termux_command")
+        self.assertEqual(calls[0]["function"]["arguments"]["command"], "ls")
+
+    def test_strip_action_payload_for_tts(self):
+        # The [ACTION] JSON must be stripped before anything reaches the bubble.
+        text = ('[ACTION] [{"id": "c", "type": "function", '
+                '"function": {"name": "open_app", "arguments": "{}"}}] '
+                'YouTube is open, Boss.')
+        self.assertEqual(strip_tool_tags(text), "YouTube is open, Boss.")
+
+    def test_plain_prose_with_action_word_not_stripped(self):
+        # Ordinary prose mentioning [ACTION] but no JSON must be preserved.
+        text = "I took an [ACTION] and opened the app, Boss."
+        self.assertEqual(strip_tool_tags(text), "I took an [ACTION] and opened the app, Boss.")
+        self.assertEqual(extract_tool_calls({"role": "assistant", "content": text}), [])
+
     def test_device_tool_registry(self):
         self.assertTrue(is_device_tool("open_app"))
         self.assertTrue(is_device_tool("read_screen"))

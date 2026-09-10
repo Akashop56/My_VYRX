@@ -782,7 +782,7 @@ async def _react_loop(
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
     _record_provider_latency(ctx, completion, elapsed_ms, provider_payload, provider_calls)
-    final_text = strip_tool_tags(_response_text(assistant_message)) or _response_text(assistant_message)
+    final_text = strip_tool_tags(_response_text(assistant_message)) or "No response generated."
 
     # Self-learning safety net: an explicit "remember X" must persist even if
     # the model forgot to call save_memory in this task.
