@@ -483,14 +483,152 @@ def _normalize_tool_call(name: str, arguments: Any, call_id: str | None = None) 
     }
 
 
+# ---------------------------------------------------------------------------
+# [ACTION] payload handling
+#
+# The planner replays assistant turns that carried native function calls back
+# to the provider as plain-text ``[ACTION] <json>`` (see ``_gemini_contents``).
+# Some models echo that exact format *back* as their own content instead of
+# invoking tools natively. The helpers below let us silently recover those as
+# real tool calls and to strip them from any text sent to the UI, so the
+# Kotlin chat bubble never shows raw tool-call JSON.
+# ---------------------------------------------------------------------------
+
+_ACTION_MARKER = "[ACTION]"
+
+
+def _split_action_payloads(text: str) -> list[dict[str, Any]]:
+    """Return the JSON objects/arrays that follow each ``[ACTION]`` marker.
+
+    Uses a tolerant JSON scan so a payload embedded in surrounding prose is
+    still recovered, while ordinary prose containing the literal word
+    ``[ACTION]`` but no valid JSON is ignored.
+    """
+    if _ACTION_MARKER not in text and _ACTION_MARKER.lower() not in text:
+        return []
+    decoder = json.JSONDecoder()
+    items: list[dict[str, Any]] = []
+    i = 0
+    n = len(text)
+    lowered = text.lower()
+    while i < n:
+        idx = lowered.find(_ACTION_MARKER.lower(), i)
+        if idx == -1:
+            break
+        j = idx + len(_ACTION_MARKER)
+        while j < n and text[j] in " \t\r\n":
+            j += 1
+        if j < n and text[j] in "[{":
+            try:
+                obj, end = decoder.raw_decode(text, j)
+            except ValueError:
+                obj = None
+                end = j
+            if isinstance(obj, list):
+                items.extend(it for it in obj if isinstance(it, dict))
+                j = end
+            elif isinstance(obj, dict):
+                items.append(obj)
+                j = end
+        i = j
+    return items
+
+
+def _normalize_wire_tool_call(item: Any) -> dict[str, Any] | None:
+    """Normalize one OpenAI-wire tool call into the project's shape.
+
+    Accepts ``{id, type, function:{name, arguments}}`` (the ``[ACTION]``
+    format) and the flattened ``{name, arguments}`` form. Returns ``None`` when
+    the payload is not a recognizable tool call.
+    """
+    if not isinstance(item, dict):
+        return None
+    function = item.get("function")
+    if not isinstance(function, dict):
+        function = item  # flattened name/arguments
+    name = function.get("name")
+    if not name:
+        return None
+    arguments = function.get("arguments", function.get("args", {}))
+    return _normalize_tool_call(str(name), arguments, item.get("id") or function.get("id"))
+
+
+def _strip_action_payloads(text: str) -> str:
+    """Remove ``[ACTION] <json>`` spans from ``text`` (inverse of the parser).
+
+    A bare ``[ACTION]`` with no JSON payload (ordinary prose that happens to use
+    the word) is left untouched.
+    """
+    if _ACTION_MARKER not in text and _ACTION_MARKER.lower() not in text:
+        return text
+    decoder = json.JSONDecoder()
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    lowered = text.lower()
+    while i < n:
+        idx = lowered.find(_ACTION_MARKER.lower(), i)
+        if idx == -1:
+            out.append(text[i:])
+            break
+        out.append(text[i:idx])
+        j = idx + len(_ACTION_MARKER)
+        while j < n and text[j] in " \t\r\n":
+            j += 1
+        consumed = False
+        if j < n and text[j] in "[{":
+            try:
+                _, end = decoder.raw_decode(text, j)
+                j = end
+                consumed = True
+            except ValueError:
+                pass
+        if consumed:
+            # The [ACTION] <json> span (including the marker) is removed.
+            i = j
+        else:
+            # No JSON payload: preserve the literal word so prose survives.
+            out.append(text[idx:idx + len(_ACTION_MARKER)])
+            i = idx + len(_ACTION_MARKER)
+    return "".join(out)
+
+
+def _looks_like_action_delta(piece: str) -> bool:
+    """True when a streamed delta is a raw ``[ACTION]``/tool-call payload that
+    must be swallowed rather than shown to the user."""
+    if not piece:
+        return False
+    return _ACTION_MARKER in piece or _ACTION_MARKER.lower() in piece
+
+
+def _swallow_action_deltas(on_delta: Callable[[str], None] | None) -> Callable[[str], None] | None:
+    """Wrap an ``on_delta`` callback so raw ``[ACTION]``/tool-call JSON is never
+    forwarded to the client; the ReAct loop consumes it instead."""
+    if on_delta is None:
+        return None
+
+    def wrapped(piece: str) -> None:
+        if _looks_like_action_delta(piece):
+            return
+        on_delta(piece)
+
+    return wrapped
+
+
 def parse_tool_tag_calls(text: str) -> list[dict[str, Any]]:
     """Extract ``<tool>{"tool": ..., "args": {...}}</tool>`` calls from text.
 
     Also accepts fenced `````json`` blocks and a bare JSON object of the same
     shape, so strict-JSON-mode providers work without native tool support.
+    Recognizes the ``[ACTION] <json>`` wire format this project replays
+    assistant calls in, so a model that echoes it back as plain text is
+    intercepted as a real tool call instead of leaking raw JSON to the user.
     Returns normalized OpenAI-style ``tool_calls`` entries (arguments as dict).
     """
-    if not text or "<tool" not in text.lower() and "{" not in text:
+    if not text:
+        return []
+    if ("<tool" not in text.lower() and "{" not in text
+            and _ACTION_MARKER.lower() not in text.lower()):
         return []
     candidates: list[str] = []
     if text:
@@ -522,6 +660,15 @@ def parse_tool_tag_calls(text: str) -> list[dict[str, Any]]:
                         item.get("args", item.get("arguments", {})), item.get("id"))
                     if normalized is not None:
                         calls.append(normalized)
+    # [ACTION] <json> — the wire format we ourselves replay assistant calls
+    # in (see ``_gemini_contents``). A model sometimes echoes it back as plain
+    # content instead of invoking tools natively; intercept each entry as a
+    # real tool call so the ReAct loop executes it (and it never reaches the
+    # user as raw JSON).
+    for item in _split_action_payloads(text):
+        call = _normalize_wire_tool_call(item)
+        if call is not None:
+            calls.append(call)
     return calls
 
 
@@ -555,10 +702,12 @@ def extract_tool_calls(message: dict[str, Any] | None) -> list[dict[str, Any]]:
 
 
 def strip_tool_tags(text: str | None) -> str:
-    """Remove ``<tool>`` blocks so only TTS-ready speech remains."""
+    """Remove ``<tool>`` blocks AND ``[ACTION] <json>`` payloads so only
+    TTS-ready speech remains. Raw tool-call JSON must never reach the UI."""
     if not text:
         return ""
     cleaned = _TOOL_TAG_RE.sub("", text)
+    cleaned = _strip_action_payloads(cleaned)
     return " ".join(cleaned.split()).strip()
 
 
@@ -716,6 +865,10 @@ def _complete_with(
     name, key, model = (provider.get("provider") or "").lower(), provider.get("api_key") or "", provider.get("model")
     if not key:
         raise ProviderFailure("API key is not configured")
+    # Raw tool-call JSON (the ``[ACTION]`` wire format) must be silently parsed
+    # by the ReAct loop, never surfaced to the client as streaming text.
+    if on_delta is not None:
+        on_delta = _swallow_action_deltas(on_delta)
     if name in ("openai", "openrouter", "groq", "custom"):
         endpoints = {"openai": "https://api.openai.com/v1/chat/completions", "openrouter": "https://openrouter.ai/api/v1/chat/completions", "groq": "https://api.groq.com/openai/v1/chat/completions"}
         endpoint = provider.get("endpoint") if name == "custom" else endpoints.get(name)
