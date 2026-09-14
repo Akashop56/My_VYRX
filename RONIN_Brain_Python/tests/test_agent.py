@@ -35,6 +35,12 @@ class ToolProtocolTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["function"]["name"], "read_screen")
 
+    def test_legacy_action_tag_parsing(self):
+        calls = parse_tool_tag_calls('[ACTION] {"tool": "read_screen", "args": {"max_nodes": 10}}')
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "read_screen")
+        self.assertEqual(calls[0]["function"]["arguments"], {"max_nodes": 10})
+
     def test_native_tool_calls_normalized(self):
         message = {"role": "assistant", "content": None, "tool_calls": [
             {"id": "1", "type": "function",
@@ -45,6 +51,11 @@ class ToolProtocolTests(unittest.TestCase):
     def test_strip_tool_tags_for_tts(self):
         text = '<tool>{"tool": "open_app", "args": {}}</tool> Done, Boss.'
         self.assertEqual(strip_tool_tags(text), "Done, Boss.")
+
+    def test_strip_action_tag_for_tts(self):
+        text = '[ACTION] {"tool": "open_app", "args": {"app_name": "YouTube"}} Done, Boss.'
+        self.assertEqual(strip_tool_tags(text), "Done, Boss.")
+        self.assertEqual(strip_tool_tags('{"tool": "read_screen", "args": {}}'), "")
 
     def test_device_tool_registry(self):
         self.assertTrue(is_device_tool("open_app"))
@@ -113,6 +124,32 @@ class ReActLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.route, "agent_final")
             self.assertFalse(result.needs_tool_result)
             self.assertEqual(mock_complete.call_count, 2)
+
+    async def test_legacy_action_tag_executes_as_a_native_tool_call(self):
+        """[ACTION] JSON must enter the same executor path as function calls."""
+        first = {"choices": [{"message": {
+            "role": "assistant",
+            "content": '[ACTION] {"tool": "save_memory", "args": '
+                       '{"category": "personal", "title": "T", "content": "C"}}',
+        }}]}
+        second = {"choices": [{"message": {"role": "assistant", "content": "Saved, Boss."}}]}
+        with patch.object(planner, "recent_history", AsyncMock(return_value=[])), \
+             patch.object(planner, "save_conversation", AsyncMock()), \
+             patch.object(planner, "search_facts", AsyncMock(return_value=[])), \
+             patch.object(planner, "get_available_tools", return_value=[
+                 {"type": "function", "function": {"name": "save_memory", "description": "m",
+                                                   "parameters": {"type": "object", "properties": {}}}}]), \
+             patch.object(planner, "execute_tool", return_value='{"saved": true}') as execute, \
+             patch.object(planner.asyncio, "sleep", AsyncMock()), \
+             patch.object(planner, "complete", side_effect=[first, second]):
+            result = await planner._run_llm(AskRequest(message="remember tea"), context())
+
+        execute.assert_called_once_with("save_memory", {
+            "category": "personal", "title": "T", "content": "C",
+        })
+        self.assertEqual(result.response, "Saved, Boss.")
+        self.assertNotIn("ACTION", result.response)
+        self.assertNotIn('"tool"', result.response)
 
     async def test_device_tool_dispatch_and_callback(self):
         """LLM calls open_app -> pending action -> /agent/result continues -> final."""

@@ -477,6 +477,86 @@ class StreamingTransportTests(unittest.TestCase):
         self.assertEqual(calls[0]["function"]["arguments"], {"package": "com.x"})
         self.assertEqual(calls[0]["id"], "call_9")
 
+    def test_streamed_action_text_is_never_forwarded_and_is_parsed(self):
+        """Split [ACTION] JSON stays private but still drives the ReAct loop."""
+        from core import llm_handler as h
+
+        class FakeResponse:
+            status_code = 200
+
+            def iter_lines(self, decode_unicode=True):
+                chunks = ("I will inspect that. ", "[ACT", "ION] {\"tool\": \"read_",
+                          "screen\", \"args\": {\"max_nodes\": 10}}")
+                for piece in chunks:
+                    yield "data: " + json.dumps({"choices": [{"delta": {"content": piece}}]})
+                yield "data: [DONE]"
+
+            def close(self):
+                pass
+
+        emitted: list[str] = []
+        with patch.object(h.requests, "post", return_value=FakeResponse()):
+            result = h._stream_post("https://provider.example/stream", {}, {"model": "fake"},
+                                    emitted.append)
+
+        streamed = "".join(emitted)
+        self.assertEqual(streamed, "I will inspect that. ")
+        self.assertNotIn("ACTION", streamed)
+        self.assertNotIn('"tool"', streamed)
+        calls = h.extract_tool_calls(result["choices"][0]["message"])
+        self.assertEqual(calls[0]["function"]["name"], "read_screen")
+        self.assertEqual(calls[0]["function"]["arguments"], {"max_nodes": 10})
+
+    def test_streamed_tool_tag_is_never_forwarded_and_is_parsed(self):
+        """The XML fallback is also held across arbitrary stream boundaries."""
+        from core import llm_handler as h
+
+        class FakeResponse:
+            status_code = 200
+
+            def iter_lines(self, decode_unicode=True):
+                chunks = ("<to", "ol>{\"tool\": \"read_screen\", ", "\"args\": {}}</tool>")
+                for piece in chunks:
+                    yield "data: " + json.dumps({"choices": [{"delta": {"content": piece}}]})
+                yield "data: [DONE]"
+
+            def close(self):
+                pass
+
+        emitted: list[str] = []
+        with patch.object(h.requests, "post", return_value=FakeResponse()):
+            result = h._stream_post("https://provider.example/stream", {}, {"model": "fake"},
+                                    emitted.append)
+
+        self.assertEqual(emitted, [])
+        calls = h.extract_tool_calls(result["choices"][0]["message"])
+        self.assertEqual(calls[0]["function"]["name"], "read_screen")
+
+    def test_streamed_bare_json_action_is_never_forwarded_and_is_parsed(self):
+        """Strict-JSON providers cannot leak a split bare tool object either."""
+        from core import llm_handler as h
+
+        class FakeResponse:
+            status_code = 200
+
+            def iter_lines(self, decode_unicode=True):
+                chunks = ("{\"tool\": \"read_", "screen\", \"args\": {}}")
+                for piece in chunks:
+                    yield "data: " + json.dumps({"choices": [{"delta": {"content": piece}}]})
+                yield "data: [DONE]"
+
+            def close(self):
+                pass
+
+        emitted: list[str] = []
+        with patch.object(h.requests, "post", return_value=FakeResponse()):
+            result = h._stream_post("https://provider.example/stream", {}, {"model": "fake"},
+                                    emitted.append)
+
+        self.assertEqual(emitted, [])
+        calls = h.extract_tool_calls(result["choices"][0]["message"])
+        self.assertEqual(calls[0]["function"]["name"], "read_screen")
+
     def test_streaming_unavailable_falls_back_to_buffered_call(self):
         """A provider that rejects ``stream`` must still answer the agent."""
         from core import llm_handler as h

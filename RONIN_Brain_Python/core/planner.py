@@ -782,7 +782,10 @@ async def _react_loop(
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
     _record_provider_latency(ctx, completion, elapsed_ms, provider_payload, provider_calls)
-    final_text = strip_tool_tags(_response_text(assistant_message)) or _response_text(assistant_message)
+    # Do not fall back to the raw content here.  An action-only fallback
+    # response intentionally cleans to an empty string; restoring the raw
+    # value would put its JSON/[ACTION] wire syntax into the chat bubble.
+    final_text = strip_tool_tags(_response_text(assistant_message))
 
     # Self-learning safety net: an explicit "remember X" must persist even if
     # the model forgot to call save_memory in this task.
@@ -1118,4 +1121,3 @@ async def plan_request_stream(request: AskRequest, ctx: BrainContext) -> AsyncIt
 
 #: In-flight streamed turns that outlived their HTTP connection.
 _DETACHED_TASKS: set[asyncio.Task] = set()
-

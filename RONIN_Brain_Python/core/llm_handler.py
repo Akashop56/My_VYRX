@@ -258,7 +258,12 @@ def iter_sse_payloads(response: requests.Response) -> Iterator[str]:
 
 def new_stream_state() -> dict[str, Any]:
     """Accumulator shared by every provider's delta folding."""
-    return {"content": [], "reasoning": [], "calls": {}, "finish": "stop"}
+    # ``action_filter`` deliberately sits beside the raw content accumulator.
+    # The raw value is needed to reconstruct a fallback text tool call after
+    # the stream finishes; only the filtered value is ever passed to on_delta.
+    return {"content": [], "reasoning": [], "calls": {}, "finish": "stop",
+            "action_filter": _StreamActionFilter(),
+            "reasoning_action_filter": _StreamActionFilter()}
 
 
 def fold_openai_delta(state: dict[str, Any], chunk: dict[str, Any]) -> tuple[str, str]:
@@ -365,9 +370,21 @@ def _stream_post(
             if not isinstance(chunk, dict):
                 continue
             text, reasoning = fold_openai_delta(state, chunk)
-            piece = text or reasoning
+            # Native tool-call fragments live in ``delta.tool_calls`` and are
+            # folded silently above. Text fallback calls arrive in ``content``;
+            # do not publish their partial JSON/tag fragments while waiting for
+            # a complete call to become parsable.
+            safe_text = _filter_stream_text(state, text)
+            safe_reasoning = _filter_stream_reasoning(state, reasoning)
+            piece = safe_text or safe_reasoning
             if piece and on_delta is not None:
                 on_delta(piece)
+        tail = _finish_stream_text(state)
+        if tail and on_delta is not None:
+            on_delta(tail)
+        reasoning_tail = _finish_stream_reasoning(state)
+        if reasoning_tail and on_delta is not None:
+            on_delta(reasoning_tail)
         completion = build_completion(state)
         if completion is None:
             raise StreamingUnavailable("provider stream returned no usable delta")
@@ -416,8 +433,9 @@ def _stream_gemini(
                 text = part.get("text")
                 if isinstance(text, str) and text:
                     state["content"].append(text)
-                    if on_delta is not None:
-                        on_delta(text)
+                    safe_text = _filter_stream_text(state, text)
+                    if safe_text and on_delta is not None:
+                        on_delta(safe_text)
                 call = part.get("functionCall")
                 if isinstance(call, dict) and call.get("name"):
                     normalized = _normalize_tool_call(str(call["name"]), call.get("args", {}))
@@ -427,6 +445,9 @@ def _stream_gemini(
                             "name": normalized["function"]["name"],
                             "arguments": json.dumps(normalized["function"]["arguments"], ensure_ascii=False),
                         }
+        tail = _finish_stream_text(state)
+        if tail and on_delta is not None:
+            on_delta(tail)
         text = "".join(state["content"])
         # A streamed <tool> tag only becomes parsable once the whole line is in.
         calls = dict(state["calls"])
@@ -457,7 +478,21 @@ def _stream_gemini(
 # ---------------------------------------------------------------------------
 
 _TOOL_TAG_RE = re.compile(r"<tool\s*>(.*?)</tool\s*>", re.IGNORECASE | re.DOTALL)
-_FENCED_JSON_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+_OPEN_TOOL_TAG_RE = re.compile(r"<tool\b[^>]*>", re.IGNORECASE)
+_ACTION_TAG_RE = re.compile(r"\[ACTION\]\s*", re.IGNORECASE)
+_FENCED_JSON_RE = re.compile(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", re.DOTALL)
+_JSON_DECODER = json.JSONDecoder()
+
+
+def _decode_json_prefix(text: str, start: int = 0) -> tuple[Any, int] | None:
+    """Decode one JSON value at ``start`` and return its absolute end index."""
+    suffix = text[start:]
+    leading = len(suffix) - len(suffix.lstrip())
+    try:
+        value, consumed = _JSON_DECODER.raw_decode(suffix.lstrip())
+    except (ValueError, TypeError):
+        return None
+    return value, start + leading + consumed
 
 
 def _coerce_args(raw: Any) -> dict[str, Any]:
@@ -483,45 +518,79 @@ def _normalize_tool_call(name: str, arguments: Any, call_id: str | None = None) 
     }
 
 
-def parse_tool_tag_calls(text: str) -> list[dict[str, Any]]:
-    """Extract ``<tool>{"tool": ..., "args": {...}}</tool>`` calls from text.
+def _calls_from_payload(payload: Any) -> list[dict[str, Any]]:
+    """Normalize a fallback action payload, including OpenAI-wire variants."""
+    items: list[Any]
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict) and isinstance(payload.get("tool_calls"), list):
+        items = payload["tool_calls"]
+    else:
+        items = [payload]
 
-    Also accepts fenced `````json`` blocks and a bare JSON object of the same
-    shape, so strict-JSON-mode providers work without native tool support.
+    calls: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function")
+        if isinstance(function, dict):
+            name = function.get("name")
+            args = function.get("arguments", {})
+        else:
+            name = item.get("tool", item.get("name"))
+            args = item.get("args", item.get("arguments", {}))
+        normalized = _normalize_tool_call(str(name or ""), args, item.get("id"))
+        if normalized is not None:
+            calls.append(normalized)
+    return calls
+
+
+def _is_tool_payload(payload: Any) -> bool:
+    return bool(_calls_from_payload(payload))
+
+
+def parse_tool_tag_calls(text: str) -> list[dict[str, Any]]:
+    """Extract text-format tool calls from an assistant response.
+
+    Accepts the normal ``<tool>{...}</tool>`` fallback, legacy ``[ACTION]
+    {...}`` calls, fenced JSON, and a bare JSON action.  The latter two are
+    important for providers that ignore XML-like tags in strict JSON mode.
     Returns normalized OpenAI-style ``tool_calls`` entries (arguments as dict).
     """
-    if not text or "<tool" not in text.lower() and "{" not in text:
+    if not text or ("<tool" not in text.lower() and "[action]" not in text.lower()
+                    and "{" not in text and "[" not in text):
         return []
-    candidates: list[str] = []
-    if text:
-        candidates.extend(match.group(1) for match in _TOOL_TAG_RE.finditer(text))
-        if not candidates:
-            candidates.extend(match.group(1) for match in _FENCED_JSON_RE.finditer(text))
-        if not candidates:
-            stripped = text.strip()
-            if stripped.startswith("{") and stripped.endswith("}"):
-                candidates.append(stripped)
+
+    payloads: list[Any] = []
+    payloads.extend(
+        decoded[0] for match in _TOOL_TAG_RE.finditer(text)
+        if (decoded := _decode_json_prefix(match.group(1))) is not None
+    )
+    payloads.extend(
+        decoded[0] for match in _FENCED_JSON_RE.finditer(text)
+        if (decoded := _decode_json_prefix(match.group(1))) is not None
+    )
+    # ``[ACTION]`` is a legacy wire marker some models still emit.  It has no
+    # closing tag, so decode precisely one JSON value immediately after it.
+    for match in _ACTION_TAG_RE.finditer(text):
+        decoded = _decode_json_prefix(text, match.end())
+        if decoded is not None:
+            payloads.append(decoded[0])
+    if not payloads:
+        decoded = _decode_json_prefix(text)
+        if decoded is not None and not text[decoded[1]:].strip():
+            payloads.append(decoded[0])
+
     calls: list[dict[str, Any]] = []
-    for raw in candidates:
-        try:
-            payload = json.loads(raw.strip())
-        except (ValueError, TypeError):
-            continue
-        # Accept {"tool":..., "args":{...}} plus OpenAI {"name":..., "arguments":...}.
-        if isinstance(payload, dict):
-            name = payload.get("tool", payload.get("name"))
-            args = payload.get("args", payload.get("arguments", {}))
-            normalized = _normalize_tool_call(str(name or ""), args, payload.get("id"))
-            if normalized is not None:
-                calls.append(normalized)
-        elif isinstance(payload, list):
-            for item in payload:
-                if isinstance(item, dict):
-                    normalized = _normalize_tool_call(
-                        str(item.get("tool", item.get("name", ""))),
-                        item.get("args", item.get("arguments", {})), item.get("id"))
-                    if normalized is not None:
-                        calls.append(normalized)
+    seen: set[tuple[str, str]] = set()
+    for payload in payloads:
+        for call in _calls_from_payload(payload):
+            function = call["function"]
+            key = (str(function["name"]), json.dumps(function["arguments"], sort_keys=True,
+                                                       ensure_ascii=False, default=str))
+            if key not in seen:
+                seen.add(key)
+                calls.append(call)
     return calls
 
 
@@ -555,15 +624,193 @@ def extract_tool_calls(message: dict[str, Any] | None) -> list[dict[str, Any]]:
 
 
 def strip_tool_tags(text: str | None) -> str:
-    """Remove ``<tool>`` blocks so only TTS-ready speech remains."""
+    """Remove every recognized text-format action so only speech remains.
+
+    This is intentionally used both for final answers and streamed thought
+    frames.  Never return fallback action syntax to the Android client.
+    """
     if not text:
         return ""
-    cleaned = _TOOL_TAG_RE.sub("", text)
+    spans: list[tuple[int, int]] = [(match.start(), match.end()) for match in _TOOL_TAG_RE.finditer(text)]
+    # A malformed/unclosed <tool> block is still action syntax and must never
+    # become user-visible.  Drop it conservatively through the message end.
+    for match in _OPEN_TOOL_TAG_RE.finditer(text):
+        if not any(start <= match.start() < end for start, end in spans):
+            spans.append((match.start(), len(text)))
+    for match in _ACTION_TAG_RE.finditer(text):
+        decoded = _decode_json_prefix(text, match.end())
+        # An [ACTION] marker denotes private agent wire data even if the model
+        # malformed its JSON.  In that case suppress its remainder as well.
+        spans.append((match.start(), decoded[1] if decoded is not None else len(text)))
+    decoded = _decode_json_prefix(text)
+    if decoded is not None and not text[decoded[1]:].strip() and _is_tool_payload(decoded[0]):
+        spans.append((0, len(text)))
+    if not spans:
+        return " ".join(text.split()).strip()
+    spans.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    cursor = 0
+    kept: list[str] = []
+    for start, end in merged:
+        kept.append(text[cursor:start])
+        cursor = end
+    kept.append(text[cursor:])
+    cleaned = "".join(kept)
     return " ".join(cleaned.split()).strip()
 
 
 def has_action_tag(text: str | None) -> bool:
-    return bool(text) and bool(_TOOL_TAG_RE.search(text or ""))
+    return bool(text) and bool(_TOOL_TAG_RE.search(text or "") or _ACTION_TAG_RE.search(text or ""))
+
+
+def _looks_like_tool_json_prefix(text: str) -> bool:
+    """Whether an unfinished JSON value is plausibly a fallback action."""
+    return bool(re.match(r'\s*(?:\[\s*)?\{\s*["\']?(?:tool|name|tool_calls|function)\b',
+                         text, re.IGNORECASE))
+
+
+class _StreamActionFilter:
+    """Incrementally withhold fallback action syntax from ``on_delta``.
+
+    JSON and tags can be split at arbitrary byte boundaries.  We only release
+    text once it cannot be the beginning of a tool call, then discard complete
+    actions.  This avoids the common leak where ``[ACT`` or ``{\"tool\"`` has
+    already reached a UI bubble before the next chunk identifies it as a call.
+    """
+
+    _TEXT_MARKERS = ("<tool", "[action]", "```")
+
+    def __init__(self) -> None:
+        self._pending = ""
+
+    @staticmethod
+    def _partial_marker_suffix(text: str) -> int:
+        lowered = text.lower()
+        return max((size for marker in _StreamActionFilter._TEXT_MARKERS
+                    for size in range(1, min(len(marker), len(text)) + 1)
+                    if lowered.endswith(marker[:size])), default=0)
+
+    def feed(self, piece: str) -> str:
+        self._pending += piece
+        return self._drain(final=False)
+
+    def finish(self) -> str:
+        return self._drain(final=True)
+
+    def _drain(self, *, final: bool) -> str:
+        visible: list[str] = []
+        while self._pending:
+            lowered = self._pending.lower()
+            candidates = [index for marker in self._TEXT_MARKERS + ("{", "[")
+                          if (index := lowered.find(marker)) >= 0]
+            if not candidates:
+                keep = 0 if final else self._partial_marker_suffix(self._pending)
+                cut = len(self._pending) - keep
+                visible.append(self._pending[:cut])
+                self._pending = self._pending[cut:]
+                break
+            start = min(candidates)
+            if start:
+                visible.append(self._pending[:start])
+                self._pending = self._pending[start:]
+                continue
+
+            if lowered.startswith("<tool"):
+                close = re.search(r"</tool\s*>", self._pending, re.IGNORECASE)
+                if close is None:
+                    if final:
+                        self._pending = ""
+                    break
+                self._pending = self._pending[close.end():]
+                continue
+
+            if lowered.startswith("[action]"):
+                decoded = _decode_json_prefix(self._pending, len("[ACTION]"))
+                if decoded is None:
+                    if final:
+                        self._pending = ""
+                    break
+                # [ACTION] is always private protocol data, regardless of a
+                # malformed/non-tool JSON payload.
+                self._pending = self._pending[decoded[1]:]
+                continue
+
+            if self._pending.startswith("```"):
+                close = self._pending.find("```", 3)
+                if close < 0:
+                    if final:
+                        # Fenced tool JSON without its fence closure is still
+                        # private if it starts as an action.
+                        body = re.sub(r"^```(?:json)?\s*", "", self._pending,
+                                      flags=re.IGNORECASE)
+                        if _looks_like_tool_json_prefix(body):
+                            self._pending = ""
+                        else:
+                            visible.append(self._pending)
+                            self._pending = ""
+                    break
+                fenced = self._pending[:close + 3]
+                body = re.sub(r"^```(?:json)?\s*", "", fenced[:-3], flags=re.IGNORECASE)
+                decoded = _decode_json_prefix(body)
+                if decoded is not None and _is_tool_payload(decoded[0]):
+                    self._pending = self._pending[close + 3:]
+                    continue
+                visible.append(self._pending[:close + 3])
+                self._pending = self._pending[close + 3:]
+                continue
+
+            # A bare fallback JSON call.  Hold it until raw_decode can prove
+            # whether it is a tool call; ordinary JSON is released unchanged.
+            decoded = _decode_json_prefix(self._pending)
+            if decoded is None:
+                if final:
+                    if _looks_like_tool_json_prefix(self._pending):
+                        self._pending = ""
+                    else:
+                        visible.append(self._pending[0])
+                        self._pending = self._pending[1:]
+                        continue
+                break
+            payload, end = decoded
+            if _is_tool_payload(payload):
+                self._pending = self._pending[end:]
+                continue
+            visible.append(self._pending[0])
+            self._pending = self._pending[1:]
+        return "".join(visible)
+
+
+def _filter_stream_text(state: dict[str, Any], text: str) -> str:
+    """Return only the user-safe portion of one streamed content delta."""
+    action_filter = state.get("action_filter")
+    if not isinstance(action_filter, _StreamActionFilter):
+        action_filter = _StreamActionFilter()
+        state["action_filter"] = action_filter
+    return action_filter.feed(text) if text else ""
+
+
+def _finish_stream_text(state: dict[str, Any]) -> str:
+    action_filter = state.get("action_filter")
+    return action_filter.finish() if isinstance(action_filter, _StreamActionFilter) else ""
+
+
+def _filter_stream_reasoning(state: dict[str, Any], text: str) -> str:
+    """Apply the same protocol boundary to reasoning-provider deltas."""
+    action_filter = state.get("reasoning_action_filter")
+    if not isinstance(action_filter, _StreamActionFilter):
+        action_filter = _StreamActionFilter()
+        state["reasoning_action_filter"] = action_filter
+    return action_filter.feed(text) if text else ""
+
+
+def _finish_stream_reasoning(state: dict[str, Any]) -> str:
+    action_filter = state.get("reasoning_action_filter")
+    return action_filter.finish() if isinstance(action_filter, _StreamActionFilter) else ""
 
 
 def build_tool_instructions(tools: list[dict[str, Any]] | None) -> str:
