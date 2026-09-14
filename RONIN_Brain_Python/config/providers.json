@@ -3,6 +3,40 @@
     "enabled": true,
     "model": "gemini-1.5-flash",
     "endpoint": null,
+    "seen_key": true,
+    "metrics": {
+      "2026-09-10": {
+        "requests": 7,
+        "errors": 0,
+        "last_latency_ms": 6834,
+        "total_latency_ms": 132736
+      },
+      "2026-09-11": {
+        "requests": 1,
+        "errors": 0,
+        "last_latency_ms": 5740,
+        "total_latency_ms": 5740
+      },
+      "2026-09-14": {
+        "requests": 1,
+        "errors": 0,
+        "last_latency_ms": 198671,
+        "total_latency_ms": 198671
+      }
+    },
+    "seen_model": "gemini-3.6-flash"
+  },
+  "groq": {
+    "enabled": true,
+    "model": null,
+    "endpoint": null,
+    "seen_key": false,
+    "metrics": {}
+  },
+  "custom": {
+    "enabled": true,
+    "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "endpoint": null,
     "seen_key": false,
     "metrics": {}
   }
