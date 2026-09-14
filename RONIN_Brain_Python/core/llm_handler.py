@@ -988,7 +988,7 @@ def _complete_with(
             raise ProviderFailure("provider returned no choices")
         return data
     if name == "gemini":
-        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model or 'gemini-1.5-flash'}:generateContent?key={key}"
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model or 'gemini-3.8-flash'}:generateContent?key={key}"
         system_text, contents = _gemini_contents(messages)
         payload_g: dict[str, Any] = {"contents": contents}
         if system_text:

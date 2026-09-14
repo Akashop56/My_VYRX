@@ -43,6 +43,20 @@ class StabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result.command)
         self.assertIn("disabled", result.response)
 
+    async def test_offline_android_command_is_serialized_before_response_validation(self):
+        unavailable = planner.AskResponse(
+            response="AI unavailable", route="llm", error="llm_unavailable",
+        )
+        with patch.object(planner, "_run_llm", AsyncMock(return_value=unavailable)), \
+             patch.object(planner, "save_conversation", AsyncMock()):
+            result = await planner.plan_request(AskRequest(message="open YouTube"), context())
+
+        self.assertEqual(result.command.action, "open_app")
+        self.assertEqual(result.model_dump(mode="json")["command"], {
+            "action": "open_app", "text": "YouTube", "package_name": None,
+            "x": None, "y": None, "node_id": None, "direction": None,
+        })
+
     async def test_tool_result_provider_failure_is_contained(self):
         completion = {"choices": [{"message": {"tool_calls": [
             {"id": "1", "function": {"name": "web_search", "arguments": "{}"}}
@@ -65,6 +79,16 @@ class StabilityTests(unittest.IsolatedAsyncioTestCase):
     def test_disabled_tools_are_removed(self):
         tools = [{"type": "function", "function": {"name": "web_search"}}]
         self.assertEqual(planner._filter_tools(tools, {"web_search": False}), [])
+
+    def test_gemini_uses_the_modern_default_model(self):
+        from core import llm_handler as handler
+
+        provider = {"provider": "gemini", "api_key": "key", "model": None}
+        payload = {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}
+        with patch.object(handler, "_post", return_value=payload) as post:
+            handler._complete_with(provider, [{"role": "user", "content": "hello"}])
+
+        self.assertIn("/gemini-3.8-flash:generateContent", post.call_args.args[0])
 
 
 if __name__ == "__main__":

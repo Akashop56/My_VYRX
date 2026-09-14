@@ -360,11 +360,15 @@ async def _run_android_command(request: AskRequest, ctx: BrainContext) -> AskRes
             route="android_command",
         )
     command = command_for_request(request.message)
+    # Keep the offline response on the JSON/Pydantic boundary.  Depending on
+    # how the legacy tool module was loaded, its AndroidCommand instance may
+    # not be recognized as the exact schema class expected by AskResponse.
+    command_payload = command.model_dump(mode="json", exclude_none=True)
     ctx.state.set("executing", f"Executing: {command.action}...")
     ctx.log.log(f"Executing device command: {command.action}", "tool")
     # The offline/legacy path hands the command to the Body in the response, so
     # there is no observation to wait for — still surface the intent in the log.
-    _tool_call(0, command.action, command.model_dump(mode="json", exclude_none=True), device=True,
+    _tool_call(0, command.action, command_payload, device=True,
                label=f"Device command · {command.action}")
     _observation(0, command.action, True, "Queued on the Body for execution.", 0)
     await ctx.stats.bump("apps_opened")
@@ -372,7 +376,7 @@ async def _run_android_command(request: AskRequest, ctx: BrainContext) -> AskRes
     return AskResponse(
         response=f"Approved Android command prepared: {command.action}.",
         route="android_command",
-        command=command,
+        command=command_payload,
     )
 
 
