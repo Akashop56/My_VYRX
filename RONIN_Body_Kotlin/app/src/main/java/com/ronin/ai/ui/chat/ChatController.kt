@@ -117,6 +117,7 @@ class ChatController(
 ) {
     private val appContext = context.applicationContext
     private val connection = BrainConnectionManager(appContext)
+    private val voiceManager = VoiceManager(appContext)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     /** Stable agent session so Brain continuations resolve to this chat. */
@@ -170,6 +171,7 @@ class ChatController(
     fun dispose() {
         ticker?.cancel()
         ticker = null
+        voiceManager.shutdown()
         scope.cancel()
     }
 
@@ -478,8 +480,16 @@ class ChatController(
         if (r.response.isNotBlank()) {
             if (!typedIn) replaceAnswerTarget(r.response)
             lastSpeech = r.response
+            speakFinalResponse(r.response)
         }
         if (elapsedMs > 0) turnElapsedMs = elapsedMs
+    }
+
+    /** Speak only the completed AskResponse, never thought/tool stream frames. */
+    private fun speakFinalResponse(response: String) {
+        if (speechQueued || !settingsProvider().voiceEnabled) return
+        speechQueued = true
+        voiceManager.speak(response)
     }
 
     // ------------------------------------------------------------------
@@ -494,6 +504,8 @@ class ChatController(
     private var thoughtDelta: String = ""
     private var revealed = 0
     private var typingStarted = false
+    /** Guards against duplicate terminal SSE frames speaking the same answer twice. */
+    private var speechQueued = false
     private var userPinnedTerminal = false
     private var activeId: String? = null
     private var lineSeq = 0
@@ -521,6 +533,7 @@ class ChatController(
         thoughtDelta = ""
         revealed = 0
         typingStarted = false
+        speechQueued = false
         userPinnedTerminal = false
         turnStepCount = 0
         turnElapsedMs = 0
