@@ -5,25 +5,23 @@ on:
     branches:
       - main
       - master
-
   pull_request:
     branches:
       - main
       - master
-
   workflow_dispatch:
-
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
+    
+    # CHANGE 1: Release create karne ke liye permission
+    permissions:
+      contents: write
 
     steps:
-
       - name: Checkout repository
         uses: actions/checkout@v4
-
 
       - name: Setup JDK 17
         uses: actions/setup-java@v4
@@ -32,18 +30,15 @@ jobs:
           distribution: 'temurin'
           cache: gradle
 
-
       - name: Check Android project files
         working-directory: ./RONIN_Body_Kotlin
         run: |
           ls -la
           ls -la gradle/wrapper
 
-
       - name: Make Gradle wrapper executable
         working-directory: ./RONIN_Body_Kotlin
         run: chmod +x gradlew
-
 
       - name: Build Debug APK
         working-directory: ./RONIN_Body_Kotlin
@@ -53,9 +48,17 @@ jobs:
           --stacktrace \
           -Dorg.gradle.jvmargs="-Xmx3g -XX:+HeapDumpOnOutOfMemoryError"
 
-
-      - name: Upload APK
+      - name: Upload APK to Artifacts (Zipped)
         uses: actions/upload-artifact@v4
         with:
           name: VYRX-debug-apk
           path: RONIN_Body_Kotlin/app/build/outputs/apk/debug/*.apk
+
+      # CHANGE 2: Direct APK upload karne ke liye naya step
+      - name: Upload direct APK to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        with:
+          tag_name: latest-debug
+          name: Latest Debug Build
+          files: RONIN_Body_Kotlin/app/build/outputs/apk/debug/*.apk
