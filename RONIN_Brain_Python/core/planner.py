@@ -33,7 +33,6 @@ import asyncio
 import json
 import threading
 import time
-import traceback
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,12 +44,15 @@ from core.capabilities import (
     CapabilityDescriptor,
     CapabilityHealth,
     ExecutionOutcome,
+    ExecutionResult,
     SemanticCapabilityType,
     classify_exception,
+    outcome_for_failure,
 )
 from core.capability_bootstrap import bootstrap_registry as _bootstrap_registry_fn
 from core.capability_executor import execute_capability as _execute_capability_fn
 from core.execution_boundary import (
+    execute_boundary,
     execute_llm_boundary,
     execute_search_boundary,
     execute_tool_boundary,
@@ -96,6 +98,17 @@ from memory.db_manager import recent_history, save_conversation, search_facts, s
 from memory.memory_engine import MemoryEngine
 from tools.system_control import command_for_request
 from tools.web_search import search
+
+
+# Keep the original callables so the compatibility shim below can preserve
+# the planner's established test/injection seam while production execution
+# always goes through the specialized normalized boundaries.  The shim is
+# intentionally local to this module; it does not change boundary signatures
+# or pass registry state into them.
+_ORIGINAL_COMPLETE = complete
+_ORIGINAL_EXECUTE_TOOL = execute_tool
+_ORIGINAL_EXECUTE_LLM_BOUNDARY = execute_llm_boundary
+_ORIGINAL_EXECUTE_TOOL_BOUNDARY = execute_tool_boundary
 
 
 #: Maximum LLM round-trips per user request (device callbacks included).
@@ -297,7 +310,7 @@ _FAILURE_REASON: dict[CanonicalFailureClass, str] = {
     CanonicalFailureClass.AUTH_DENIED: "authentication failed",
     CanonicalFailureClass.POLICY_BLOCKED: "request blocked by policy",
     CanonicalFailureClass.VALIDATION_FAILED: "invalid request data",
-    CanonicalFailureClass.DETERMINISTIC_ERROR: "requested resource not found",
+    CanonicalFailureClass.DETERMINISTIC_ERROR: "requested file was not found or command not found",
     CanonicalFailureClass.UNSUPPORTED_OPERATION: "operation not supported",
     CanonicalFailureClass.UNKNOWN_FATAL: "unexpected error",
 }
@@ -319,14 +332,16 @@ def _tool_failure_observation(
     tool_name: str,
     failure_class: CanonicalFailureClass | None,
 ) -> str:
-    """Create a sanitized ReAct observation for a tool failure.
+    """Create a sanitized operational observation for a tool failure.
 
-    Format: ``"Tool {name} failed ({class}): {reason}"``
-    No raw exception details, stack traces, or internal paths are included.
+    The observation deliberately contains only the canonical class and a
+    stable, human-readable reason.  In particular, it never copies
+    ``ExecutionResult.data`` or ``diagnostics.raw_message`` because either may
+    contain an exception message, a filesystem path, or provider telemetry.
     """
-    label = _failure_class_label(failure_class)
+    label = failure_class.name if failure_class is not None else "UNKNOWN_FATAL"
     reason = _failure_class_reason(failure_class)
-    return f"Tool {tool_name} failed ({label}): {reason}"
+    return f"Tool {tool_name} failed. Failure class: {label}. Reason: {reason}."
 
 
 def _llm_failure_observation(
@@ -334,13 +349,10 @@ def _llm_failure_observation(
     *,
     context: str = "Reasoning",
 ) -> str:
-    """Create a sanitized ReAct observation for an LLM reasoning failure.
-
-    Format: ``"{context} failed ({class}): {reason}"``
-    """
-    label = _failure_class_label(failure_class)
+    """Create a sanitized observation for an LLM reasoning failure."""
+    label = failure_class.name if failure_class is not None else "UNKNOWN_FATAL"
     reason = _failure_class_reason(failure_class)
-    return f"{context} failed ({label}): {reason}"
+    return f"{context} failed. Failure class: {label}. Reason: {reason}."
 
 
 def _correction_for_failure_class(
@@ -366,6 +378,143 @@ def _correction_for_failure_class(
     if failure_class == CanonicalFailureClass.POLICY_BLOCKED:
         return "this action is not permitted; try an alternative approach"
     return "re-read the state and try a different approach"
+
+
+def _execute_llm_request(message: str, history: list, providers: list,
+                         **kwargs: Any) -> ExecutionResult:
+    """Run reasoning through the LLM boundary and return its normalized result.
+
+    The production path calls ``execute_llm_boundary`` directly.  The narrow
+    fallback exists only for the repository's long-standing ``planner.complete``
+    injection seam: older callers patch that symbol to provide a fake transport.
+    It still uses the generic normalizer and therefore preserves the same
+    ``ExecutionResult`` contract without changing the boundary API.
+    """
+    if execute_llm_boundary is not _ORIGINAL_EXECUTE_LLM_BOUNDARY:
+        return execute_llm_boundary(message, history, providers, **kwargs)
+    if complete is not _ORIGINAL_COMPLETE:
+        return execute_boundary(complete, message, history, providers, **kwargs)
+    return execute_llm_boundary(message, history, providers, **kwargs)
+
+
+def _execute_tool_request(tool_name: str, arguments: dict[str, Any]) -> ExecutionResult:
+    """Run a Brain tool through its normalized execution boundary.
+
+    As with :func:`_execute_llm_request`, the compatibility branch is only for
+    callers that replace the old planner-local ``execute_tool`` seam.  It is
+    normalized before it reaches the ReAct interpreter below.
+    """
+    if execute_tool_boundary is not _ORIGINAL_EXECUTE_TOOL_BOUNDARY:
+        result = execute_tool_boundary(tool_name, arguments)
+    elif execute_tool is not _ORIGINAL_EXECUTE_TOOL:
+        result = execute_boundary(execute_tool, tool_name, arguments)
+    else:
+        result = execute_tool_boundary(tool_name, arguments)
+    return _normalize_tool_result(result)
+
+
+def _normalize_tool_result(result: ExecutionResult) -> ExecutionResult:
+    """Defensively classify JSON error payloads from compatibility transports."""
+    if result.outcome != ExecutionOutcome.SUCCESS or not isinstance(result.data, str):
+        return result
+    try:
+        payload = json.loads(result.data)
+    except (json.JSONDecodeError, TypeError):
+        return result
+    if not isinstance(payload, dict) or "error" not in payload:
+        return result
+
+    failure_class, diagnostics = classify_exception(
+        RuntimeError(str(payload.get("error") or "tool execution failed")),
+        extra_details={"source": "tool_registry"},
+    )
+    return ExecutionResult(
+        outcome=outcome_for_failure(failure_class),
+        data=result.data,
+        partial_data=result.partial_data,
+        failure_class=failure_class,
+        diagnostics=diagnostics,
+        elapsed_ms=result.elapsed_ms,
+        sub_goal_id=result.sub_goal_id,
+        capability_id=result.capability_id,
+    )
+
+
+def _failure_class_for_result(result: ExecutionResult) -> CanonicalFailureClass | None:
+    """Recover a safe canonical class when a producer supplied outcome only."""
+    if result.failure_class is not None:
+        return result.failure_class
+    return {
+        ExecutionOutcome.RETRYABLE_FAILURE: CanonicalFailureClass.TRANSIENT,
+        ExecutionOutcome.BLOCKED: CanonicalFailureClass.POLICY_BLOCKED,
+        ExecutionOutcome.DENIED: CanonicalFailureClass.AUTH_DENIED,
+        ExecutionOutcome.UNSUPPORTED: CanonicalFailureClass.UNSUPPORTED_OPERATION,
+        ExecutionOutcome.FATAL_FAILURE: CanonicalFailureClass.UNKNOWN_FATAL,
+    }.get(result.outcome)
+
+
+def _tool_execution_observation(tool_name: str, result: ExecutionResult) -> tuple[str, bool]:
+    """Interpret one tool ``ExecutionResult`` for the ReAct context and UI."""
+    if result.outcome == ExecutionOutcome.SUCCESS:
+        return _result_text(result.data), True
+    if result.outcome == ExecutionOutcome.PARTIAL_SUCCESS:
+        partial = result.partial_data if result.partial_data is not None else result.data
+        return (
+            f"Tool {tool_name} partially succeeded. Verified result: {_result_text(partial)}",
+            True,
+        )
+    # All failure outcomes intentionally discard result.data and diagnostics.
+    return _tool_failure_observation(tool_name, _failure_class_for_result(result)), False
+
+
+def _result_text(value: Any) -> str:
+    """Render successful/partial data without exposing Python object reprs."""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return "(no usable result)"
+
+
+def _device_failure_observation(tool_name: str, *, timed_out: bool = False) -> str:
+    """Sanitize a Body callback failure before it reaches ReAct or the UI."""
+    if timed_out:
+        return (
+            f"Tool {tool_name} failed. Failure class: TRANSIENT. "
+            "Reason: Body callback TIMEOUT waiting for an observation."
+        )
+    return _tool_failure_observation(tool_name, CanonicalFailureClass.UNKNOWN_FATAL)
+
+
+def _llm_completion(result: ExecutionResult) -> dict | None:
+    """Extract usable completion data while preserving partial-success semantics."""
+    if result.outcome not in {ExecutionOutcome.SUCCESS, ExecutionOutcome.PARTIAL_SUCCESS}:
+        return None
+    data = (
+        result.partial_data if result.outcome == ExecutionOutcome.PARTIAL_SUCCESS
+        and result.partial_data is not None else result.data
+    )
+    return data if isinstance(data, dict) else None
+
+
+def _llm_failure_response(result: ExecutionResult, *, steps: int = 0) -> AskResponse:
+    """Return a bounded, sanitized response for a failed reasoning boundary."""
+    failure_class = _failure_class_for_result(result)
+    observation = _llm_failure_observation(failure_class)
+    _self_correction(
+        steps,
+        None,
+        observation,
+        "stop this reasoning step and use only an explicitly available fallback",
+        attempt=steps,
+    )
+    return AskResponse(
+        response=f"{observation} The reasoning service is temporarily unavailable.",
+        route="agent_final" if steps else "llm",
+        error="llm_unavailable",
+        steps=steps,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -522,12 +671,12 @@ def _invoke_complete(
     *args: Any,
     **kwargs: Any,
 ) -> Any:
-    """Call ``complete()`` wrapped in the capability execution boundary.
+    """Call ``complete()`` through the pre-existing capability health bridge.
 
-    On success: returns the raw completion dict.
-    On failure: the executor updates health, then ``LLMError`` is re-raised
-    so the caller's existing error-handling (offline fallback, etc.) works
-    unchanged.
+    This legacy helper is retained for callers that still import it.  Active
+    planner paths use :func:`_execute_llm_request` and interpret
+    ``ExecutionResult`` directly; the registry-aware helper remains separate
+    so boundary signatures stay registry-agnostic.
     """
     if reg is None:
         return complete(*args, **kwargs)
@@ -536,14 +685,10 @@ def _invoke_complete(
     if exec_result.outcome == ExecutionOutcome.SUCCESS:
         return exec_result.data
 
-    # Health was already updated by the executor.  Re-raise so the
-    # caller's catch block still fires.
-    raw_msg = (
-        exec_result.diagnostics.raw_message
-        if exec_result.diagnostics
-        else "provider execution failed"
-    )
-    raise LLMError(raw_msg)
+    # Health was already updated by the existing executor bridge.  Preserve
+    # the legacy exception contract for callers outside the active loop.
+    failure_class = _failure_class_for_result(exec_result)
+    raise LLMError(_llm_failure_observation(failure_class))
 
 
 def _record_provider_failures_from_llm_error(
@@ -675,17 +820,30 @@ async def _run_web_search(request: AskRequest, ctx: BrainContext) -> AskResponse
     started = time.monotonic()
     exec_result = await asyncio.to_thread(execute_search_boundary, query)
     latency_ms = exec_result.elapsed_ms or int((time.monotonic() - started) * 1000)
-    if exec_result.outcome != ExecutionOutcome.SUCCESS:
+    if exec_result.outcome not in {ExecutionOutcome.SUCCESS, ExecutionOutcome.PARTIAL_SUCCESS}:
         failure_label = _failure_class_label(exec_result.failure_class)
-        sanitized = _llm_failure_observation(exec_result.failure_class, context="Web search")
+        sanitized = _tool_failure_observation("search", exec_result.failure_class)
         await ctx.stats.record_tool_usage("web_search", query, False)
         ctx.log.log(f"Web search failed: {failure_label}", "error")
         _observation(0, "search", False, sanitized, latency_ms)
-        _self_correction(0, "search", sanitized,
-                         _correction_for_failure_class(exec_result.failure_class, "search"))
+        _self_correction(
+            0,
+            "search",
+            sanitized,
+            _correction_for_failure_class(_failure_class_for_result(exec_result), "search"),
+        )
         return AskResponse(response=sanitized, route="web_search", error=failure_label)
-    data = exec_result.data
+    data = (
+        exec_result.partial_data
+        if exec_result.outcome == ExecutionOutcome.PARTIAL_SUCCESS
+        and exec_result.partial_data is not None else exec_result.data
+    )
     latency_ms = int((time.monotonic() - started) * 1000)
+    if not isinstance(data, dict):
+        sanitized = "Web search failed. Failure class: VALIDATION_FAILED. Reason: invalid request data."
+        await ctx.stats.record_tool_usage("web_search", query, False)
+        _observation(0, "search", False, sanitized, latency_ms)
+        return AskResponse(response=sanitized, route="web_search", error="validation_failed")
     results = data.get("results") or []
     ctx.log.log(f"Parsing {len(results)} results...", "info")
     _observation(0, "search", len(results) > 0, f"{len(results)} results parsed", latency_ms)
@@ -728,14 +886,15 @@ async def _run_tool_creation(request: AskRequest, ctx: BrainContext) -> AskRespo
     started = time.monotonic()
     stream = _stream()
     exec_result = await asyncio.to_thread(
-        execute_llm_boundary, request.message, [], provider_payload,
+        _execute_llm_request, request.message, [], provider_payload,
         system_prompt=tool_creation_system_prompt,
         on_delta=stream.delta_forwarder(0) if stream is not None else None,
     )
     elapsed_ms = exec_result.elapsed_ms or int((time.monotonic() - started) * 1000)
     if stream is not None:
         stream.flush_delta(0)
-    if exec_result.outcome != ExecutionOutcome.SUCCESS:
+    completion = _llm_completion(exec_result)
+    if completion is None:
         failure_label = _failure_class_label(exec_result.failure_class)
         ctx.log.log(f"Code generation failed: {failure_label}", "error")
         return AskResponse(
@@ -743,7 +902,6 @@ async def _run_tool_creation(request: AskRequest, ctx: BrainContext) -> AskRespo
             route="tool_creation",
             error=failure_label,
         )
-    completion = exec_result.data
     _record_provider_latency(ctx, completion, elapsed_ms, provider_payload)
     generated_code = _response_text(_assistant_message(completion))
     cleaned_code = generated_code.replace("```python", "").replace("```", "").strip()
@@ -769,11 +927,12 @@ async def _run_tool_creation(request: AskRequest, ctx: BrainContext) -> AskRespo
 # ---------------------------------------------------------------------------
 
 async def _run_llm(request: AskRequest, ctx: BrainContext) -> AskResponse:
-    """Contain provider failures, including failures after a tool result.
+    """Contain normalized reasoning failures without leaking diagnostics.
 
-    Capability-aware variant: classifies per-provider failures, updates
-    health in the registry, and only returns the offline fallback when no
-    reasoning capabilities remain available.
+    Active reasoning calls return ``ExecutionResult`` objects from the LLM
+    boundary.  The ``LLMError`` handler remains only for legacy callers that
+    bypass that boundary; it preserves the existing response contract while
+    keeping raw provider messages out of ReAct and UI surfaces.
     """
     try:
         return await _run_llm_unchecked(request, ctx)
@@ -859,13 +1018,21 @@ async def _run_llm_unchecked(request: AskRequest, ctx: BrainContext) -> AskRespo
 
     started = time.monotonic()
     messages = _conversation_messages(request.message, history, system_prompt)
-    completion = await asyncio.to_thread(
-        _invoke_complete, reg, _REASONING_META_CAP_ID,
+    llm_result = await asyncio.to_thread(
+        _execute_llm_request,
         request.message, history, provider_payload,
         system_prompt=system_prompt, tools=available_tools, on_provider=_on_provider,
         on_delta=stream.delta_forwarder(0) if stream is not None else None,
     )
-    # Record per-provider success in the capability registry.
+    completion = _llm_completion(llm_result)
+    if completion is None:
+        # The normalized failure class is the only feedback allowed past the
+        # boundary.  In particular, diagnostics.raw_message never enters the
+        # ReAct context or the streamed thought terminal.
+        return _llm_failure_response(llm_result)
+    # Record per-provider success in the capability registry only for the
+    # pre-existing health bridge.  The execution boundary itself remains
+    # registry-agnostic.
     _record_provider_success(ctx, provider_calls)
     if stream is not None:
         stream.flush_delta(0, text=_stream_visible_thought(_assistant_message(completion)))
@@ -915,8 +1082,12 @@ async def _await_device_observation(
     result = str(payload.get("result") or "")
     success = bool(payload.get("success", True))
     tool = str(payload.get("tool") or tool_name)
-    status = "succeeded" if success else "FAILED"
-    return (f"[{tool} {status}]: {result.strip() or '(empty result)'}", success, tool, False)
+    if not success:
+        # Body callbacks have no normalized boundary object.  Preserve only a
+        # safe class-level observation; never feed the callback's raw error
+        # text (which may include device diagnostics) to the model.
+        return (_device_failure_observation(tool), False, tool, False)
+    return (f"[{tool} succeeded]: {result.strip() or '(empty result)'}", True, tool, False)
 
 
 
@@ -1016,8 +1187,7 @@ async def _react_loop(
                     session_id, tool_name)
                 device_ms = int((time.monotonic() - dispatch_started) * 1000)
                 if timed_out:
-                    observation_text = f"[{tool_name} TIMEOUT]: no result from the Body in " \
-                                       f"{int(TOOL_RESULT_TIMEOUT_SECONDS)} s"
+                    observation_text = _device_failure_observation(tool_name, timed_out=True)
                     log.log(f"Device tool {tool_name} timed out waiting for the Body", "error")
                     # Nobody is coming with an answer: drop the resume session so a
                     # late callback cannot run the loop a second time.
@@ -1053,29 +1223,43 @@ async def _react_loop(
             _tool_call(steps, tool_name, arguments, device=False, thought=thought,
                        label=f"Executing {tool_name} in the Brain")
             tool_started = time.monotonic()
-            try:
-                result_text = await asyncio.to_thread(execute_tool, tool_name, arguments)
-            except Exception as exc:  # never let one tool kill the loop; observe + self-correct
-                result_text = json.dumps({"error": f"Tool execution failed: {exc}"}, ensure_ascii=False)
-            tool_ms = int((time.monotonic() - tool_started) * 1000)
-            success = '"error"' not in result_text[:160]
+            exec_result = await asyncio.to_thread(
+                _execute_tool_request, tool_name, arguments,
+            )
+            tool_ms = exec_result.elapsed_ms or int((time.monotonic() - tool_started) * 1000)
+            result_text, tool_ok = _tool_execution_observation(tool_name, exec_result)
             catalog_id = _tool_catalog_id(tool_name)
-            await stats.record_tool_usage(catalog_id, _clip(json.dumps(arguments, ensure_ascii=False)[:80]), success)
+            await stats.record_tool_usage(
+                catalog_id,
+                _clip(json.dumps(arguments, ensure_ascii=False)[:80]),
+                tool_ok,
+            )
             if catalog_id == "web_search":
                 await stats.bump("web_searches")
             if catalog_id == "app_control":
                 await stats.bump("apps_opened")
-            if catalog_id in {"agent_memory", "note_creator"} and success:
+            if catalog_id in {"agent_memory", "note_creator"} and tool_ok:
                 await stats.bump("learned")
             brain_tools_called.append(tool_name)
-            _observation(steps, tool_name, success, result_text, tool_ms)
-            if success:
+            _observation(steps, tool_name, tool_ok, result_text, tool_ms)
+            if tool_ok:
                 log.log(f"Tool {tool_name} finished in {tool_ms} ms", "success")
             else:
-                # Self-correction fuel: the next Thought sees the error and adapts.
-                log.log(f"Tool {tool_name} failed in {tool_ms} ms — agent will self-correct", "warning")
-                _self_correction(steps, tool_name, _clip(result_text, 200),
-                                 _correction_for_failure(result_text, tool_name), attempt=steps)
+                # The next Thought sees a canonical, sanitized observation;
+                # raw boundary diagnostics never enter messages or the stream.
+                log.log(
+                    f"Tool {tool_name} failed ({exec_result.outcome.value}) in {tool_ms} ms — agent will self-correct",
+                    "warning",
+                )
+                _self_correction(
+                    steps,
+                    tool_name,
+                    result_text,
+                    _correction_for_failure_class(
+                        _failure_class_for_result(exec_result), tool_name,
+                    ),
+                    attempt=steps,
+                )
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.get("id", "") if isinstance(tool_call, dict) else "",
@@ -1090,10 +1274,19 @@ async def _react_loop(
         _thinking("Reasoning over tool results…", step=steps + 1,
                   phase="reason" if not resume_after_dispatch else "verify")
         next_delta = stream.delta_forwarder(steps + 1) if stream is not None else None
-        completion = await asyncio.to_thread(
-            complete, "", [], provider_payload, tools=available_tools, messages=messages,
+        llm_result = await asyncio.to_thread(
+            _execute_llm_request,
+            "", [], provider_payload,
+            tools=available_tools,
+            messages=messages,
+            on_provider=on_provider,
             on_delta=next_delta,
         )
+        completion = _llm_completion(llm_result)
+        if completion is None:
+            # A failed re-plan ends this bounded run cleanly.  It does not
+            # consume another retry, enter offline mode, or expose diagnostics.
+            return _llm_failure_response(llm_result, steps=steps + 1)
         if stream is not None:
             stream.flush_delta(steps + 1, text=_stream_visible_thought(_assistant_message(completion)))
         assistant_message = _assistant_message(completion)
@@ -1166,8 +1359,10 @@ async def continue_with_tool_result(request: ToolResultRequest, ctx: BrainContex
     pending_id = str(session.get("pending_id", "") or request.tool_call_id or "")
     input_mode = str(session.get("input_mode", "text") or "text")
 
-    status = "succeeded" if request.success else "FAILED"
-    observation = f"[{request.tool} {status}]: {(request.result or '').strip() or '(empty result)'}"
+    observation = (
+        f"[{request.tool} succeeded]: {(request.result or '').strip() or '(empty result)'}"
+        if request.success else _device_failure_observation(request.tool)
+    )
     messages.append({
         "role": "tool",
         "tool_call_id": pending_id,
@@ -1188,19 +1383,18 @@ async def continue_with_tool_result(request: ToolResultRequest, ctx: BrainContex
 
     state.set("thinking", "Reasoning over device result...")
     await _rate_limit_pause()  # GROQ RATE LIMIT BYPASS
-    try:
-        completion = await asyncio.to_thread(
-            complete, "", [], provider_payload, tools=available_tools,
-            messages=messages,
-        )
-    except LLMError:
-        log.log("All configured AI providers failed", "error")
+    llm_result = await asyncio.to_thread(
+        _execute_llm_request,
+        "", [], provider_payload,
+        tools=available_tools,
+        messages=messages,
+        on_provider=_on_provider,
+    )
+    completion = _llm_completion(llm_result)
+    if completion is None:
+        log.log("Reasoning failed after device observation", "error")
         state.set("idle", "AI unavailable. Please retry.")
-        return AskResponse(
-            response="The AI service dropped mid-action, Boss. Please try again.",
-            route="agent_final",
-            error="llm_unavailable",
-        )
+        return _llm_failure_response(llm_result, steps=steps + 1)
     assistant_message = _assistant_message(completion)
     result = await _react_loop(
         ctx, provider_payload=provider_payload, available_tools=available_tools,
@@ -1285,9 +1479,11 @@ async def plan_request(request: AskRequest, ctx: BrainContext,
         stream.bind_loop()
     try:
         return await _plan_request_inner(request, ctx, stream=stream)
-    except Exception as exc:  # a stream must always end with a terminal frame
+    except Exception:  # a stream must always end with a terminal frame
         if stream is not None:
-            stream.emit(EVENT_ERROR, code="brain_error", message=_clip(str(exc), 300),
+            # Unexpected failures are intentionally not copied into the stream;
+            # normalized boundary failures have already been interpreted above.
+            stream.emit(EVENT_ERROR, code="brain_error", message="Planner execution failed",
                         fatal=True, elapsed_ms=_elapsed(stream))
         raise
     finally:
@@ -1347,14 +1543,26 @@ async def _plan_request_inner(request: AskRequest, ctx: BrainContext, *,
                         result = await _run_web_search(request, ctx)
                     elif fallback.route == "local_tool":
                         result = await _run_local_tool(request, ctx)
-    except LLMError as exc:
-        log.log(f"AI engine error: {exc}", "error")
-        print(f"\n[🔥 RONIN CRITICAL ERROR]:\n{traceback.format_exc()}\n", flush=True)
-        result = AskResponse(response="RONIN could not complete that request.", route=decision.route, error=str(exc))
-    except Exception as exc:  # keep the endpoint alive no matter what
-        log.log(f"Unexpected error: {exc}", "error")
-        print(f"\n[🔥 RONIN CRITICAL ERROR]:\n{traceback.format_exc()}\n", flush=True)
-        result = AskResponse(response="RONIN could not complete that request.", route=decision.route, error=str(exc))
+    except LLMError:
+        # Boundary failures are handled as ExecutionResults; this is only an
+        # unexpected legacy escape hatch and must stay sanitized as well.
+        log.log("AI engine execution failed", "error")
+        print("\n[🔥 RONIN CRITICAL ERROR]: AI engine execution failed\n", flush=True)
+        result = AskResponse(
+            response="RONIN could not complete that request.",
+            route=decision.route,
+            error="llm_execution_failed",
+        )
+    except Exception:
+        # Keep the endpoint alive without copying raw exception text into the
+        # API response or streamed UI.
+        log.log("Unexpected planner execution failure", "error")
+        print("\n[🔥 RONIN CRITICAL ERROR]: planner execution failed\n", flush=True)
+        result = AskResponse(
+            response="RONIN could not complete that request.",
+            route=decision.route,
+            error="planner_execution_failed",
+        )
 
     # Pending device action: the Body will call back on /agent/result, which
     # finalizes the turn. Stay in executing state so the orb shows acting.
