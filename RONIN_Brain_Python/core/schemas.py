@@ -14,6 +14,24 @@ Route = Literal["android_command", "web_search", "local_tool", "llm", "tool_crea
 
 from tools.system_control import AndroidCommand as AndroidCommandSchema  # noqa: E402
 
+# ---------------------------------------------------------------------------
+# Re-export Capability-Oriented Architecture models
+# ---------------------------------------------------------------------------
+from core.capabilities import (  # noqa: E402, F401
+    CanonicalFailureClass,
+    CapabilityDescriptor,
+    CapabilityHealth,
+    DiagnosticContext,
+    ExecutionOutcome,
+    ExecutionResult,
+    HealthPolicy,
+    HealthTracker,
+    SemanticCapabilityType,
+    classify_exception,
+    classify_http_status,
+    outcome_for_failure,
+)
+
 
 class ProviderRequest(BaseModel):
     provider: Literal["openai", "gemini", "groq", "openrouter", "custom"]
