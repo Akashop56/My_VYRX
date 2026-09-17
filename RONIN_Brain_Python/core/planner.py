@@ -40,6 +40,21 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from core.action_log import ActionLog
+from core.capabilities import (
+    CanonicalFailureClass,
+    CapabilityDescriptor,
+    CapabilityHealth,
+    ExecutionOutcome,
+    SemanticCapabilityType,
+    classify_exception,
+)
+from core.capability_bootstrap import bootstrap_registry as _bootstrap_registry_fn
+from core.capability_executor import execute_capability as _execute_capability_fn
+from core.execution_boundary import (
+    execute_llm_boundary,
+    execute_search_boundary,
+    execute_tool_boundary,
+)
 from core.llm_handler import (
     SYSTEM_PROMPT,
     LLMError,
@@ -49,6 +64,7 @@ from core.llm_handler import (
     strip_tool_tags,
 )
 from core.provider_manager import ProviderManager
+from core.registry import CapabilityRegistry
 from core.router import legacy_route, route_request
 from core.schemas import AgentAction, AskRequest, AskResponse, ToolResultRequest, UpdateProposal
 from core.state_manager import StateManager
@@ -203,6 +219,7 @@ class BrainContext:
     provider_manager: ProviderManager
     memory_engine: MemoryEngine
     device_status: dict = field(default_factory=dict)
+    capability_registry: CapabilityRegistry = field(default_factory=CapabilityRegistry)
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +279,92 @@ def _correction_for_failure(result_text: str, tool_name: str) -> str:
         return "retry with a shorter timeout, then degrade gracefully"
     if "not found" in lowered or "no such" in lowered or "error" in lowered:
         return f"change strategy instead of repeating {tool_name} (re-inspect, different args, or another tool)"
+    return "re-read the state and try a different approach"
+
+
+# ---------------------------------------------------------------------------
+# Sanitized failure feedback helpers
+#
+# These convert ExecutionResult failures into clean, structured observations
+# for the ReAct loop.  Raw stack traces, sensitive diagnostics, and internal
+# telemetry are NEVER exposed to the LLM context or user-facing UI.
+# ---------------------------------------------------------------------------
+
+#: Canonical failure class → human-readable reason (safe for ReAct context).
+_FAILURE_REASON: dict[CanonicalFailureClass, str] = {
+    CanonicalFailureClass.TRANSIENT: "service temporarily unavailable",
+    CanonicalFailureClass.NETWORK_ISOLATED: "unable to reach the service",
+    CanonicalFailureClass.AUTH_DENIED: "authentication failed",
+    CanonicalFailureClass.POLICY_BLOCKED: "request blocked by policy",
+    CanonicalFailureClass.VALIDATION_FAILED: "invalid request data",
+    CanonicalFailureClass.DETERMINISTIC_ERROR: "requested resource not found",
+    CanonicalFailureClass.UNSUPPORTED_OPERATION: "operation not supported",
+    CanonicalFailureClass.UNKNOWN_FATAL: "unexpected error",
+}
+
+
+def _failure_class_reason(failure_class: CanonicalFailureClass | None) -> str:
+    """Map a failure class to a sanitized, human-readable reason string."""
+    if failure_class is None:
+        return "unknown error"
+    return _FAILURE_REASON.get(failure_class, "unknown error")
+
+
+def _failure_class_label(failure_class: CanonicalFailureClass | None) -> str:
+    """Canonical label for logging (e.g. 'transient', 'auth_denied')."""
+    return failure_class.value if failure_class is not None else "unknown"
+
+
+def _tool_failure_observation(
+    tool_name: str,
+    failure_class: CanonicalFailureClass | None,
+) -> str:
+    """Create a sanitized ReAct observation for a tool failure.
+
+    Format: ``"Tool {name} failed ({class}): {reason}"``
+    No raw exception details, stack traces, or internal paths are included.
+    """
+    label = _failure_class_label(failure_class)
+    reason = _failure_class_reason(failure_class)
+    return f"Tool {tool_name} failed ({label}): {reason}"
+
+
+def _llm_failure_observation(
+    failure_class: CanonicalFailureClass | None,
+    *,
+    context: str = "Reasoning",
+) -> str:
+    """Create a sanitized ReAct observation for an LLM reasoning failure.
+
+    Format: ``"{context} failed ({class}): {reason}"``
+    """
+    label = _failure_class_label(failure_class)
+    reason = _failure_class_reason(failure_class)
+    return f"{context} failed ({label}): {reason}"
+
+
+def _correction_for_failure_class(
+    failure_class: CanonicalFailureClass | None,
+    tool_name: str,
+) -> str:
+    """Map a canonical failure class to the agent's stated recovery strategy.
+
+    Replaces string-matching heuristics with deterministic class-based routing.
+    """
+    if failure_class == CanonicalFailureClass.TRANSIENT:
+        return "retry with a shorter timeout, then degrade gracefully"
+    if failure_class == CanonicalFailureClass.DETERMINISTIC_ERROR:
+        return f"change strategy instead of repeating {tool_name} (re-inspect, different args, or another tool)"
+    if failure_class == CanonicalFailureClass.UNSUPPORTED_OPERATION:
+        return f"try a different tool or approach instead of {tool_name}"
+    if failure_class == CanonicalFailureClass.AUTH_DENIED:
+        return "check credentials or try a different provider"
+    if failure_class == CanonicalFailureClass.NETWORK_ISOLATED:
+        return "check network connectivity or try an offline approach"
+    if failure_class == CanonicalFailureClass.VALIDATION_FAILED:
+        return f"check the arguments passed to {tool_name} and retry with valid input"
+    if failure_class == CanonicalFailureClass.POLICY_BLOCKED:
+        return "this action is not permitted; try an alternative approach"
     return "re-read the state and try a different approach"
 
 
@@ -348,6 +451,185 @@ def _tool_catalog_id(function_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Capability-aware LLM routing helpers
+#
+# These bridge the existing `complete()` transport with the new
+# CapabilityRegistry so that provider health is tracked across requests
+# and the orchestrator can route around degraded capabilities.
+# ---------------------------------------------------------------------------
+
+#: Meta-capability ID used to track the overall LLM reasoning call
+#: (as opposed to individual provider capabilities).
+_REASONING_META_CAP_ID = "reasoning-request"
+
+
+def _get_registry(ctx: BrainContext) -> CapabilityRegistry | None:
+    """Get the capability registry from context, or None if unavailable."""
+    return getattr(ctx, "capability_registry", None)
+
+
+def _bootstrap_providers(ctx: BrainContext, provider_payload: list[dict]) -> None:
+    """Bootstrap the registry with provider capabilities from this request."""
+    reg = _get_registry(ctx)
+    if reg is None:
+        return
+    _bootstrap_registry_fn(reg, providers_config=provider_payload)
+    # Register the meta-reasoning capability if not already present.
+    if not reg.contains(_REASONING_META_CAP_ID):
+        reg.register(CapabilityDescriptor(
+            id=_REASONING_META_CAP_ID,
+            capability_type=SemanticCapabilityType.REASONING,
+            description="Meta-capability for LLM reasoning request execution",
+            requires_internet=True,
+            requires_auth=True,
+            is_local=False,
+        ))
+
+
+def _sort_providers_by_health(
+    ctx: BrainContext, provider_payload: list[dict],
+) -> list[dict]:
+    """Sort providers by capability health: AVAILABLE/UNKNOWN first.
+
+    UNAVAILABLE providers are placed last but still included —
+    ``complete()`` handles internal failover, so they serve as a
+    last-resort fallback before the request fails entirely.
+    """
+    reg = _get_registry(ctx)
+    if reg is None:
+        return list(provider_payload)
+
+    _PRIORITY = {
+        CapabilityHealth.AVAILABLE: 0,
+        CapabilityHealth.UNKNOWN: 1,
+        CapabilityHealth.DEGRADED: 2,
+        CapabilityHealth.UNAVAILABLE: 3,
+    }
+
+    def _key(provider: dict) -> int:
+        name = str(provider.get("provider") or "").lower().strip()
+        desc = reg.get(f"provider-{name}")
+        if desc is None:
+            return 1  # Unknown provider — same priority as UNKNOWN
+        return _PRIORITY.get(desc.health, 1)
+
+    return sorted(provider_payload, key=_key)
+
+
+def _invoke_complete(
+    reg: CapabilityRegistry | None,
+    cap_id: str,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Call ``complete()`` wrapped in the capability execution boundary.
+
+    On success: returns the raw completion dict.
+    On failure: the executor updates health, then ``LLMError`` is re-raised
+    so the caller's existing error-handling (offline fallback, etc.) works
+    unchanged.
+    """
+    if reg is None:
+        return complete(*args, **kwargs)
+
+    exec_result = _execute_capability_fn(reg, cap_id, complete, *args, **kwargs)
+    if exec_result.outcome == ExecutionOutcome.SUCCESS:
+        return exec_result.data
+
+    # Health was already updated by the executor.  Re-raise so the
+    # caller's catch block still fires.
+    raw_msg = (
+        exec_result.diagnostics.raw_message
+        if exec_result.diagnostics
+        else "provider execution failed"
+    )
+    raise LLMError(raw_msg)
+
+
+def _record_provider_failures_from_llm_error(
+    ctx: BrainContext, exc: LLMError,
+) -> None:
+    """Parse ``LLMError`` and update per-provider health in the registry.
+
+    ``complete()`` formats its error as:
+    ``"All configured providers failed: name1: msg1; name2: msg2"``.
+    We parse this to classify each provider's failure independently so
+    that e.g. an AUTH_DENIED failure for one provider doesn't mark a
+    TRANSIENT timeout for another.
+    """
+    reg = _get_registry(ctx)
+    if reg is None:
+        return
+
+    msg = str(exc)
+    prefix = "All configured providers failed: "
+    parsed_any = False
+
+    if msg.startswith(prefix):
+        rest = msg[len(prefix):]
+        for part in rest.split("; "):
+            if ": " not in part:
+                continue
+            name, provider_msg = part.split(": ", 1)
+            name = name.strip().lower()
+            cap_id = f"provider-{name}"
+            if reg.contains(cap_id):
+                failure_class, _ = classify_exception(RuntimeError(provider_msg.strip()))
+                try:
+                    reg.update_health(cap_id, success=False, failure_class=failure_class)
+                except Exception:
+                    pass
+                parsed_any = True
+
+    if not parsed_any:
+        # Couldn't parse per-provider details — classify the overall error
+        # and apply it to all REASONING provider capabilities.
+        failure_class, _ = classify_exception(exc)
+        for desc in reg.query_by_semantic_type(SemanticCapabilityType.REASONING):
+            if desc.id.startswith("provider-"):
+                try:
+                    reg.update_health(desc.id, success=False, failure_class=failure_class)
+                except Exception:
+                    pass
+
+
+def _record_provider_success(
+    ctx: BrainContext, provider_calls: dict[str, bool],
+) -> None:
+    """Record success for providers that responded successfully."""
+    reg = _get_registry(ctx)
+    if reg is None:
+        return
+    for name, ok in provider_calls.items():
+        if ok:
+            cap_id = f"provider-{name}"
+            if reg.contains(cap_id):
+                try:
+                    reg.update_health(cap_id, success=True)
+                except Exception:
+                    pass
+
+
+def _count_healthy_reasoners(ctx: BrainContext) -> int:
+    """Count reasoning capabilities still potentially usable.
+
+    Returns ``-1`` when no registry is available (unknown).
+    """
+    reg = _get_registry(ctx)
+    if reg is None:
+        return -1
+    reasoners = reg.query_by_semantic_type(SemanticCapabilityType.REASONING)
+    return sum(
+        1 for d in reasoners
+        if d.health in (
+            CapabilityHealth.AVAILABLE,
+            CapabilityHealth.UNKNOWN,
+            CapabilityHealth.DEGRADED,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
 # Route executors (offline fallbacks + developer agent)
 # ---------------------------------------------------------------------------
 
@@ -391,14 +673,18 @@ async def _run_web_search(request: AskRequest, ctx: BrainContext) -> AskResponse
     ctx.log.log(f"Searching web for: \"{_clip(query, 48)}\"", "tool")
     _tool_call(0, "search", {"query": query}, device=False, label="Web Search")
     started = time.monotonic()
-    try:
-        data = await asyncio.to_thread(search, query)
-    except Exception as exc:
+    exec_result = await asyncio.to_thread(execute_search_boundary, query)
+    latency_ms = exec_result.elapsed_ms or int((time.monotonic() - started) * 1000)
+    if exec_result.outcome != ExecutionOutcome.SUCCESS:
+        failure_label = _failure_class_label(exec_result.failure_class)
+        sanitized = _llm_failure_observation(exec_result.failure_class, context="Web search")
         await ctx.stats.record_tool_usage("web_search", query, False)
-        ctx.log.log(f"Web search failed: {exc}", "error")
-        _observation(0, "search", False, str(exc), int((time.monotonic() - started) * 1000))
-        _self_correction(0, "search", str(exc), "answer from memory/reasoning instead of search")
-        return AskResponse(response=f"Web search failed: {exc}", route="web_search", error=str(exc))
+        ctx.log.log(f"Web search failed: {failure_label}", "error")
+        _observation(0, "search", False, sanitized, latency_ms)
+        _self_correction(0, "search", sanitized,
+                         _correction_for_failure_class(exec_result.failure_class, "search"))
+        return AskResponse(response=sanitized, route="web_search", error=failure_label)
+    data = exec_result.data
     latency_ms = int((time.monotonic() - started) * 1000)
     results = data.get("results") or []
     ctx.log.log(f"Parsing {len(results)} results...", "info")
@@ -441,14 +727,23 @@ async def _run_tool_creation(request: AskRequest, ctx: BrainContext) -> AskRespo
     provider_payload = [provider.model_dump() for provider in request.providers]
     started = time.monotonic()
     stream = _stream()
-    completion = await asyncio.to_thread(
-        complete, request.message, [], provider_payload,
+    exec_result = await asyncio.to_thread(
+        execute_llm_boundary, request.message, [], provider_payload,
         system_prompt=tool_creation_system_prompt,
         on_delta=stream.delta_forwarder(0) if stream is not None else None,
     )
-    elapsed_ms = int((time.monotonic() - started) * 1000)
+    elapsed_ms = exec_result.elapsed_ms or int((time.monotonic() - started) * 1000)
     if stream is not None:
         stream.flush_delta(0)
+    if exec_result.outcome != ExecutionOutcome.SUCCESS:
+        failure_label = _failure_class_label(exec_result.failure_class)
+        ctx.log.log(f"Code generation failed: {failure_label}", "error")
+        return AskResponse(
+            response=f"Code generation failed ({_failure_class_reason(exec_result.failure_class)}). Please try again.",
+            route="tool_creation",
+            error=failure_label,
+        )
+    completion = exec_result.data
     _record_provider_latency(ctx, completion, elapsed_ms, provider_payload)
     generated_code = _response_text(_assistant_message(completion))
     cleaned_code = generated_code.replace("```python", "").replace("```", "").strip()
@@ -474,11 +769,22 @@ async def _run_tool_creation(request: AskRequest, ctx: BrainContext) -> AskRespo
 # ---------------------------------------------------------------------------
 
 async def _run_llm(request: AskRequest, ctx: BrainContext) -> AskResponse:
-    """Contain provider failures, including failures after a tool result."""
+    """Contain provider failures, including failures after a tool result.
+
+    Capability-aware variant: classifies per-provider failures, updates
+    health in the registry, and only returns the offline fallback when no
+    reasoning capabilities remain available.
+    """
     try:
         return await _run_llm_unchecked(request, ctx)
-    except LLMError:
-        ctx.log.log("All configured AI providers failed", "error")
+    except LLMError as exc:
+        # Classify per-provider failures and update capability health.
+        _record_provider_failures_from_llm_error(ctx, exc)
+        remaining = _count_healthy_reasoners(ctx)
+        remaining_ctx = (
+            f" ({remaining} reasoning capability/ies still healthy)" if remaining >= 0 else ""
+        )
+        ctx.log.log(f"All configured AI providers failed{remaining_ctx}", "error")
         ctx.state.set("idle", "AI unavailable. Please retry.")
         _self_correction(0, None, "all configured AI providers failed",
                           "offline legacy route (keyword commands without a key)")
@@ -506,6 +812,12 @@ async def _run_llm_unchecked(request: AskRequest, ctx: BrainContext) -> AskRespo
                         text=f"{injected} standing order(s) recalled from long-term memory")
     system_prompt += memory_block
     provider_payload = [provider.model_dump() for provider in request.providers]
+
+    # --- Capability-aware provider setup ---
+    reg = _get_registry(ctx)
+    _bootstrap_providers(ctx, provider_payload)
+    provider_payload = _sort_providers_by_health(ctx, provider_payload)
+
     settings = _runtime_settings(Path(__file__).resolve().parent.parent / "config" / "settings.json")
 
     if _tool_execution_enabled(settings):
@@ -548,10 +860,13 @@ async def _run_llm_unchecked(request: AskRequest, ctx: BrainContext) -> AskRespo
     started = time.monotonic()
     messages = _conversation_messages(request.message, history, system_prompt)
     completion = await asyncio.to_thread(
-        complete, request.message, history, provider_payload,
+        _invoke_complete, reg, _REASONING_META_CAP_ID,
+        request.message, history, provider_payload,
         system_prompt=system_prompt, tools=available_tools, on_provider=_on_provider,
         on_delta=stream.delta_forwarder(0) if stream is not None else None,
     )
+    # Record per-provider success in the capability registry.
+    _record_provider_success(ctx, provider_calls)
     if stream is not None:
         stream.flush_delta(0, text=_stream_visible_thought(_assistant_message(completion)))
     assistant_message = _assistant_message(completion)
