@@ -2,7 +2,8 @@
 
 Every user request flows through:
 
-    1. Planner   : receive request, inject persistent memory into the prompt
+    1. Planner   : identify semantic capability requirements, query the active
+                   Registry, and inject the current capability plan
     2. Agent loop: LLM emits native function calls or ``<tool>`` JSON tags
     3. Executor  : Brain tools run inline (memory / web / shell); device tools
                    (open app / read screen / click / …) are dispatched to the
@@ -121,6 +122,480 @@ MAX_OBSERVATION_CHARS = 6000
 #: module constant so tests and local runs can retune it without patching
 #: ``asyncio.sleep`` globally.
 RATE_LIMIT_PAUSE_SECONDS: float = 2.0
+
+
+# ---------------------------------------------------------------------------
+# Capability-aware task planning
+# ---------------------------------------------------------------------------
+#
+# This is intentionally a capability plan, not a second execution graph.
+# ``AgentAction`` and the existing ReAct message/tool protocol remain the
+# execution representation.  These small records only describe which semantic
+# capabilities a task/sub-goal needs and which registered implementations are
+# currently eligible to satisfy it.
+
+
+@dataclass(frozen=True)
+class CapabilityRequirement:
+    """One semantic capability requirement for one planner sub-goal."""
+
+    sub_goal_id: str
+    description: str
+    capability_type: SemanticCapabilityType
+    requires_internet: bool | None = None
+    requires_local: bool | None = None
+    required_permissions: tuple[str, ...] = ()
+
+
+@dataclass
+class CapabilitySubGoal:
+    """Capability requirement plus its currently eligible implementations."""
+
+    requirement: CapabilityRequirement
+    candidates: tuple[CapabilityDescriptor, ...] = ()
+    selected_capability_id: str | None = None
+
+    @property
+    def candidate_ids(self) -> tuple[str, ...]:
+        return tuple(candidate.id for candidate in self.candidates)
+
+    @property
+    def available(self) -> bool:
+        return bool(self.candidates)
+
+
+@dataclass
+class CapabilityPlan:
+    """A task-level semantic plan; actions still belong to the ReAct loop."""
+
+    task: str
+    sub_goals: list[CapabilitySubGoal] = field(default_factory=list)
+    outcomes: dict[str, ExecutionOutcome] = field(default_factory=dict)
+
+    def sub_goal(self, sub_goal_id: str) -> CapabilitySubGoal | None:
+        return next((item for item in self.sub_goals if item.requirement.sub_goal_id == sub_goal_id), None)
+
+    def requirement_for_type(self, capability_type: SemanticCapabilityType) -> CapabilityRequirement | None:
+        for item in self.sub_goals:
+            if item.requirement.capability_type == capability_type:
+                return item.requirement
+        return None
+
+    @property
+    def outcome(self) -> ExecutionOutcome | None:
+        """Summarize completed sub-goals without hiding partial success."""
+        if not self.outcomes:
+            return None
+        values = list(self.outcomes.values())
+        successful = any(value in {ExecutionOutcome.SUCCESS, ExecutionOutcome.PARTIAL_SUCCESS}
+                         for value in values)
+        failed = any(value not in {ExecutionOutcome.SUCCESS, ExecutionOutcome.PARTIAL_SUCCESS}
+                     for value in values)
+        if failed and successful:
+            return ExecutionOutcome.PARTIAL_SUCCESS
+        if failed:
+            return values[0]
+        if any(value == ExecutionOutcome.PARTIAL_SUCCESS for value in values):
+            return ExecutionOutcome.PARTIAL_SUCCESS
+        return ExecutionOutcome.SUCCESS
+
+    def record_outcome(self, sub_goal_id: str, result: ExecutionResult) -> None:
+        """Record one sub-goal result; unrelated sub-goals remain untouched."""
+        if self.sub_goal(sub_goal_id) is not None:
+            self.outcomes[sub_goal_id] = result.outcome
+
+
+# The planner consumes these states; it does not calculate or mutate health.
+_USABLE_CAPABILITY_HEALTH = frozenset({
+    CapabilityHealth.UNKNOWN,
+    CapabilityHealth.AVAILABLE,
+    CapabilityHealth.DEGRADED,
+})
+_CAPABILITY_HEALTH_ORDER = {
+    CapabilityHealth.AVAILABLE: 0,
+    CapabilityHealth.DEGRADED: 1,
+    CapabilityHealth.UNKNOWN: 2,
+}
+
+# Semantic mapping for the existing action/tool surface.  No provider or model
+# identities appear here.
+_TOOL_CAPABILITY_TYPES: dict[str, SemanticCapabilityType] = {
+    "search": SemanticCapabilityType.WEB_RETRIEVAL,
+    "web_search": SemanticCapabilityType.WEB_RETRIEVAL,
+    "save_memory": SemanticCapabilityType.MEMORY_PERSISTENCE,
+    "retrieve_memory": SemanticCapabilityType.MEMORY_PERSISTENCE,
+    "read_file": SemanticCapabilityType.FILE_SYSTEM_IO,
+    "write_file": SemanticCapabilityType.FILE_SYSTEM_IO,
+    "list_files": SemanticCapabilityType.FILE_SYSTEM_IO,
+    "run_termux_command": SemanticCapabilityType.SYSTEM_COMMAND,
+    "open_app": SemanticCapabilityType.DEVICE_INTERACTION,
+    "list_apps": SemanticCapabilityType.DEVICE_INTERACTION,
+    "read_screen": SemanticCapabilityType.DEVICE_INTERACTION,
+    "click": SemanticCapabilityType.DEVICE_INTERACTION,
+    "click_xy": SemanticCapabilityType.DEVICE_INTERACTION,
+    "click_node": SemanticCapabilityType.DEVICE_INTERACTION,
+    "set_text": SemanticCapabilityType.DEVICE_INTERACTION,
+    "scroll": SemanticCapabilityType.DEVICE_INTERACTION,
+    "press_back": SemanticCapabilityType.DEVICE_INTERACTION,
+    "press_home": SemanticCapabilityType.DEVICE_INTERACTION,
+    "get_notifications": SemanticCapabilityType.DEVICE_INTERACTION,
+}
+
+
+def _add_capability_requirement(
+    requirements: list[CapabilityRequirement],
+    *,
+    sub_goal_id: str,
+    description: str,
+    capability_type: SemanticCapabilityType,
+    requires_internet: bool | None = None,
+    requires_local: bool | None = None,
+    required_permissions: tuple[str, ...] = (),
+) -> None:
+    if any(item.capability_type == capability_type for item in requirements):
+        return
+    requirements.append(CapabilityRequirement(
+        sub_goal_id=sub_goal_id,
+        description=description,
+        capability_type=capability_type,
+        requires_internet=requires_internet,
+        requires_local=requires_local,
+        required_permissions=required_permissions,
+    ))
+
+
+def identify_required_capabilities(task: str) -> tuple[CapabilityRequirement, ...]:
+    """Infer semantic requirements without selecting a vendor or model.
+
+    This is deliberately conservative: it identifies requirements implied by
+    the request, while the Registry remains the source of truth for whether an
+    implementation exists and is usable.  It does not implement retrieval,
+    routing policy, or an offline fallback chain.
+    """
+    normalized = " ".join(str(task or "").casefold().split())
+    requirements: list[CapabilityRequirement] = []
+
+    # Every current ReAct task needs a reasoning step.  The meta-capability
+    # used for health bookkeeping is excluded later from implementation
+    # candidates, so this remains a semantic requirement rather than a vendor.
+    _add_capability_requirement(
+        requirements,
+        sub_goal_id="subgoal-reasoning",
+        description="Understand the request and orchestrate the next ReAct step.",
+        capability_type=SemanticCapabilityType.REASONING,
+    )
+
+    if any(token in normalized for token in (
+        "current", "latest", "today", "news", "web", "internet", "external",
+        "online", "search", "up-to-date", "up to date",
+    )):
+        _add_capability_requirement(
+            requirements,
+            sub_goal_id="subgoal-web-retrieval",
+            description="Retrieve current external information.",
+            capability_type=SemanticCapabilityType.WEB_RETRIEVAL,
+            requires_internet=True,
+        )
+
+    if any(token in normalized for token in (
+        "file", "files", "project", "codebase", "repository", "repo", "folder",
+        "directory", "path", "local", "workspace",
+    )):
+        _add_capability_requirement(
+            requirements,
+            sub_goal_id="subgoal-local-files",
+            description="Inspect or operate on local project/file data.",
+            capability_type=SemanticCapabilityType.FILE_SYSTEM_IO,
+            requires_local=True,
+        )
+
+    if "local knowledge" in normalized or "knowledge base" in normalized:
+        _add_capability_requirement(
+            requirements,
+            sub_goal_id="subgoal-local-knowledge",
+            description="Search locally available knowledge.",
+            capability_type=SemanticCapabilityType.LOCAL_KNOWLEDGE_SEARCH,
+            requires_local=True,
+        )
+
+    if any(token in normalized for token in ("compare", "comparison", "contrast", "synthesize")):
+        _add_capability_requirement(
+            requirements,
+            sub_goal_id="subgoal-synthesis",
+            description="Compare or synthesize the independently gathered results.",
+            capability_type=SemanticCapabilityType.SYNTHESIS,
+        )
+
+    if any(token in normalized for token in (
+        "open app", "launch", "click", "tap", "screen", "notification", "device",
+        "phone",
+    )):
+        _add_capability_requirement(
+            requirements,
+            sub_goal_id="subgoal-device",
+            description="Interact with the Android device.",
+            capability_type=SemanticCapabilityType.DEVICE_INTERACTION,
+        )
+
+    if any(token in normalized for token in (
+        "calculate", "compute", "formula", "sort", "transform", "arithmetic",
+    )):
+        _add_capability_requirement(
+            requirements,
+            sub_goal_id="subgoal-compute",
+            description="Perform deterministic computation.",
+            capability_type=SemanticCapabilityType.DETERMINISTIC_COMPUTE,
+        )
+
+    if any(token in normalized for token in (
+        "remember", "memory", "recall preference", "save this",
+    )):
+        _add_capability_requirement(
+            requirements,
+            sub_goal_id="subgoal-memory",
+            description="Persist or recall user-provided memory.",
+            capability_type=SemanticCapabilityType.MEMORY_PERSISTENCE,
+            requires_local=True,
+        )
+
+    return tuple(requirements)
+
+
+def _candidate_satisfies(
+    descriptor: CapabilityDescriptor,
+    requirement: CapabilityRequirement,
+) -> bool:
+    if descriptor.health not in _USABLE_CAPABILITY_HEALTH:
+        return False
+    if descriptor.id == _REASONING_META_CAP_ID:
+        return False
+    if requirement.requires_internet is not None \
+            and descriptor.requires_internet != requirement.requires_internet:
+        return False
+    if requirement.requires_local is not None \
+            and descriptor.is_local != requirement.requires_local:
+        return False
+    if requirement.required_permissions and not set(requirement.required_permissions).issubset(
+        set(descriptor.required_permissions)
+    ):
+        return False
+    return True
+
+
+def query_capability_candidates(
+    registry: CapabilityRegistry | None,
+    requirement: CapabilityRequirement,
+) -> tuple[CapabilityDescriptor, ...]:
+    """Query the Registry and return all currently usable implementations."""
+    if registry is None:
+        return ()
+    descriptors = registry.query_by_semantic_type(requirement.capability_type)
+    eligible = [
+        descriptor for descriptor in descriptors
+        if _candidate_satisfies(descriptor, requirement)
+    ]
+    # This is only a deterministic presentation preference.  It does not
+    # encode a primary/secondary/offline fallback chain or a health policy.
+    eligible.sort(key=lambda descriptor: (
+        _CAPABILITY_HEALTH_ORDER.get(descriptor.health, 99), descriptor.id,
+    ))
+    return tuple(eligible)
+
+
+def build_capability_plan(
+    task: str,
+    registry: CapabilityRegistry | None,
+) -> CapabilityPlan:
+    """Identify requirements and attach Registry-backed candidates."""
+    sub_goals: list[CapabilitySubGoal] = []
+    for requirement in identify_required_capabilities(task):
+        candidates = query_capability_candidates(registry, requirement)
+        sub_goals.append(CapabilitySubGoal(
+            requirement=requirement,
+            candidates=candidates,
+            selected_capability_id=candidates[0].id if candidates else None,
+        ))
+    return CapabilityPlan(task=task, sub_goals=sub_goals)
+
+
+def _capability_plan_prompt(
+    plan: CapabilityPlan,
+    *,
+    affected_sub_goal_id: str | None = None,
+) -> str:
+    """Describe semantic availability to the reasoning model, not internals."""
+    lines = ["", "[CAPABILITY PLAN — semantic requirements and current availability]"]
+    for sub_goal in plan.sub_goals:
+        requirement = sub_goal.requirement
+        state = "available" if sub_goal.available else "unavailable"
+        marker = " (reconsider this sub-goal)" if requirement.sub_goal_id == affected_sub_goal_id else ""
+        lines.append(
+            f"- {requirement.sub_goal_id}: {requirement.capability_type.value} — {state}{marker}"
+        )
+    if affected_sub_goal_id:
+        lines.append("Only reconsider the affected sub-goal; retain independent verified work.")
+    return "\n".join(lines)
+
+
+def _tool_semantic_type(tool_name: str) -> SemanticCapabilityType | None:
+    return _TOOL_CAPABILITY_TYPES.get(str(tool_name or "").strip())
+
+
+def _filter_provider_payload_by_capability_plan(
+    provider_payload: list[dict],
+    plan: CapabilityPlan | None,
+) -> list[dict]:
+    """Exclude registered reasoning implementations known to be unusable."""
+    if plan is None:
+        return provider_payload
+    reasoning = plan.sub_goal("subgoal-reasoning")
+    if reasoning is None:
+        return provider_payload
+    registered_provider_ids = {
+        f"provider-{str(provider.get('provider') or '').lower().strip()}"
+        for provider in provider_payload
+    }
+    usable_provider_ids = set(reasoning.candidate_ids) & registered_provider_ids
+    # If no provider was registered for this request, retain the existing
+    # empty payload so the normalized LLM failure/offline compatibility path
+    # remains responsible for the response.  If providers were registered,
+    # only currently usable Registry candidates may be attempted.
+    if not registered_provider_ids:
+        return provider_payload
+    return [
+        provider for provider in provider_payload
+        if f"provider-{str(provider.get('provider') or '').lower().strip()}"
+        in usable_provider_ids
+    ]
+
+
+def _filter_tools_by_capability_plan(
+    tools: list[dict],
+    plan: CapabilityPlan | None,
+) -> list[dict]:
+    """Remove tools whose required semantic capability has no candidate."""
+    if plan is None:
+        return tools
+    unavailable_types = {
+        sub_goal.requirement.capability_type
+        for sub_goal in plan.sub_goals
+        if not sub_goal.available
+        and sub_goal.requirement.capability_type != SemanticCapabilityType.REASONING
+    }
+    if not unavailable_types:
+        return tools
+    return [
+        tool for tool in tools
+        if _tool_semantic_type(tool.get("function", {}).get("name", ""))
+        not in unavailable_types
+    ]
+
+
+def _sub_goal_for_tool(plan: CapabilityPlan | None, tool_name: str) -> str | None:
+    if plan is None:
+        return None
+    capability_type = _tool_semantic_type(tool_name)
+    if capability_type is None:
+        return None
+    requirement = plan.requirement_for_type(capability_type)
+    return requirement.sub_goal_id if requirement else None
+
+
+def replan_affected_subgoal(
+    plan: CapabilityPlan | None,
+    registry: CapabilityRegistry | None,
+    result: ExecutionResult,
+    *,
+    tool_name: str | None = None,
+) -> tuple[CapabilityPlan | None, str | None]:
+    """Refresh only the failed sub-goal's candidates from current Registry state."""
+    if plan is None or registry is None:
+        return plan, None
+    sub_goal_id = result.sub_goal_id
+    if sub_goal_id is None and result.capability_id:
+        matching = next(
+            (
+                item for item in plan.sub_goals
+                if result.capability_id in item.candidate_ids
+            ),
+            None,
+        )
+        sub_goal_id = matching.requirement.sub_goal_id if matching else None
+    if sub_goal_id is None:
+        sub_goal_id = _sub_goal_for_tool(plan, tool_name or "")
+    if sub_goal_id is None:
+        return plan, None
+    current = plan.sub_goal(sub_goal_id)
+    if current is None:
+        return plan, None
+    candidates = query_capability_candidates(registry, current.requirement)
+    current.candidates = candidates
+    current.selected_capability_id = candidates[0].id if candidates else None
+    plan.record_outcome(sub_goal_id, result)
+    return plan, sub_goal_id
+
+
+def _record_capability_result(
+    plan: CapabilityPlan | None,
+    result: ExecutionResult,
+    *,
+    tool_name: str | None = None,
+) -> None:
+    if plan is None:
+        return
+    sub_goal_id = result.sub_goal_id
+    if sub_goal_id is None and result.capability_id:
+        matching = next(
+            (
+                item for item in plan.sub_goals
+                if result.capability_id in item.candidate_ids
+            ),
+            None,
+        )
+        sub_goal_id = matching.requirement.sub_goal_id if matching else None
+    if sub_goal_id is None:
+        sub_goal_id = _sub_goal_for_tool(plan, tool_name or "")
+    if sub_goal_id:
+        plan.record_outcome(sub_goal_id, result)
+
+
+def _bootstrap_active_tool_capabilities(
+    ctx: BrainContext,
+    available_tools: list[dict],
+) -> None:
+    """Register only currently armed tools without resetting existing health."""
+    registry = _get_registry(ctx)
+    if registry is None:
+        return
+    brain_names = [
+        str(tool.get("function", {}).get("name", ""))
+        for tool in available_tools
+        if not is_device_tool(tool.get("function", {}).get("name", ""))
+    ]
+    device_specs = [
+        {
+            "id": f"device-{tool.get('function', {}).get('name', '')}",
+            "name": tool.get("function", {}).get("name", "device tool"),
+            "category": "device",
+            "description": tool.get("function", {}).get("description", "Device interaction"),
+            "brain_kind": "server_device",
+        }
+        for tool in available_tools
+        if is_device_tool(tool.get("function", {}).get("name", ""))
+    ]
+    missing_brain = [
+        name for name in brain_names if name and not registry.contains(f"brain-{name}")
+    ]
+    missing_device = [
+        spec for spec in device_specs
+        if not registry.contains(f"tool-{spec['id']}")
+    ]
+    if missing_brain or missing_device:
+        _bootstrap_registry_fn(
+            registry,
+            tools_list=missing_device,
+            brain_tool_names=missing_brain,
+        )
 
 
 async def _rate_limit_pause() -> None:
@@ -618,12 +1093,18 @@ def _get_registry(ctx: BrainContext) -> CapabilityRegistry | None:
 
 
 def _bootstrap_providers(ctx: BrainContext, provider_payload: list[dict]) -> None:
-    """Bootstrap the registry with provider capabilities from this request."""
+    """Register request providers without resetting existing health state."""
     reg = _get_registry(ctx)
     if reg is None:
         return
-    _bootstrap_registry_fn(reg, providers_config=provider_payload)
-    # Register the meta-reasoning capability if not already present.
+    missing = [
+        provider for provider in provider_payload
+        if not reg.contains(f"provider-{str(provider.get('provider') or '').lower().strip()}")
+    ]
+    if missing:
+        _bootstrap_registry_fn(reg, providers_config=missing)
+    # Register the meta-reasoning capability if not already present.  It is a
+    # health bookkeeping capability, never a selectable implementation.
     if not reg.contains(_REASONING_META_CAP_ID):
         reg.register(CapabilityDescriptor(
             id=_REASONING_META_CAP_ID,
@@ -989,6 +1470,20 @@ async def _run_llm_unchecked(request: AskRequest, ctx: BrainContext) -> AskRespo
         available_tools = server_tools + device_tools
     else:
         available_tools = []
+
+    # Arm the Registry with the exact tools visible to this request, preserving
+    # health on capabilities that were already registered.  Then build a
+    # semantic plan before the prompt/tool surface is finalized.
+    _bootstrap_active_tool_capabilities(ctx, available_tools)
+    capability_plan = build_capability_plan(request.message, reg) if reg is not None else None
+    provider_payload = _filter_provider_payload_by_capability_plan(
+        provider_payload,
+        capability_plan,
+    )
+    available_tools = _filter_tools_by_capability_plan(available_tools, capability_plan)
+    if capability_plan is not None:
+        system_prompt += _capability_plan_prompt(capability_plan)
+
     if available_tools:
         log.log(f"{len(available_tools)} tools available for this request", "info")
         system_prompt += build_tool_instructions(available_tools)
@@ -1044,6 +1539,7 @@ async def _run_llm_unchecked(request: AskRequest, ctx: BrainContext) -> AskRespo
         steps=0, brain_tools_called=[], session_id=request.session_id,
         original_message=request.message, started=started,
         input_mode=str(request.input_mode or "text"),
+        capability_plan=capability_plan,
     )
 
 
@@ -1107,6 +1603,7 @@ async def _react_loop(
     original_message: str,
     started: float,
     input_mode: str = "text",
+    capability_plan: CapabilityPlan | None = None,
 ) -> AskResponse:
     """Thought -> Action -> Observation until final speech or device dispatch.
 
@@ -1166,6 +1663,7 @@ async def _react_loop(
                     "provider_calls": provider_calls,
                     "started": started,
                     "input_mode": input_mode,
+                    "capability_plan": capability_plan,
                 })
                 catalog_id = _tool_catalog_id(tool_name)
                 state.set("executing", f"Running {tool_label(catalog_id)} on device...")
@@ -1211,6 +1709,35 @@ async def _react_loop(
                     "name": observed_tool or tool_name,
                     "content": observation_text[:MAX_OBSERVATION_CHARS],
                 })
+                device_result = ExecutionResult(
+                    outcome=(ExecutionOutcome.SUCCESS if device_ok
+                             else ExecutionOutcome.RETRYABLE_FAILURE if timed_out
+                             else ExecutionOutcome.FATAL_FAILURE),
+                    capability_id=f"tool-device-{observed_tool or tool_name}",
+                    failure_class=(None if device_ok else
+                                   CanonicalFailureClass.TRANSIENT if timed_out
+                                   else CanonicalFailureClass.UNKNOWN_FATAL),
+                )
+                if device_ok:
+                    _record_capability_result(
+                        capability_plan, device_result,
+                        tool_name=observed_tool or tool_name,
+                    )
+                else:
+                    capability_plan, affected_sub_goal_id = replan_affected_subgoal(
+                        capability_plan,
+                        _get_registry(ctx),
+                        device_result,
+                        tool_name=observed_tool or tool_name,
+                    )
+                    if affected_sub_goal_id:
+                        messages.append({
+                            "role": "system",
+                            "content": _capability_plan_prompt(
+                                capability_plan,
+                                affected_sub_goal_id=affected_sub_goal_id,
+                            ),
+                        })
                 await stats.record_tool_usage(_tool_catalog_id(observed_tool or tool_name),
                                               _clip(observation_text, 80), device_ok)
                 # One dispatched action per step: reason over its observation now.
@@ -1266,6 +1793,27 @@ async def _react_loop(
                 "name": tool_name,
                 "content": result_text[:MAX_OBSERVATION_CHARS],
             })
+            if tool_ok:
+                _record_capability_result(
+                    capability_plan,
+                    exec_result,
+                    tool_name=tool_name,
+                )
+            else:
+                capability_plan, affected_sub_goal_id = replan_affected_subgoal(
+                    capability_plan,
+                    _get_registry(ctx),
+                    exec_result,
+                    tool_name=tool_name,
+                )
+                if affected_sub_goal_id:
+                    messages.append({
+                        "role": "system",
+                        "content": _capability_plan_prompt(
+                            capability_plan,
+                            affected_sub_goal_id=affected_sub_goal_id,
+                        ),
+                    })
             brain_done += 1
 
         # GROQ RATE LIMIT BYPASS: 2 second ka pause
@@ -1358,6 +1906,7 @@ async def continue_with_tool_result(request: ToolResultRequest, ctx: BrainContex
     started = float(session.get("started", time.monotonic()))
     pending_id = str(session.get("pending_id", "") or request.tool_call_id or "")
     input_mode = str(session.get("input_mode", "text") or "text")
+    capability_plan = session.get("capability_plan")
 
     observation = (
         f"[{request.tool} succeeded]: {(request.result or '').strip() or '(empty result)'}"
@@ -1369,6 +1918,28 @@ async def continue_with_tool_result(request: ToolResultRequest, ctx: BrainContex
         "name": request.tool,
         "content": observation[:MAX_OBSERVATION_CHARS],
     })
+    device_result = ExecutionResult(
+        outcome=(ExecutionOutcome.SUCCESS if request.success else ExecutionOutcome.FATAL_FAILURE),
+        capability_id=f"tool-device-{request.tool}",
+        failure_class=None if request.success else CanonicalFailureClass.UNKNOWN_FATAL,
+    )
+    if request.success:
+        _record_capability_result(capability_plan, device_result, tool_name=request.tool)
+    else:
+        capability_plan, affected_sub_goal_id = replan_affected_subgoal(
+            capability_plan,
+            _get_registry(ctx),
+            device_result,
+            tool_name=request.tool,
+        )
+        if affected_sub_goal_id:
+            messages.append({
+                "role": "system",
+                "content": _capability_plan_prompt(
+                    capability_plan,
+                    affected_sub_goal_id=affected_sub_goal_id,
+                ),
+            })
     catalog_id = _tool_catalog_id(request.tool)
     await stats.record_tool_usage(catalog_id, _clip(request.result or "", 80), request.success)
     if request.tool == "open_app" and request.success:
@@ -1403,6 +1974,7 @@ async def continue_with_tool_result(request: ToolResultRequest, ctx: BrainContex
         steps=steps + 1, brain_tools_called=brain_tools_called,
         session_id=request.session_id, original_message=original_message, started=started,
         input_mode=input_mode,
+        capability_plan=capability_plan,
     )
     if not result.needs_tool_result:
         _clear_agent_session(request.session_id)
