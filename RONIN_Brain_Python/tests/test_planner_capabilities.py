@@ -52,6 +52,8 @@ class CapabilityAwarePlannerTests(unittest.TestCase):
         registry = CapabilityRegistry()
         registry.register(descriptor("reasoning-a", SemanticCapabilityType.REASONING))
         registry.register(descriptor("reasoning-b", SemanticCapabilityType.REASONING))
+        registry.update_health("reasoning-a", success=True)
+        registry.update_health("reasoning-b", success=True)
         requirement = next(
             item for item in identify_required_capabilities("hello")
             if item.capability_type == SemanticCapabilityType.REASONING
@@ -67,6 +69,7 @@ class CapabilityAwarePlannerTests(unittest.TestCase):
         registry = CapabilityRegistry()
         registry.register(descriptor("reasoning-good", SemanticCapabilityType.REASONING))
         registry.register(descriptor("reasoning-bad", SemanticCapabilityType.REASONING))
+        registry.update_health("reasoning-good", success=True)
         registry.update_health(
             "reasoning-bad",
             success=False,
@@ -163,6 +166,8 @@ class CapabilityAwarePlannerTests(unittest.TestCase):
             requires_internet=True,
             is_local=False,
         ))
+        registry.update_health("web-search-a", success=True)
+        registry.update_health("web-search-b", success=True)
         plan = build_capability_plan("find current information", registry)
         failed = ExecutionResultForTest.fatal("web-search-a")
         registry.update_health(

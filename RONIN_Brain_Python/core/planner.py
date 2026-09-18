@@ -50,7 +50,6 @@ from core.capabilities import (
     classify_exception,
     outcome_for_failure,
 )
-from core.capability_bootstrap import bootstrap_registry as _bootstrap_registry_fn
 from core.capability_executor import execute_capability as _execute_capability_fn
 from core.execution_boundary import (
     execute_boundary,
@@ -149,10 +148,18 @@ class CapabilityRequirement:
 
 @dataclass
 class CapabilitySubGoal:
-    """Capability requirement plus its currently eligible implementations."""
+    """Capability requirement plus current selectable implementations.
+
+    ``candidates`` contains only implementations that the current planner
+    policy may select: AVAILABLE and DEGRADED.  UNKNOWN implementations are
+    retained separately so uncertainty is visible without being mislabeled as
+    healthy or selectable.
+    """
 
     requirement: CapabilityRequirement
     candidates: tuple[CapabilityDescriptor, ...] = ()
+    unknown_candidates: tuple[CapabilityDescriptor, ...] = ()
+    unavailable_candidates: tuple[CapabilityDescriptor, ...] = ()
     selected_capability_id: str | None = None
 
     @property
@@ -160,8 +167,28 @@ class CapabilitySubGoal:
         return tuple(candidate.id for candidate in self.candidates)
 
     @property
+    def unknown_candidate_ids(self) -> tuple[str, ...]:
+        return tuple(candidate.id for candidate in self.unknown_candidates)
+
+    @property
+    def unavailable_candidate_ids(self) -> tuple[str, ...]:
+        return tuple(candidate.id for candidate in self.unavailable_candidates)
+
+    @property
     def available(self) -> bool:
+        """Whether this sub-goal has a currently selectable implementation."""
         return bool(self.candidates)
+
+    @property
+    def health_state(self) -> CapabilityHealth:
+        """Summarize Registry health without collapsing UNKNOWN into healthy."""
+        if any(candidate.health == CapabilityHealth.AVAILABLE for candidate in self.candidates):
+            return CapabilityHealth.AVAILABLE
+        if self.candidates:
+            return CapabilityHealth.DEGRADED
+        if self.unknown_candidates:
+            return CapabilityHealth.UNKNOWN
+        return CapabilityHealth.UNAVAILABLE
 
 
 @dataclass
@@ -206,8 +233,10 @@ class CapabilityPlan:
 
 
 # The planner consumes these states; it does not calculate or mutate health.
+# UNKNOWN is deliberately not a selectable/dispatchable candidate.  The
+# separate ``unknown_candidates`` field preserves uncertainty for a future,
+# explicitly defined validation policy without implementing that policy here.
 _USABLE_CAPABILITY_HEALTH = frozenset({
-    CapabilityHealth.UNKNOWN,
     CapabilityHealth.AVAILABLE,
     CapabilityHealth.DEGRADED,
 })
@@ -361,12 +390,11 @@ def identify_required_capabilities(task: str) -> tuple[CapabilityRequirement, ..
     return tuple(requirements)
 
 
-def _candidate_satisfies(
+def _descriptor_matches_requirement(
     descriptor: CapabilityDescriptor,
     requirement: CapabilityRequirement,
 ) -> bool:
-    if descriptor.health not in _USABLE_CAPABILITY_HEALTH:
-        return False
+    """Apply semantic/dependency matching without inspecting health."""
     if descriptor.id == _REASONING_META_CAP_ID:
         return False
     if requirement.requires_internet is not None \
@@ -382,17 +410,44 @@ def _candidate_satisfies(
     return True
 
 
+def _candidate_satisfies(
+    descriptor: CapabilityDescriptor,
+    requirement: CapabilityRequirement,
+    *,
+    include_unknown: bool = False,
+) -> bool:
+    allowed_health = _USABLE_CAPABILITY_HEALTH
+    if include_unknown:
+        allowed_health = allowed_health | {CapabilityHealth.UNKNOWN}
+    if descriptor.health not in allowed_health:
+        return False
+    return _descriptor_matches_requirement(descriptor, requirement)
+
+
 def query_capability_candidates(
     registry: CapabilityRegistry | None,
     requirement: CapabilityRequirement,
+    *,
+    include_unknown: bool = False,
 ) -> tuple[CapabilityDescriptor, ...]:
-    """Query the Registry and return all currently usable implementations."""
+    """Query Registry-backed implementations for planner selection.
+
+    By default only AVAILABLE and DEGRADED implementations are selectable.
+    ``include_unknown`` is an explicit inspection hook for a future validation
+    or probing policy; no planner path enables it for dispatch selection.
+    UNAVAILABLE implementations are always excluded.
+    """
     if registry is None:
         return ()
     descriptors = registry.query_by_semantic_type(requirement.capability_type)
     eligible = [
-        descriptor for descriptor in descriptors
-        if _candidate_satisfies(descriptor, requirement)
+        descriptor
+        for descriptor in descriptors
+        if _candidate_satisfies(
+            descriptor,
+            requirement,
+            include_unknown=include_unknown,
+        )
     ]
     # This is only a deterministic presentation preference.  It does not
     # encode a primary/secondary/offline fallback chain or a health policy.
@@ -410,9 +465,24 @@ def build_capability_plan(
     sub_goals: list[CapabilitySubGoal] = []
     for requirement in identify_required_capabilities(task):
         candidates = query_capability_candidates(registry, requirement)
+        matching = [] if registry is None else [
+            descriptor
+            for descriptor in registry.query_by_semantic_type(requirement.capability_type)
+            if _descriptor_matches_requirement(descriptor, requirement)
+        ]
+        unknown = tuple(
+            descriptor for descriptor in matching
+            if descriptor.health == CapabilityHealth.UNKNOWN
+        )
+        unavailable = tuple(
+            descriptor for descriptor in matching
+            if descriptor.health == CapabilityHealth.UNAVAILABLE
+        )
         sub_goals.append(CapabilitySubGoal(
             requirement=requirement,
             candidates=candidates,
+            unknown_candidates=unknown,
+            unavailable_candidates=unavailable,
             selected_capability_id=candidates[0].id if candidates else None,
         ))
     return CapabilityPlan(task=task, sub_goals=sub_goals)
@@ -427,7 +497,7 @@ def _capability_plan_prompt(
     lines = ["", "[CAPABILITY PLAN — semantic requirements and current availability]"]
     for sub_goal in plan.sub_goals:
         requirement = sub_goal.requirement
-        state = "available" if sub_goal.available else "unavailable"
+        state = sub_goal.health_state.value
         marker = " (reconsider this sub-goal)" if requirement.sub_goal_id == affected_sub_goal_id else ""
         lines.append(
             f"- {requirement.sub_goal_id}: {requirement.capability_type.value} — {state}{marker}"
@@ -445,27 +515,38 @@ def _filter_provider_payload_by_capability_plan(
     provider_payload: list[dict],
     plan: CapabilityPlan | None,
 ) -> list[dict]:
-    """Exclude registered reasoning implementations known to be unusable."""
+    """Apply Registry health without presenting UNKNOWN as healthy.
+
+    AVAILABLE and DEGRADED providers are selected from the plan.  UNKNOWN
+    providers remain in the legacy transport input only when no validated
+    implementation exists; the plan labels that sub-goal ``unknown`` and does
+    not select one.  This preserves first-use compatibility without inventing
+    a probing subsystem or changing execution-boundary contracts.  Providers
+    whose sub-goal has no known implementation are not attempted.
+    """
     if plan is None:
         return provider_payload
     reasoning = plan.sub_goal("subgoal-reasoning")
     if reasoning is None:
         return provider_payload
-    registered_provider_ids = {
-        f"provider-{str(provider.get('provider') or '').lower().strip()}"
-        for provider in provider_payload
-    }
-    usable_provider_ids = set(reasoning.candidate_ids) & registered_provider_ids
-    # If no provider was registered for this request, retain the existing
-    # empty payload so the normalized LLM failure/offline compatibility path
-    # remains responsible for the response.  If providers were registered,
-    # only currently usable Registry candidates may be attempted.
-    if not registered_provider_ids:
-        return provider_payload
+    if reasoning.health_state == CapabilityHealth.UNKNOWN:
+        blocked = set(reasoning.unavailable_candidate_ids)
+        return [provider for provider in provider_payload
+                if f"provider-{str(provider.get('provider') or '').lower().strip()}"
+                not in blocked]
+    if not reasoning.available:
+        # No descriptor at all means a manually-created/legacy context has not
+        # run application bootstrap; preserve its old transport behavior.
+        return provider_payload if not reasoning.unavailable_candidate_ids else [
+            provider for provider in provider_payload
+            if f"provider-{str(provider.get('provider') or '').lower().strip()}"
+            not in set(reasoning.unavailable_candidate_ids)
+        ]
+    selected_ids = set(reasoning.candidate_ids)
     return [
         provider for provider in provider_payload
         if f"provider-{str(provider.get('provider') or '').lower().strip()}"
-        in usable_provider_ids
+        in selected_ids
     ]
 
 
@@ -479,7 +560,7 @@ def _filter_tools_by_capability_plan(
     unavailable_types = {
         sub_goal.requirement.capability_type
         for sub_goal in plan.sub_goals
-        if not sub_goal.available
+        if sub_goal.health_state == CapabilityHealth.UNAVAILABLE
         and sub_goal.requirement.capability_type != SemanticCapabilityType.REASONING
     }
     if not unavailable_types:
@@ -529,7 +610,20 @@ def replan_affected_subgoal(
     if current is None:
         return plan, None
     candidates = query_capability_candidates(registry, current.requirement)
+    matching = [
+        descriptor
+        for descriptor in registry.query_by_semantic_type(current.requirement.capability_type)
+        if _descriptor_matches_requirement(descriptor, current.requirement)
+    ]
     current.candidates = candidates
+    current.unknown_candidates = tuple(
+        descriptor for descriptor in matching
+        if descriptor.health == CapabilityHealth.UNKNOWN
+    )
+    current.unavailable_candidates = tuple(
+        descriptor for descriptor in matching
+        if descriptor.health == CapabilityHealth.UNAVAILABLE
+    )
     current.selected_capability_id = candidates[0].id if candidates else None
     plan.record_outcome(sub_goal_id, result)
     return plan, sub_goal_id
@@ -557,45 +651,6 @@ def _record_capability_result(
         sub_goal_id = _sub_goal_for_tool(plan, tool_name or "")
     if sub_goal_id:
         plan.record_outcome(sub_goal_id, result)
-
-
-def _bootstrap_active_tool_capabilities(
-    ctx: BrainContext,
-    available_tools: list[dict],
-) -> None:
-    """Register only currently armed tools without resetting existing health."""
-    registry = _get_registry(ctx)
-    if registry is None:
-        return
-    brain_names = [
-        str(tool.get("function", {}).get("name", ""))
-        for tool in available_tools
-        if not is_device_tool(tool.get("function", {}).get("name", ""))
-    ]
-    device_specs = [
-        {
-            "id": f"device-{tool.get('function', {}).get('name', '')}",
-            "name": tool.get("function", {}).get("name", "device tool"),
-            "category": "device",
-            "description": tool.get("function", {}).get("description", "Device interaction"),
-            "brain_kind": "server_device",
-        }
-        for tool in available_tools
-        if is_device_tool(tool.get("function", {}).get("name", ""))
-    ]
-    missing_brain = [
-        name for name in brain_names if name and not registry.contains(f"brain-{name}")
-    ]
-    missing_device = [
-        spec for spec in device_specs
-        if not registry.contains(f"tool-{spec['id']}")
-    ]
-    if missing_brain or missing_device:
-        _bootstrap_registry_fn(
-            registry,
-            tools_list=missing_device,
-            brain_tool_names=missing_brain,
-        )
 
 
 async def _rate_limit_pause() -> None:
@@ -707,6 +762,8 @@ class BrainContext:
     provider_manager: ProviderManager
     memory_engine: MemoryEngine
     device_status: dict = field(default_factory=dict)
+    # The application owns registration/bootstrap during its lifespan.  The
+    # planner receives this registry as read/write health state only.
     capability_registry: CapabilityRegistry = field(default_factory=CapabilityRegistry)
 
 
@@ -1092,38 +1149,15 @@ def _get_registry(ctx: BrainContext) -> CapabilityRegistry | None:
     return getattr(ctx, "capability_registry", None)
 
 
-def _bootstrap_providers(ctx: BrainContext, provider_payload: list[dict]) -> None:
-    """Register request providers without resetting existing health state."""
-    reg = _get_registry(ctx)
-    if reg is None:
-        return
-    missing = [
-        provider for provider in provider_payload
-        if not reg.contains(f"provider-{str(provider.get('provider') or '').lower().strip()}")
-    ]
-    if missing:
-        _bootstrap_registry_fn(reg, providers_config=missing)
-    # Register the meta-reasoning capability if not already present.  It is a
-    # health bookkeeping capability, never a selectable implementation.
-    if not reg.contains(_REASONING_META_CAP_ID):
-        reg.register(CapabilityDescriptor(
-            id=_REASONING_META_CAP_ID,
-            capability_type=SemanticCapabilityType.REASONING,
-            description="Meta-capability for LLM reasoning request execution",
-            requires_internet=True,
-            requires_auth=True,
-            is_local=False,
-        ))
-
-
 def _sort_providers_by_health(
     ctx: BrainContext, provider_payload: list[dict],
 ) -> list[dict]:
-    """Sort providers by capability health: AVAILABLE/UNKNOWN first.
+    """Present providers by current Registry health without health mutation.
 
-    UNAVAILABLE providers are placed last but still included —
-    ``complete()`` handles internal failover, so they serve as a
-    last-resort fallback before the request fails entirely.
+    AVAILABLE precedes DEGRADED.  UNKNOWN is ordered after both because it is
+    not evidence of health; it remains a distinguishable transport input for
+    the compatibility validation path.  UNAVAILABLE is last and is removed
+    once a validated reasoning candidate exists.
     """
     reg = _get_registry(ctx)
     if reg is None:
@@ -1131,8 +1165,8 @@ def _sort_providers_by_health(
 
     _PRIORITY = {
         CapabilityHealth.AVAILABLE: 0,
-        CapabilityHealth.UNKNOWN: 1,
-        CapabilityHealth.DEGRADED: 2,
+        CapabilityHealth.DEGRADED: 1,
+        CapabilityHealth.UNKNOWN: 2,
         CapabilityHealth.UNAVAILABLE: 3,
     }
 
@@ -1249,7 +1283,6 @@ def _count_healthy_reasoners(ctx: BrainContext) -> int:
         1 for d in reasoners
         if d.health in (
             CapabilityHealth.AVAILABLE,
-            CapabilityHealth.UNKNOWN,
             CapabilityHealth.DEGRADED,
         )
     )
@@ -1453,9 +1486,10 @@ async def _run_llm_unchecked(request: AskRequest, ctx: BrainContext) -> AskRespo
     system_prompt += memory_block
     provider_payload = [provider.model_dump() for provider in request.providers]
 
-    # --- Capability-aware provider setup ---
+    # --- Capability-aware provider discovery ---
+    # Registration is owned by the application lifecycle.  A request only
+    # reads the active registry and applies its current health state.
     reg = _get_registry(ctx)
-    _bootstrap_providers(ctx, provider_payload)
     provider_payload = _sort_providers_by_health(ctx, provider_payload)
 
     settings = _runtime_settings(Path(__file__).resolve().parent.parent / "config" / "settings.json")
@@ -1471,10 +1505,9 @@ async def _run_llm_unchecked(request: AskRequest, ctx: BrainContext) -> AskRespo
     else:
         available_tools = []
 
-    # Arm the Registry with the exact tools visible to this request, preserving
-    # health on capabilities that were already registered.  Then build a
-    # semantic plan before the prompt/tool surface is finalized.
-    _bootstrap_active_tool_capabilities(ctx, available_tools)
+    # Build a semantic plan from the lifecycle-owned Registry before the
+    # prompt/tool surface is finalized.  No capability registration occurs in
+    # this request path.
     capability_plan = build_capability_plan(request.message, reg) if reg is not None else None
     provider_payload = _filter_provider_payload_by_capability_plan(
         provider_payload,

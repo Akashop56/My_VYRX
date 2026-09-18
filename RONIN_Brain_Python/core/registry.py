@@ -112,6 +112,39 @@ class CapabilityRegistry:
 
         return stored.model_copy(deep=True)
 
+    def register_if_absent(
+        self,
+        descriptor: CapabilityDescriptor,
+        policy: HealthPolicy | None = None,
+    ) -> CapabilityDescriptor:
+        """Register *descriptor* only when its ID is not already present.
+
+        This is the lifecycle/bootstrap operation.  Unlike :meth:`register`,
+        it is deliberately idempotent and preserves the existing descriptor
+        and health tracker when another lifecycle call (or a concurrent
+        bootstrap) already registered the capability.
+        """
+        stored = descriptor.model_copy(deep=True)
+        stored.health = CapabilityHealth.UNKNOWN
+
+        with self._lock:
+            existing = self._descriptors.get(stored.id)
+            if existing is not None:
+                tracker = self._trackers.get(stored.id)
+                snapshot = existing.model_copy(deep=True)
+                if tracker is not None:
+                    snapshot.health = tracker.current_health
+                return snapshot
+
+            tracker = HealthTracker(
+                capability_id=stored.id,
+                policy=policy,
+                initial_health=CapabilityHealth.UNKNOWN,
+            )
+            self._descriptors[stored.id] = stored
+            self._trackers[stored.id] = tracker
+            return stored.model_copy(deep=True)
+
     def unregister(self, capability_id: str) -> bool:
         """Remove a capability from the registry.
 

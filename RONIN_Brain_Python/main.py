@@ -25,6 +25,7 @@ from core.planner import (
     plan_request,
     plan_request_stream,
 )
+from core.capability_lifecycle import bootstrap_application_capabilities
 from core.provider_manager import KNOWN_PROVIDERS, ProviderManager
 from core.streaming import (
     MEDIA_TYPE_SSE,
@@ -52,7 +53,7 @@ from core.state_manager import StateManager
 from core.stats import StatsTracker
 from core.system_updater import safe_hot_reload
 from core.tool_registry import execute_tool, get_available_tools
-from core.tools_catalog import TOOLS_CATALOG, tool_label, tool_reason
+from core.tools_catalog import TOOLS_CATALOG, device_tool_schemas, tool_label, tool_reason
 from memory.db_manager import initialize_database, recent_history, save_conversation, store_fact
 from memory.memory_engine import MemoryEngine
 from tools.system_control import AndroidCommand, command_for_request
@@ -108,6 +109,14 @@ async def lifespan(_: FastAPI):
     await initialize_database()
     await MEMORY_ENGINE.init()
     await STATS.init()
+    # Capability registration belongs to the application lifecycle.  The
+    # planner receives this active registry and only queries it per request.
+    bootstrap_application_capabilities(
+        CTX.capability_registry,
+        PROVIDER_MANAGER,
+        available_tools=get_available_tools(),
+        device_tools=device_tool_schemas(),
+    )
     ACTION_LOG.log("VYRX Brain online", "success")
     ACTION_LOG.log(f"Core engine v{BRAIN_VERSION} ready", "info")
     yield
