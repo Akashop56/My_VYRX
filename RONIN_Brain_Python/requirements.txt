@@ -4,3 +4,5 @@ pydantic
 aiosqlite
 groq
 requests
+ijson
+pypdf
