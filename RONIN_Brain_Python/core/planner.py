@@ -1659,18 +1659,17 @@ def _record_provider_failures_from_llm_error(
 
 
 def _record_reasoning_result(ctx: BrainContext, result: ExecutionResult) -> None:
-    """Apply the normalized outcome to a selected local reasoning candidate."""
-    if result.capability_id != LOCAL_REASONING_CAPABILITY_ID:
-        return
+    """Apply one selected reasoning outcome to its Registry candidate."""
+    capability_id = result.capability_id
     registry = _get_registry(ctx)
-    if registry is None or not registry.contains(LOCAL_REASONING_CAPABILITY_ID):
+    if not capability_id or registry is None or not registry.contains(capability_id):
         return
     try:
         if result.outcome == ExecutionOutcome.SUCCESS:
-            registry.update_health(LOCAL_REASONING_CAPABILITY_ID, success=True)
+            registry.update_health(capability_id, success=True)
         elif result.failure_class is not None:
             registry.update_health(
-                LOCAL_REASONING_CAPABILITY_ID,
+                capability_id,
                 success=False,
                 failure_class=result.failure_class,
             )
