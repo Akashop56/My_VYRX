@@ -26,6 +26,7 @@ from core.planner import (
     plan_request_stream,
 )
 from core.capability_lifecycle import bootstrap_application_capabilities
+from core.local_reasoning import LocalReasoningAdapter
 from core.knowledge.engine import KnowledgeEngine
 from core.knowledge.integration import (
     ingest_knowledge,
@@ -94,6 +95,7 @@ MEMORY_ENGINE = MemoryEngine(DATABASE_PATH)
 STATS = StatsTracker(DATABASE_PATH)
 PROVIDER_MANAGER = ProviderManager(PROVIDER_STATE_PATH)
 _KNOWLEDGE_ENGINE_INITIALIZED = False
+_LOCAL_REASONING_INITIALIZED = False
 
 CTX = BrainContext(
     log=ACTION_LOG,
@@ -121,7 +123,11 @@ async def lifespan(_: FastAPI):
     # Exactly one KnowledgeEngine is created by the application lifecycle and
     # then passed through BrainContext.  The planner only consumes this
     # instance; it never constructs or initializes one.
-    global _KNOWLEDGE_ENGINE_INITIALIZED
+    global _KNOWLEDGE_ENGINE_INITIALIZED, _LOCAL_REASONING_INITIALIZED
+    if not _LOCAL_REASONING_INITIALIZED:
+        _LOCAL_REASONING_INITIALIZED = True
+        if CTX.local_reasoning is None:
+            CTX.local_reasoning = LocalReasoningAdapter.from_environment()
     if not _KNOWLEDGE_ENGINE_INITIALIZED:
         _KNOWLEDGE_ENGINE_INITIALIZED = True
         try:
@@ -138,10 +144,19 @@ async def lifespan(_: FastAPI):
         available_tools=get_available_tools(),
         device_tools=device_tool_schemas(),
         knowledge_engine=CTX.knowledge_engine,
+        local_reasoning=CTX.local_reasoning,
     )
     ACTION_LOG.log("VYRX Brain online", "success")
     ACTION_LOG.log(f"Core engine v{BRAIN_VERSION} ready", "info")
-    yield
+    try:
+        yield
+    finally:
+        # The adapter owns no persistent model in this environment, but it can
+        # still have an active subprocess. Shutdown is explicit and safe.
+        if CTX.local_reasoning is not None:
+            CTX.local_reasoning.close()
+        CTX.local_reasoning = None
+        _LOCAL_REASONING_INITIALIZED = False
 
 
 app = FastAPI(title="VYRX Brain (RONIN core)", version=BRAIN_VERSION, lifespan=lifespan)

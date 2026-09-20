@@ -136,7 +136,11 @@ def execute_llm_boundary(
     """
     started = time.monotonic()
     try:
-        data = _complete(message, history, providers, **kwargs)
+        # A lifecycle-owned local adapter can use this same boundary without
+        # changing the normalized ExecutionResult contract.  The private kwarg
+        # is consumed here and never reaches a vendor/runtime callable.
+        completion_callable = kwargs.pop("_completion_callable", _complete)
+        data = completion_callable(message, history, providers, **kwargs)
         elapsed_ms = int((time.monotonic() - started) * 1000)
         return ExecutionResult(
             outcome=ExecutionOutcome.SUCCESS,

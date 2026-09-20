@@ -63,6 +63,7 @@ from core.knowledge.integration import (
     KNOWLEDGE_TOOL_NAME,
     knowledge_tool_schema,
 )
+from core.local_reasoning import LOCAL_REASONING_CAPABILITY_ID, LocalReasoningAdapter
 from core.llm_handler import (
     SYSTEM_PROMPT,
     LLMError,
@@ -993,6 +994,10 @@ class BrainContext:
     # The application creates this once during its lifespan.  The planner
     # receives the established instance and never constructs or initializes it.
     knowledge_engine: KnowledgeEngine | None = None
+    # The application lifecycle may establish one serialized local reasoning
+    # adapter. The planner only consumes it when the capability plan selects
+    # its registry candidate.
+    local_reasoning: LocalReasoningAdapter | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1142,19 +1147,121 @@ def _correction_for_failure_class(
 
 def _execute_llm_request(message: str, history: list, providers: list,
                          **kwargs: Any) -> ExecutionResult:
-    """Run reasoning through the LLM boundary and return its normalized result.
+    """Run one selected reasoning candidate through the LLM boundary.
 
-    The production path calls ``execute_llm_boundary`` directly.  The narrow
-    fallback exists only for the repository's long-standing ``planner.complete``
-    injection seam: older callers patch that symbol to provide a fake transport.
-    It still uses the generic normalizer and therefore preserves the same
-    ``ExecutionResult`` contract without changing the boundary API.
+    Local reasoning is selected by the normal capability plan and passed as a
+    callable to the existing boundary. It is not a remote-failure branch or a
+    planner-owned fallback hierarchy. The compatibility seams for tests and
+    older callers remain unchanged when no local candidate is selected.
     """
+    local_adapter = kwargs.pop("local_adapter", None)
+    selected_capability_id = kwargs.pop("selected_capability_id", None)
+
+    def _tag(result: ExecutionResult) -> ExecutionResult:
+        # Successful remote calls report actual provider success through the
+        # existing callback bridge; only failed selected candidates need a
+        # candidate identity for bounded semantic recovery. Local calls always
+        # carry their identity so local health is updated as well.
+        if selected_capability_id and (
+            selected_capability_id == LOCAL_REASONING_CAPABILITY_ID
+            or result.outcome != ExecutionOutcome.SUCCESS
+        ):
+            return result.model_copy(update={"capability_id": selected_capability_id})
+        return result
+
+    if (
+        selected_capability_id == LOCAL_REASONING_CAPABILITY_ID
+        and isinstance(local_adapter, LocalReasoningAdapter)
+    ):
+        result = execute_llm_boundary(
+            message,
+            history,
+            providers,
+            _completion_callable=local_adapter.complete,
+            **kwargs,
+        )
+        return _tag(result)
     if execute_llm_boundary is not _ORIGINAL_EXECUTE_LLM_BOUNDARY:
-        return execute_llm_boundary(message, history, providers, **kwargs)
+        return _tag(execute_llm_boundary(message, history, providers, **kwargs))
     if complete is not _ORIGINAL_COMPLETE:
-        return execute_boundary(complete, message, history, providers, **kwargs)
-    return execute_llm_boundary(message, history, providers, **kwargs)
+        return _tag(execute_boundary(complete, message, history, providers, **kwargs))
+    return _tag(execute_llm_boundary(message, history, providers, **kwargs))
+
+
+def _selected_reasoning_candidate(plan: CapabilityPlan | None) -> str | None:
+    """Return the Registry-selected reasoning implementation, if any."""
+    if plan is None:
+        return None
+    sub_goal = plan.sub_goal("subgoal-reasoning")
+    return sub_goal.selected_capability_id if sub_goal is not None else None
+
+
+def _execute_reasoning_candidate(
+    candidate: CapabilityDescriptor,
+    *,
+    message: str,
+    history: list,
+    provider_payload: list[dict],
+    ctx: BrainContext,
+    kwargs: dict[str, Any],
+) -> ExecutionResult:
+    """Execute one semantic reasoning candidate through the same LLM boundary."""
+    if candidate.id == LOCAL_REASONING_CAPABILITY_ID:
+        return _execute_llm_request(
+            message,
+            history,
+            [],
+            local_adapter=getattr(ctx, "local_reasoning", None),
+            selected_capability_id=candidate.id,
+            **kwargs,
+        )
+    candidate_payload = [
+        provider for provider in provider_payload
+        if f"provider-{str(provider.get('provider') or '').strip().casefold()}" == candidate.id
+    ]
+    if not candidate_payload:
+        return ExecutionResult(
+            outcome=ExecutionOutcome.UNSUPPORTED,
+            capability_id=candidate.id,
+            failure_class=CanonicalFailureClass.UNSUPPORTED_OPERATION,
+        )
+    return _execute_llm_request(
+        message,
+        history,
+        candidate_payload,
+        selected_capability_id=candidate.id,
+        **kwargs,
+    )
+
+
+def _recover_reasoning_failure(
+    ctx: BrainContext,
+    plan: CapabilityPlan | None,
+    result: ExecutionResult,
+    *,
+    message: str,
+    history: list,
+    provider_payload: list[dict],
+    kwargs: dict[str, Any],
+) -> tuple[ExecutionResult, CapabilityPlan | None, bool]:
+    """Use Phase 11 bounded candidate recovery for any reasoning backend."""
+    registry = _get_registry(ctx)
+    if registry is None or result.outcome == ExecutionOutcome.SUCCESS:
+        return result, plan, False
+    recovered, _, did_recover = recover_failed_subgoal(
+        plan,
+        registry,
+        result,
+        execute_candidate=lambda candidate: _execute_reasoning_candidate(
+            candidate,
+            message=message,
+            history=history,
+            provider_payload=provider_payload,
+            ctx=ctx,
+            kwargs=kwargs,
+        ),
+    )
+    return recovered, plan, did_recover
 
 
 def _execute_tool_request(
@@ -1551,6 +1658,27 @@ def _record_provider_failures_from_llm_error(
                     pass
 
 
+def _record_reasoning_result(ctx: BrainContext, result: ExecutionResult) -> None:
+    """Apply the normalized outcome to a selected local reasoning candidate."""
+    if result.capability_id != LOCAL_REASONING_CAPABILITY_ID:
+        return
+    registry = _get_registry(ctx)
+    if registry is None or not registry.contains(LOCAL_REASONING_CAPABILITY_ID):
+        return
+    try:
+        if result.outcome == ExecutionOutcome.SUCCESS:
+            registry.update_health(LOCAL_REASONING_CAPABILITY_ID, success=True)
+        elif result.failure_class is not None:
+            registry.update_health(
+                LOCAL_REASONING_CAPABILITY_ID,
+                success=False,
+                failure_class=result.failure_class,
+            )
+    except Exception:
+        # A concurrent lifecycle teardown must not change the planner result.
+        pass
+
+
 def _record_provider_success(
     ctx: BrainContext, provider_calls: dict[str, bool],
 ) -> None:
@@ -1816,6 +1944,8 @@ async def _run_llm_unchecked(request: AskRequest, ctx: BrainContext) -> AskRespo
     available_tools = _filter_tools_by_capability_plan(available_tools, capability_plan)
     if capability_plan is not None:
         system_prompt += _capability_plan_prompt(capability_plan)
+    selected_reasoning_id = _selected_reasoning_candidate(capability_plan)
+    local_reasoning = getattr(ctx, "local_reasoning", None)
 
     if available_tools:
         log.log(f"{len(available_tools)} tools available for this request", "info")
@@ -1851,7 +1981,26 @@ async def _run_llm_unchecked(request: AskRequest, ctx: BrainContext) -> AskRespo
         request.message, history, provider_payload,
         system_prompt=system_prompt, tools=available_tools, on_provider=_on_provider,
         on_delta=stream.delta_forwarder(0) if stream is not None else None,
+        local_adapter=local_reasoning,
+        selected_capability_id=selected_reasoning_id,
     )
+    _record_reasoning_result(ctx, llm_result)
+    if llm_result.outcome != ExecutionOutcome.SUCCESS:
+        llm_result, capability_plan, _ = _recover_reasoning_failure(
+            ctx,
+            capability_plan,
+            llm_result,
+            message=request.message,
+            history=history,
+            provider_payload=provider_payload,
+            kwargs={
+                "system_prompt": system_prompt,
+                "tools": available_tools,
+                "on_provider": _on_provider,
+                "on_delta": stream.delta_forwarder(0) if stream is not None else None,
+            },
+        )
+        _record_reasoning_result(ctx, llm_result)
     completion = _llm_completion(llm_result)
     if completion is None:
         # The normalized failure class is the only feedback allowed past the
@@ -2209,7 +2358,26 @@ async def _react_loop(
             messages=messages,
             on_provider=on_provider,
             on_delta=next_delta,
+            local_adapter=getattr(ctx, "local_reasoning", None),
+            selected_capability_id=_selected_reasoning_candidate(capability_plan),
         )
+        _record_reasoning_result(ctx, llm_result)
+        if llm_result.outcome != ExecutionOutcome.SUCCESS:
+            llm_result, capability_plan, _ = _recover_reasoning_failure(
+                ctx,
+                capability_plan,
+                llm_result,
+                message="",
+                history=[],
+                provider_payload=provider_payload,
+                kwargs={
+                    "tools": available_tools,
+                    "messages": messages,
+                    "on_provider": on_provider,
+                    "on_delta": next_delta,
+                },
+            )
+            _record_reasoning_result(ctx, llm_result)
         completion = _llm_completion(llm_result)
         if completion is None:
             # A failed re-plan ends this bounded run cleanly.  It does not
@@ -2340,7 +2508,25 @@ async def continue_with_tool_result(request: ToolResultRequest, ctx: BrainContex
         tools=available_tools,
         messages=messages,
         on_provider=_on_provider,
+        local_adapter=getattr(ctx, "local_reasoning", None),
+        selected_capability_id=_selected_reasoning_candidate(capability_plan),
     )
+    _record_reasoning_result(ctx, llm_result)
+    if llm_result.outcome != ExecutionOutcome.SUCCESS:
+        llm_result, capability_plan, _ = _recover_reasoning_failure(
+            ctx,
+            capability_plan,
+            llm_result,
+            message="",
+            history=[],
+            provider_payload=provider_payload,
+            kwargs={
+                "tools": available_tools,
+                "messages": messages,
+                "on_provider": _on_provider,
+            },
+        )
+        _record_reasoning_result(ctx, llm_result)
     completion = _llm_completion(llm_result)
     if completion is None:
         log.log("Reasoning failed after device observation", "error")
