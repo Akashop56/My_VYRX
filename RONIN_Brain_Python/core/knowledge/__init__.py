@@ -16,6 +16,7 @@ from core.knowledge.embeddings import (
     EmbeddingAdapter,
     EmbeddingResult,
     NullEmbeddingAdapter,
+    adapter_identity,
 )
 from core.knowledge.engine import KnowledgeEngine
 from core.knowledge.models import (
@@ -51,6 +52,7 @@ __all__ = [
     "ParserRegistry",
     "ScanReport",
     "UnsupportedFormatError",
+    "adapter_identity",
     "default_parser_registry",
     "iter_chunks",
 ]

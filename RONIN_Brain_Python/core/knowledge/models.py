@@ -96,7 +96,7 @@ class IngestionReport:
 
 @dataclass(frozen=True)
 class KnowledgeSearchResult:
-    """Structured result returned by lexical or future semantic retrieval."""
+    """Structured result returned by lexical, semantic, or hybrid retrieval."""
 
     chunk_id: int
     matched_chunk: str

@@ -23,7 +23,11 @@ KNOWLEDGE_TOOL_NAME = "search_local_knowledge"
 
 
 def knowledge_capability_descriptor(engine: KnowledgeEngine | None) -> CapabilityDescriptor:
-    """Describe the local lexical knowledge implementation."""
+    """Describe the local lexical/semantic knowledge implementation."""
+    semantic_health = (
+        engine.semantic_health_status().value
+        if engine is not None else CapabilityHealth.UNAVAILABLE.value
+    )
     return CapabilityDescriptor(
         id=KNOWLEDGE_CAPABILITY_ID,
         capability_type=SemanticCapabilityType.LOCAL_KNOWLEDGE_SEARCH,
@@ -35,7 +39,12 @@ def knowledge_capability_descriptor(engine: KnowledgeEngine | None) -> Capabilit
         estimated_cost_tier="free",
         metadata={
             "engine": "KnowledgeEngine",
+            # Preserve the Phase 9 default identity; modes are selected by
+            # the engine/tool without changing LOCAL_KNOWLEDGE_SEARCH.
             "retrieval_method": "lexical_fts5",
+            "retrieval_modes": ["lexical-only", "semantic-only", "hybrid"],
+            "lexical_retrieval": "available_when_sqlite_fts5_is_healthy",
+            "semantic_retrieval": semantic_health,
             "root": str(engine.root) if engine is not None else None,
         },
     )
@@ -94,8 +103,8 @@ def knowledge_tool_schema() -> dict[str, Any]:
         "function": {
             "name": KNOWLEDGE_TOOL_NAME,
             "description": (
-                "Search indexed local files and return relevant excerpts with "
-                "source paths and locations. This is lexical local knowledge only."
+                "Search indexed local files and return concise relevant excerpts "
+                "with source paths and locations using lexical, semantic, or hybrid retrieval."
             ),
             "parameters": {
                 "type": "object",
@@ -109,6 +118,12 @@ def knowledge_tool_schema() -> dict[str, Any]:
                         "description": "Maximum number of local excerpts to return.",
                         "minimum": 1,
                         "maximum": 20,
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["lexical-only", "semantic-only", "hybrid"],
+                        "description": "Retrieval mode; hybrid combines lexical and semantic rankings.",
+                        "default": "lexical-only",
                     },
                 },
                 "required": ["query"],
@@ -153,7 +168,10 @@ def execute_knowledge_search(
     if engine is None:
         raise RuntimeError("local knowledge engine is unavailable")
     limit = max(1, min(20, int(arguments.get("limit", 5))))
-    return format_knowledge_results(query, engine.search(query, limit=limit))
+    mode = str(arguments.get("mode") or "lexical-only").strip().casefold()
+    if mode not in {"lexical-only", "semantic-only", "hybrid"}:
+        raise ValueError("knowledge search mode must be lexical-only, semantic-only, or hybrid")
+    return format_knowledge_results(query, engine.search(query, limit=limit, mode=mode))
 
 
 def scan_knowledge(engine: KnowledgeEngine) -> ScanReport:

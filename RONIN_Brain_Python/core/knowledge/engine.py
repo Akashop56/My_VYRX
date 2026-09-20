@@ -7,7 +7,9 @@ when to invoke those deterministic operations.
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
+import math
 import os
 import re
 import sqlite3
@@ -17,7 +19,11 @@ from pathlib import Path
 from typing import Any
 
 from core.knowledge.chunking import Chunk, ChunkingConfig, iter_chunks
-from core.knowledge.embeddings import EmbeddingAdapter, normalize_embedding_result
+from core.knowledge.embeddings import (
+    EmbeddingAdapter,
+    adapter_identity,
+    normalize_embedding_result,
+)
 from core.capabilities import CapabilityHealth
 from core.knowledge.models import (
     ChangeKind,
@@ -145,6 +151,7 @@ class KnowledgeEngine:
                     chunk_id INTEGER PRIMARY KEY REFERENCES knowledge_chunks(id) ON DELETE CASCADE,
                     adapter_name TEXT NOT NULL,
                     model_name TEXT,
+                    embedding_version TEXT NOT NULL DEFAULT 'unknown',
                     dimensions INTEGER,
                     status TEXT NOT NULL,
                     metadata_json TEXT,
@@ -159,9 +166,20 @@ class KnowledgeEngine:
                 );
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in self._db.execute(
+                    "PRAGMA table_info(knowledge_embedding_metadata)"
+                ).fetchall()
+            }
+            if "embedding_version" not in columns:
+                self._db.execute(
+                    "ALTER TABLE knowledge_embedding_metadata "
+                    "ADD COLUMN embedding_version TEXT NOT NULL DEFAULT 'unknown'"
+                )
             self._db.execute(
                 "INSERT OR REPLACE INTO knowledge_ingestion_state(key, value) VALUES(?, ?)",
-                ("schema_version", "1"),
+                ("schema_version", "2"),
             )
             self._db.execute(
                 "INSERT OR REPLACE INTO knowledge_ingestion_state(key, value) VALUES(?, ?)",
@@ -280,6 +298,11 @@ class KnowledgeEngine:
         results: list[IngestionFileResult] = []
         for observation in report.observations:
             if observation.change == ChangeKind.UNCHANGED:
+                # Source chunks remain unchanged, but a changed embedding
+                # implementation/version must rebuild only their vectors.
+                with self._lock:
+                    if self._embedding_rows_need_refresh(observation.path):
+                        self._refresh_file_embeddings(observation.path)
                 results.append(IngestionFileResult(
                     observation.path,
                     IngestionStatus.SKIPPED,
@@ -345,17 +368,52 @@ class KnowledgeEngine:
         self._db.execute("DELETE FROM knowledge_chunks WHERE file_path = ?", (relative,))
 
     def _embedding_rows(self, chunk_rows: list[tuple[int, Chunk]]) -> list[tuple[Any, ...]]:
+        """Generate one bounded embedding batch without affecting FTS rows."""
         if self.embedding_adapter is None:
             return []
-        rows: list[tuple[Any, ...]] = []
-        for chunk_id, chunk in chunk_rows:
+        adapter = self.embedding_adapter
+        adapter_name, model_name, embedding_version = adapter_identity(adapter)
+        results: list[Any] = []
+        batch_embed = getattr(adapter, "embed_batch", None)
+        if callable(batch_embed):
             try:
-                raw = self.embedding_adapter.embed(chunk.content)
-                result = normalize_embedding_result(raw, self.embedding_adapter)
+                results = list(batch_embed([chunk.content for _, chunk in chunk_rows]))
+                if len(results) != len(chunk_rows):
+                    raise ValueError("embedding batch returned the wrong result count")
+            except Exception as exc:
+                results = [exc] * len(chunk_rows)
+        else:
+            for _, chunk in chunk_rows:
+                try:
+                    results.append(adapter.embed(chunk.content))
+                except Exception as exc:
+                    results.append(exc)
+
+        rows: list[tuple[Any, ...]] = []
+        for (chunk_id, _), raw in zip(chunk_rows, results):
+            if isinstance(raw, BaseException):
+                # Embeddings are optional. A backend outage never invalidates
+                # lexical ingestion or deletes a previously valid index.
+                rows.append((
+                    chunk_id,
+                    adapter_name,
+                    model_name,
+                    embedding_version,
+                    None,
+                    "unavailable",
+                    "{}",
+                    None,
+                    _safe_error(raw),
+                    _utc_now(),
+                ))
+                continue
+            try:
+                result = normalize_embedding_result(raw, adapter)
                 rows.append((
                     chunk_id,
                     result.adapter_name,
                     result.model_name,
+                    result.embedding_version,
                     result.dimensions,
                     "available",
                     json.dumps(result.metadata, ensure_ascii=False, sort_keys=True),
@@ -364,12 +422,11 @@ class KnowledgeEngine:
                     _utc_now(),
                 ))
             except Exception as exc:
-                # Embeddings are optional. A backend outage never invalidates
-                # lexical ingestion or deletes a previously valid index.
                 rows.append((
                     chunk_id,
-                    str(getattr(self.embedding_adapter, "adapter_name", type(self.embedding_adapter).__name__)),
-                    getattr(self.embedding_adapter, "model_name", None),
+                    adapter_name,
+                    model_name,
+                    embedding_version,
                     None,
                     "unavailable",
                     "{}",
@@ -378,6 +435,70 @@ class KnowledgeEngine:
                     _utc_now(),
                 ))
         return rows
+
+    def _adapter_signature(self) -> tuple[str, str | None, str] | None:
+        return adapter_identity(self.embedding_adapter) if self.embedding_adapter is not None else None
+
+    def _embedding_rows_need_refresh(self, relative: str) -> bool:
+        """Detect missing/failed/incompatible vectors for an unchanged file."""
+        signature = self._adapter_signature()
+        if signature is None:
+            return False
+        adapter_name, model_name, version = signature
+        rows = self._db.execute(
+            """SELECT em.adapter_name, em.model_name, em.embedding_version,
+                      em.status, em.vector_json
+               FROM knowledge_embedding_metadata AS em
+               JOIN knowledge_chunks AS c ON c.id = em.chunk_id
+               WHERE c.file_path = ?""",
+            (relative,),
+        ).fetchall()
+        chunk_count = self._db.execute(
+            "SELECT COUNT(*) AS c FROM knowledge_chunks WHERE file_path = ?",
+            (relative,),
+        ).fetchone()["c"]
+        if int(chunk_count) == 0 or len(rows) != int(chunk_count):
+            return int(chunk_count) > 0
+        return any(
+            row["status"] != "available"
+            or row["vector_json"] is None
+            or (str(row["adapter_name"]), row["model_name"], str(row["embedding_version"]))
+            != (adapter_name, model_name, version)
+            for row in rows
+        )
+
+    def _refresh_file_embeddings(self, relative: str) -> None:
+        """Re-embed unchanged chunks only when the versioned space changed."""
+        if self.embedding_adapter is None:
+            return
+        cursor = self._db.execute(
+            """SELECT id, content FROM knowledge_chunks
+               WHERE file_path = ? ORDER BY ordinal""",
+            (relative,),
+        )
+        batch: list[tuple[int, Chunk]] = []
+        for row in cursor:
+            batch.append((
+                int(row["id"]),
+                Chunk(int(row["id"]), str(row["content"]), 0, len(str(row["content"])), 1, 1),
+            ))
+            if len(batch) >= self.batch_size:
+                self._db.executemany(
+                    """INSERT OR REPLACE INTO knowledge_embedding_metadata(
+                        chunk_id, adapter_name, model_name, embedding_version,
+                        dimensions, status, metadata_json, vector_json, error, created_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    self._embedding_rows(batch),
+                )
+                batch.clear()
+        if batch:
+            self._db.executemany(
+                """INSERT OR REPLACE INTO knowledge_embedding_metadata(
+                    chunk_id, adapter_name, model_name, embedding_version,
+                    dimensions, status, metadata_json, vector_json, error, created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                self._embedding_rows(batch),
+            )
 
     def _insert_chunk_batch(self, relative: str, batch: list[Chunk]) -> int:
         self._db.executemany(
@@ -422,9 +543,9 @@ class KnowledgeEngine:
         if embedding_rows:
             self._db.executemany(
                 """INSERT OR REPLACE INTO knowledge_embedding_metadata(
-                    chunk_id, adapter_name, model_name, dimensions, status,
-                    metadata_json, vector_json, error, created_at
-                ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                    chunk_id, adapter_name, model_name, embedding_version,
+                    dimensions, status, metadata_json, vector_json, error, created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
                 embedding_rows,
             )
         return len(batch)
@@ -581,7 +702,7 @@ class KnowledgeEngine:
                 self._db.rollback()
                 raise
 
-    # -- independent lexical retrieval -----------------------------------
+    # -- independent lexical/semantic/hybrid retrieval ------------------
 
     @staticmethod
     def _fts_query(query: str) -> str:
@@ -596,12 +717,29 @@ class KnowledgeEngine:
         terms = " OR ".join('"' + token.replace('"', '""') + '"' for token in tokens)
         return f'"{phrase}" OR {terms}'
 
-    def search(self, query: str, limit: int = 20) -> list[KnowledgeSearchResult]:
-        """Search only the persisted FTS5 lexical index."""
+    def _lexical_result(self, row: sqlite3.Row, score: float) -> KnowledgeSearchResult:
+        return KnowledgeSearchResult(
+            chunk_id=int(row["id"]),
+            matched_chunk=str(row["content"]),
+            source_file=str(self.root / str(row["file_path"])),
+            location={
+                "char_start": int(row["char_start"]),
+                "char_end": int(row["char_end"]),
+                "line_start": int(row["line_start"]),
+                "line_end": int(row["line_end"]),
+            },
+            retrieval_method="lexical_fts5",
+            relevance=1.0 / (1.0 + abs(score)),
+            metadata={
+                "relative_path": str(row["file_path"]),
+                "source_kind": str(row["source_kind"]),
+            },
+        )
+
+    def _search_lexical(self, query: str, limit: int) -> list[KnowledgeSearchResult]:
         fts_query = self._fts_query(query)
         if not fts_query:
             return []
-        limit = max(1, min(200, int(limit or 20)))
         with self._lock:
             rows = self._db.execute(
                 """SELECT c.id, c.content, c.file_path, c.char_start,
@@ -614,10 +752,67 @@ class KnowledgeEngine:
                    LIMIT ?""",
                 (fts_query, limit),
             ).fetchall()
-        results: list[KnowledgeSearchResult] = []
-        for row in rows:
-            score = float(row["score"] or 0.0)
-            results.append(KnowledgeSearchResult(
+        return [self._lexical_result(row, float(row["score"] or 0.0)) for row in rows]
+
+    @staticmethod
+    def _cosine(left: tuple[float, ...], right: tuple[float, ...]) -> float:
+        if not left or len(left) != len(right):
+            return 0.0
+        left_norm = math.sqrt(sum(value * value for value in left))
+        right_norm = math.sqrt(sum(value * value for value in right))
+        if left_norm == 0.0 or right_norm == 0.0:
+            return 0.0
+        return sum(a * b for a, b in zip(left, right)) / (left_norm * right_norm)
+
+    def _query_vector(self, query: str) -> tuple[float, ...] | None:
+        if self.embedding_adapter is None:
+            return None
+        try:
+            result = normalize_embedding_result(
+                self.embedding_adapter.embed(query), self.embedding_adapter,
+            )
+            return tuple(result.vector)
+        except Exception:
+            # Semantic failure is intentionally isolated from lexical search.
+            return None
+
+    def _search_semantic(self, query: str, limit: int) -> list[KnowledgeSearchResult]:
+        query_vector = self._query_vector(query)
+        signature = self._adapter_signature()
+        if query_vector is None or not query_vector or signature is None:
+            return []
+        adapter_name, model_name, embedding_version = signature
+        candidates: list[tuple[float, int, sqlite3.Row]] = []
+        with self._lock:
+            cursor = self._db.execute(
+                """SELECT c.id, c.content, c.file_path, c.char_start,
+                          c.char_end, c.line_start, c.line_end, c.source_kind,
+                          em.vector_json
+                   FROM knowledge_embedding_metadata AS em
+                   JOIN knowledge_chunks AS c ON c.id = em.chunk_id
+                   WHERE em.adapter_name = ? AND em.model_name IS ?
+                     AND em.embedding_version = ?
+                     AND em.dimensions = ? AND em.status = 'available'
+                     AND em.vector_json IS NOT NULL
+                   ORDER BY c.id ASC""",
+                (adapter_name, model_name, embedding_version, len(query_vector)),
+            )
+            for row in cursor:
+                try:
+                    vector = tuple(float(value) for value in json.loads(row["vector_json"]))
+                    score = self._cosine(query_vector, vector)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if score <= 0.0:
+                    continue
+                item = (score, -int(row["id"]), row)
+                if len(candidates) < limit:
+                    heapq.heappush(candidates, item)
+                elif item[:2] > candidates[0][:2]:
+                    heapq.heapreplace(candidates, item)
+        candidates.sort(key=lambda item: (-item[0], -item[1]))
+        return [
+            KnowledgeSearchResult(
                 chunk_id=int(row["id"]),
                 matched_chunk=str(row["content"]),
                 source_file=str(self.root / str(row["file_path"])),
@@ -627,14 +822,77 @@ class KnowledgeEngine:
                     "line_start": int(row["line_start"]),
                     "line_end": int(row["line_end"]),
                 },
-                retrieval_method="lexical_fts5",
-                relevance=1.0 / (1.0 + abs(score)),
+                retrieval_method="semantic_cosine",
+                relevance=float(score),
                 metadata={
                     "relative_path": str(row["file_path"]),
                     "source_kind": str(row["source_kind"]),
+                    "embedding_version": embedding_version,
                 },
+            )
+            for score, _, row in candidates
+        ]
+
+    def _hybrid_search(self, query: str, limit: int) -> list[KnowledgeSearchResult]:
+        candidate_limit = min(200, max(limit * 3, limit))
+        lexical = self._search_lexical(query, candidate_limit)
+        semantic = self._search_semantic(query, candidate_limit)
+        if not semantic:
+            return lexical[:limit]
+        rrf_k = 60.0
+        combined: dict[int, dict[str, Any]] = {}
+        for rank, result in enumerate(lexical, 1):
+            entry = combined.setdefault(result.chunk_id, {"result": result, "score": 0.0, "lexical_rank": None, "semantic_rank": None})
+            entry["score"] += 1.0 / (rrf_k + rank)
+            entry["lexical_rank"] = rank
+        for rank, result in enumerate(semantic, 1):
+            entry = combined.setdefault(result.chunk_id, {"result": result, "score": 0.0, "lexical_rank": None, "semantic_rank": None})
+            entry["score"] += 1.0 / (rrf_k + rank)
+            entry["semantic_rank"] = rank
+        ranked = sorted(
+            combined.values(),
+            key=lambda item: (-item["score"], item["result"].chunk_id),
+        )[:limit]
+        output: list[KnowledgeSearchResult] = []
+        for entry in ranked:
+            result = entry["result"]
+            metadata = dict(result.metadata)
+            metadata.update({
+                "lexical_rank": entry["lexical_rank"],
+                "semantic_rank": entry["semantic_rank"],
+                "rrf_k": rrf_k,
+            })
+            output.append(KnowledgeSearchResult(
+                chunk_id=result.chunk_id,
+                matched_chunk=result.matched_chunk,
+                source_file=result.source_file,
+                location=result.location,
+                retrieval_method="hybrid_rrf",
+                relevance=float(entry["score"]),
+                metadata=metadata,
             ))
-        return results
+        return output
+
+    def search(
+        self,
+        query: str,
+        limit: int = 20,
+        mode: str = "lexical-only",
+    ) -> list[KnowledgeSearchResult]:
+        """Search using lexical-only, semantic-only, or hybrid retrieval."""
+        normalized_mode = str(mode or "lexical-only").strip().casefold()
+        if normalized_mode not in {"lexical-only", "semantic-only", "hybrid"}:
+            raise ValueError("knowledge search mode must be lexical-only, semantic-only, or hybrid")
+        limit = max(1, min(200, int(limit or 20)))
+        if normalized_mode == "semantic-only":
+            return self._search_semantic(query, limit)
+        if normalized_mode == "hybrid":
+            return self._hybrid_search(query, limit)
+        return self._search_lexical(query, limit)
+
+    def semantic_health_status(self) -> CapabilityHealth:
+        """Report semantic backend availability without affecting lexical health."""
+        return CapabilityHealth.AVAILABLE if self.embedding_adapter is not None else CapabilityHealth.UNAVAILABLE
 
     # -- inspection / lifecycle ------------------------------------------
 
