@@ -174,11 +174,32 @@ class KnowledgeHybridTests(unittest.TestCase):
             "SELECT DISTINCT embedding_version FROM knowledge_embedding_metadata"
         ).fetchone()
         self.assertEqual(row["embedding_version"], "v2")
+        self.assertTrue(second.search("versioned", mode="semantic-only"))
         second.close()
 
         incompatible = self.engine(FakeEmbeddingAdapter("v1"))
         self.assertEqual(incompatible.search("versioned", mode="semantic-only"), [])
         incompatible.close()
+
+    def test_modified_chunks_are_reembedded_and_deleted_vectors_are_removed(self):
+        source = self.root / "changing.txt"
+        source.write_text("semantic-only concept", encoding="utf-8")
+        adapter = FakeEmbeddingAdapter()
+        engine = self.engine(adapter)
+        engine.ingest()
+        first_calls = len(adapter.calls)
+        self.assertEqual(engine.embedding_metadata_count(), 1)
+
+        source.write_text("semantic-only concept changed", encoding="utf-8")
+        engine.ingest()
+        self.assertGreater(len(adapter.calls), first_calls)
+        self.assertEqual(engine.embedding_metadata_count(), engine.chunk_count("changing.txt"))
+
+        source.unlink()
+        engine.ingest()
+        self.assertEqual(engine.chunk_count("changing.txt"), 0)
+        self.assertEqual(engine.embedding_metadata_count(), 0)
+        engine.close()
 
     def test_large_data_embedding_batches_are_bounded(self):
         (self.root / "large.txt").write_text(" ".join(f"token-{i}" for i in range(40)), encoding="utf-8")
