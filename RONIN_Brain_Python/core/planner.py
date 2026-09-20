@@ -37,7 +37,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 from core.action_log import ActionLog
 from core.capabilities import (
@@ -120,6 +120,10 @@ _ORIGINAL_EXECUTE_TOOL_BOUNDARY = execute_tool_boundary
 #: Maximum LLM round-trips per user request (device callbacks included).
 MAX_AGENT_STEPS = 8
 
+#: Maximum alternative implementations attempted for one failed sub-goal.
+#: This is deliberately separate from the ReAct step budget.
+MAX_CAPABILITY_RECOVERY_ATTEMPTS = 2
+
 #: Truncation for tool observations fed back into the context window.
 MAX_OBSERVATION_CHARS = 6000
 
@@ -167,6 +171,15 @@ class CapabilitySubGoal:
     unknown_candidates: tuple[CapabilityDescriptor, ...] = ()
     unavailable_candidates: tuple[CapabilityDescriptor, ...] = ()
     selected_capability_id: str | None = None
+    # Per-plan-instance execution history. This is intentionally scoped to
+    # this sub-goal so an alternative in one semantic domain cannot blacklist
+    # an unrelated sub-goal.
+    attempted_capabilities: list[str] = field(default_factory=list)
+
+    def mark_attempted(self, capability_id: str | None) -> None:
+        """Record one attempted implementation exactly once."""
+        if capability_id and capability_id not in self.attempted_capabilities:
+            self.attempted_capabilities.append(capability_id)
 
     @property
     def candidate_ids(self) -> tuple[str, ...]:
@@ -234,8 +247,10 @@ class CapabilityPlan:
 
     def record_outcome(self, sub_goal_id: str, result: ExecutionResult) -> None:
         """Record one sub-goal result; unrelated sub-goals remain untouched."""
-        if self.sub_goal(sub_goal_id) is not None:
+        current = self.sub_goal(sub_goal_id)
+        if current is not None:
             self.outcomes[sub_goal_id] = result.outcome
+            current.mark_attempted(result.capability_id or current.selected_capability_id)
 
 
 # The planner consumes these states; it does not calculate or mutate health.
@@ -600,6 +615,139 @@ def _sub_goal_for_tool(plan: CapabilityPlan | None, tool_name: str) -> str | Non
     return requirement.sub_goal_id if requirement else None
 
 
+def _affected_sub_goal_id(
+    plan: CapabilityPlan,
+    result: ExecutionResult,
+    tool_name: str | None,
+) -> str | None:
+    """Resolve one failure to one plan sub-goal without touching siblings."""
+    if result.sub_goal_id and plan.sub_goal(result.sub_goal_id) is not None:
+        return result.sub_goal_id
+    if result.capability_id:
+        matching = next(
+            (
+                item for item in plan.sub_goals
+                if result.capability_id in item.candidate_ids
+                or result.capability_id == item.selected_capability_id
+            ),
+            None,
+        )
+        if matching is not None:
+            return matching.requirement.sub_goal_id
+    return _sub_goal_for_tool(plan, tool_name or "")
+
+
+def _refresh_sub_goal_candidates(
+    current: CapabilitySubGoal,
+    registry: CapabilityRegistry,
+) -> None:
+    """Refresh only one sub-goal's compatible registry snapshots."""
+    current.candidates = query_capability_candidates(registry, current.requirement)
+    matching = [
+        descriptor
+        for descriptor in registry.query_by_semantic_type(current.requirement.capability_type)
+        if _descriptor_matches_requirement(descriptor, current.requirement)
+    ]
+    current.unknown_candidates = tuple(
+        descriptor for descriptor in matching
+        if descriptor.health == CapabilityHealth.UNKNOWN
+    )
+    current.unavailable_candidates = tuple(
+        descriptor for descriptor in matching
+        if descriptor.health == CapabilityHealth.UNAVAILABLE
+    )
+
+
+def select_next_capability(
+    sub_goal: CapabilitySubGoal,
+    registry: CapabilityRegistry,
+) -> CapabilityDescriptor | None:
+    """Select the next healthy, compatible, untried implementation."""
+    _refresh_sub_goal_candidates(sub_goal, registry)
+    for candidate in sub_goal.candidates:
+        if candidate.id not in sub_goal.attempted_capabilities:
+            return candidate
+    return None
+
+
+def recover_failed_subgoal(
+    plan: CapabilityPlan | None,
+    registry: CapabilityRegistry | None,
+    result: ExecutionResult,
+    *,
+    tool_name: str | None = None,
+    execute_candidate: Callable[[CapabilityDescriptor], ExecutionResult] | None = None,
+) -> tuple[ExecutionResult, str | None, bool]:
+    """Boundedly hot-swap one failed sub-goal through a supplied boundary.
+
+    The executor is deliberately supplied by the caller so this helper can
+    reuse the existing tool/provider boundary without inventing a second
+    execution system. It never updates registry health; execution boundaries
+    remain responsible for health policy side effects.
+    """
+    if plan is None or registry is None:
+        return result, None, False
+    sub_goal_id = _affected_sub_goal_id(plan, result, tool_name)
+    if sub_goal_id is None:
+        return result, None, False
+    current = plan.sub_goal(sub_goal_id)
+    if current is None:
+        return result, None, False
+
+    failed_id = result.capability_id or current.selected_capability_id
+    current.mark_attempted(failed_id)
+    _refresh_sub_goal_candidates(current, registry)
+    last_result = result
+    if execute_candidate is None:
+        plan.record_outcome(sub_goal_id, last_result)
+        return last_result, sub_goal_id, False
+
+    # The failed implementation is not an alternative. Persisted attempted
+    # state therefore also enforces the bound if recovery is invoked again for
+    # the same sub-goal instance.
+    alternatives_already_tried = max(0, len(current.attempted_capabilities) - 1)
+    remaining_attempts = max(
+        0,
+        MAX_CAPABILITY_RECOVERY_ATTEMPTS - alternatives_already_tried,
+    )
+    for _ in range(remaining_attempts):
+        candidate = select_next_capability(current, registry)
+        if candidate is None:
+            break
+        # Mark before invocation so a faulty callback cannot cause a loop to
+        # retry the same implementation.
+        current.mark_attempted(candidate.id)
+        current.selected_capability_id = candidate.id
+        try:
+            candidate_result = execute_candidate(candidate)
+        except Exception as exc:
+            failure_class, diagnostics = classify_exception(exc)
+            candidate_result = ExecutionResult(
+                outcome=outcome_for_failure(failure_class),
+                failure_class=failure_class,
+                diagnostics=diagnostics,
+            )
+        if not isinstance(candidate_result, ExecutionResult):
+            candidate_result = ExecutionResult(
+                outcome=ExecutionOutcome.FATAL_FAILURE,
+                failure_class=CanonicalFailureClass.VALIDATION_FAILED,
+            )
+        candidate_result = candidate_result.model_copy(update={
+            "sub_goal_id": sub_goal_id,
+            "capability_id": candidate.id,
+        })
+        last_result = candidate_result
+        if candidate_result.outcome in {
+            ExecutionOutcome.SUCCESS,
+            ExecutionOutcome.PARTIAL_SUCCESS,
+        }:
+            plan.record_outcome(sub_goal_id, candidate_result)
+            return candidate_result, sub_goal_id, True
+
+    plan.record_outcome(sub_goal_id, last_result)
+    return last_result, sub_goal_id, False
+
+
 def replan_affected_subgoal(
     plan: CapabilityPlan | None,
     registry: CapabilityRegistry | None,
@@ -610,39 +758,17 @@ def replan_affected_subgoal(
     """Refresh only the failed sub-goal's candidates from current Registry state."""
     if plan is None or registry is None:
         return plan, None
-    sub_goal_id = result.sub_goal_id
-    if sub_goal_id is None and result.capability_id:
-        matching = next(
-            (
-                item for item in plan.sub_goals
-                if result.capability_id in item.candidate_ids
-            ),
-            None,
-        )
-        sub_goal_id = matching.requirement.sub_goal_id if matching else None
-    if sub_goal_id is None:
-        sub_goal_id = _sub_goal_for_tool(plan, tool_name or "")
+    sub_goal_id = _affected_sub_goal_id(plan, result, tool_name)
     if sub_goal_id is None:
         return plan, None
     current = plan.sub_goal(sub_goal_id)
     if current is None:
         return plan, None
-    candidates = query_capability_candidates(registry, current.requirement)
-    matching = [
-        descriptor
-        for descriptor in registry.query_by_semantic_type(current.requirement.capability_type)
-        if _descriptor_matches_requirement(descriptor, current.requirement)
-    ]
-    current.candidates = candidates
-    current.unknown_candidates = tuple(
-        descriptor for descriptor in matching
-        if descriptor.health == CapabilityHealth.UNKNOWN
+    current.mark_attempted(result.capability_id or current.selected_capability_id)
+    _refresh_sub_goal_candidates(current, registry)
+    current.selected_capability_id = (
+        current.candidates[0].id if current.candidates else None
     )
-    current.unavailable_candidates = tuple(
-        descriptor for descriptor in matching
-        if descriptor.health == CapabilityHealth.UNAVAILABLE
-    )
-    current.selected_capability_id = candidates[0].id if candidates else None
     plan.record_outcome(sub_goal_id, result)
     return plan, sub_goal_id
 
@@ -655,18 +781,7 @@ def _record_capability_result(
 ) -> None:
     if plan is None:
         return
-    sub_goal_id = result.sub_goal_id
-    if sub_goal_id is None and result.capability_id:
-        matching = next(
-            (
-                item for item in plan.sub_goals
-                if result.capability_id in item.candidate_ids
-            ),
-            None,
-        )
-        sub_goal_id = matching.requirement.sub_goal_id if matching else None
-    if sub_goal_id is None:
-        sub_goal_id = _sub_goal_for_tool(plan, tool_name or "")
+    sub_goal_id = _affected_sub_goal_id(plan, result, tool_name)
     if sub_goal_id:
         plan.record_outcome(sub_goal_id, result)
 
@@ -1001,6 +1116,51 @@ def _normalize_tool_result(result: ExecutionResult) -> ExecutionResult:
         sub_goal_id=result.sub_goal_id,
         capability_id=result.capability_id,
     )
+
+
+def _capability_tool_name(
+    candidate: CapabilityDescriptor,
+    fallback: str,
+) -> str | None:
+    """Resolve a registry descriptor to an existing Brain tool binding."""
+    metadata = candidate.metadata or {}
+    raw_name = (
+        metadata.get("function_name")
+        or metadata.get("tool_name")
+        or metadata.get("function")
+    )
+    if not raw_name and candidate.id.startswith("brain-"):
+        raw_name = candidate.id.removeprefix("brain-")
+    if not raw_name and candidate.id.startswith("tool-"):
+        raw_name = candidate.id.removeprefix("tool-")
+    raw_name = str(raw_name or "").strip()
+    if raw_name == "web_search":
+        return "search"
+    if raw_name in _TOOL_CAPABILITY_TYPES:
+        return raw_name
+    # A same-capability implementation may be represented by the original
+    # tool binding when a test/application supplies that binding explicitly.
+    if candidate.id == fallback:
+        return fallback
+    return None
+
+
+def _execute_registered_candidate(
+    candidate: CapabilityDescriptor,
+    *,
+    original_tool_name: str,
+    arguments: dict[str, Any],
+    ctx: BrainContext,
+) -> ExecutionResult:
+    """Execute one alternative using the existing tool boundary."""
+    tool_name = _capability_tool_name(candidate, original_tool_name)
+    if tool_name is None:
+        return ExecutionResult(
+            outcome=ExecutionOutcome.UNSUPPORTED,
+            capability_id=candidate.id,
+            failure_class=CanonicalFailureClass.UNSUPPORTED_OPERATION,
+        )
+    return _execute_tool_request(tool_name, arguments, ctx)
 
 
 def _failure_class_for_result(result: ExecutionResult) -> CanonicalFailureClass | None:
@@ -1836,7 +1996,43 @@ async def _react_loop(
             )
             tool_ms = exec_result.elapsed_ms or int((time.monotonic() - tool_started) * 1000)
             result_text, tool_ok = _tool_execution_observation(tool_name, exec_result)
-            catalog_id = _tool_catalog_id(tool_name)
+            effective_tool_name = tool_name
+            affected_sub_goal_id: str | None = None
+
+            # Backend recovery happens before the failed observation is handed
+            # to the model. Only this tool's semantic sub-goal is retried; all
+            # earlier successful observations remain in ``messages``.
+            if not tool_ok:
+                recovered_result, affected_sub_goal_id, recovered = recover_failed_subgoal(
+                    capability_plan,
+                    _get_registry(ctx),
+                    exec_result,
+                    tool_name=tool_name,
+                    execute_candidate=lambda candidate: _execute_registered_candidate(
+                        candidate,
+                        original_tool_name=tool_name,
+                        arguments=arguments,
+                        ctx=ctx,
+                    ),
+                )
+                if recovered:
+                    exec_result = recovered_result
+                    registry = _get_registry(ctx)
+                    descriptor = (
+                        registry.get(exec_result.capability_id)
+                        if registry is not None and exec_result.capability_id
+                        else None
+                    )
+                    effective_tool_name = (
+                        _capability_tool_name(descriptor, tool_name)
+                        if descriptor is not None
+                        else tool_name
+                    ) or tool_name
+                    result_text, tool_ok = _tool_execution_observation(
+                        effective_tool_name, exec_result,
+                    )
+
+            catalog_id = _tool_catalog_id(effective_tool_name)
             await stats.record_tool_usage(
                 catalog_id,
                 _clip(json.dumps(arguments, ensure_ascii=False)[:80]),
@@ -1848,45 +2044,38 @@ async def _react_loop(
                 await stats.bump("apps_opened")
             if catalog_id in {"agent_memory", "note_creator"} and tool_ok:
                 await stats.bump("learned")
-            brain_tools_called.append(tool_name)
-            _observation(steps, tool_name, tool_ok, result_text, tool_ms)
+            brain_tools_called.append(effective_tool_name)
+            _observation(steps, effective_tool_name, tool_ok, result_text, tool_ms)
             if tool_ok:
-                log.log(f"Tool {tool_name} finished in {tool_ms} ms", "success")
+                log.log(f"Tool {effective_tool_name} finished in {tool_ms} ms", "success")
+                _record_capability_result(
+                    capability_plan,
+                    exec_result,
+                    tool_name=effective_tool_name,
+                )
             else:
                 # The next Thought sees a canonical, sanitized observation;
                 # raw boundary diagnostics never enter messages or the stream.
                 log.log(
-                    f"Tool {tool_name} failed ({exec_result.outcome.value}) in {tool_ms} ms — agent will self-correct",
+                    f"Tool {effective_tool_name} failed ({exec_result.outcome.value}) in {tool_ms} ms — agent will self-correct",
                     "warning",
                 )
                 _self_correction(
                     steps,
-                    tool_name,
+                    effective_tool_name,
                     result_text,
                     _correction_for_failure_class(
-                        _failure_class_for_result(exec_result), tool_name,
+                        _failure_class_for_result(exec_result), effective_tool_name,
                     ),
                     attempt=steps,
                 )
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.get("id", "") if isinstance(tool_call, dict) else "",
-                "name": tool_name,
-                "content": result_text[:MAX_OBSERVATION_CHARS],
-            })
-            if tool_ok:
-                _record_capability_result(
-                    capability_plan,
-                    exec_result,
-                    tool_name=tool_name,
-                )
-            else:
-                capability_plan, affected_sub_goal_id = replan_affected_subgoal(
-                    capability_plan,
-                    _get_registry(ctx),
-                    exec_result,
-                    tool_name=tool_name,
-                )
+                if affected_sub_goal_id is None:
+                    capability_plan, affected_sub_goal_id = replan_affected_subgoal(
+                        capability_plan,
+                        _get_registry(ctx),
+                        exec_result,
+                        tool_name=effective_tool_name,
+                    )
                 if affected_sub_goal_id:
                     messages.append({
                         "role": "system",
@@ -1895,6 +2084,15 @@ async def _react_loop(
                             affected_sub_goal_id=affected_sub_goal_id,
                         ),
                     })
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.get("id", "") if isinstance(tool_call, dict) else "",
+                # Keep the protocol name paired with the model's original
+                # tool_call; the observation content carries the verified
+                # alternative result.
+                "name": tool_name,
+                "content": result_text[:MAX_OBSERVATION_CHARS],
+            })
             brain_done += 1
 
         # GROQ RATE LIMIT BYPASS: 2 second ka pause
