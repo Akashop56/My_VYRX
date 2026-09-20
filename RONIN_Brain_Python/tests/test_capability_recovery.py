@@ -108,6 +108,10 @@ class AdaptiveCapabilityRecoveryTests(unittest.TestCase):
         sub_goal = plan.sub_goal("subgoal-web-retrieval")
         self.assertEqual(sub_goal.attempted_capabilities, ["web-a", "web-b"])
         self.assertEqual(plan.outcomes["subgoal-web-retrieval"], ExecutionOutcome.SUCCESS)
+        self.assertEqual(
+            [event["event"] for event in sub_goal.recovery_history],
+            ["failed", "candidate_rejected", "candidate_selected", "recovered"],
+        )
 
     def test_unrelated_semantic_capability_remains_usable(self):
         registry = CapabilityRegistry()
@@ -136,6 +140,106 @@ class AdaptiveCapabilityRecoveryTests(unittest.TestCase):
         self.assertEqual(plan.sub_goal("subgoal-local-files").candidate_ids, ("files-a",))
         self.assertEqual(plan.sub_goal("subgoal-local-files").attempted_capabilities, [])
         self.assertEqual(registry.get("files-a").health, CapabilityHealth.AVAILABLE)
+
+    def test_ineligible_auth_failure_uses_llm_observation_path(self):
+        registry = CapabilityRegistry()
+        _available(
+            registry, "web-a", SemanticCapabilityType.WEB_RETRIEVAL,
+            requires_internet=True, is_local=False,
+        )
+        _available(
+            registry, "web-b", SemanticCapabilityType.WEB_RETRIEVAL,
+            requires_internet=True, is_local=False,
+        )
+        plan = build_capability_plan("find current external information", registry)
+        calls: list[str] = []
+
+        result, affected, did_recover = recover_failed_subgoal(
+            plan,
+            registry,
+            _failed("web-a", CanonicalFailureClass.AUTH_DENIED).model_copy(update={
+                "outcome": ExecutionOutcome.DENIED,
+            }),
+            execute_candidate=lambda candidate: calls.append(candidate.id) or _success(candidate.id),
+        )
+
+        self.assertFalse(did_recover)
+        self.assertIsNone(affected)
+        self.assertEqual(calls, [])
+        self.assertEqual(result.failure_class, CanonicalFailureClass.AUTH_DENIED)
+        self.assertEqual(
+            plan.sub_goal("subgoal-web-retrieval").recovery_history[-1]["reason"],
+            "failure_class_not_eligible",
+        )
+
+    def test_incompatible_semantic_capability_is_not_selected(self):
+        registry = CapabilityRegistry()
+        _available(
+            registry, "web-a", SemanticCapabilityType.WEB_RETRIEVAL,
+            requires_internet=True, is_local=False,
+        )
+        _available(registry, "files-b", SemanticCapabilityType.FILE_SYSTEM_IO)
+        plan = build_capability_plan("find current external information", registry)
+        calls: list[str] = []
+
+        _, _, did_recover = recover_failed_subgoal(
+            plan,
+            registry,
+            _failed("web-a"),
+            execute_candidate=lambda candidate: calls.append(candidate.id) or _success(candidate.id),
+        )
+
+        self.assertFalse(did_recover)
+        self.assertEqual(calls, [])
+        self.assertNotIn("files-b", plan.sub_goal("subgoal-web-retrieval").candidate_ids)
+        self.assertEqual(plan.sub_goal("subgoal-web-retrieval").unavailable_candidate_ids, ())
+
+    def test_already_tried_capability_is_not_retried_on_later_recovery_call(self):
+        registry = CapabilityRegistry()
+        for capability_id in ("web-a", "web-b"):
+            _available(
+                registry, capability_id, SemanticCapabilityType.WEB_RETRIEVAL,
+                requires_internet=True, is_local=False,
+            )
+        plan = build_capability_plan("find current external information", registry)
+        calls: list[str] = []
+        first, _, first_recovered = recover_failed_subgoal(
+            plan,
+            registry,
+            _failed("web-a"),
+            execute_candidate=lambda candidate: calls.append(candidate.id) or _failed(candidate.id),
+        )
+        second, _, second_recovered = recover_failed_subgoal(
+            plan,
+            registry,
+            first,
+            execute_candidate=lambda candidate: calls.append(candidate.id) or _success(candidate.id),
+        )
+
+        self.assertFalse(first_recovered)
+        self.assertFalse(second_recovered)
+        self.assertEqual(calls, ["web-b"])
+        self.assertEqual(second.capability_id, "web-b")
+
+    def test_non_execution_result_cannot_be_accepted_as_recovery(self):
+        registry = CapabilityRegistry()
+        for capability_id in ("web-a", "web-b"):
+            _available(
+                registry, capability_id, SemanticCapabilityType.WEB_RETRIEVAL,
+                requires_internet=True, is_local=False,
+            )
+        plan = build_capability_plan("find current external information", registry)
+
+        result, _, did_recover = recover_failed_subgoal(
+            plan,
+            registry,
+            _failed("web-a"),
+            execute_candidate=lambda candidate: {"verified": True},
+        )
+
+        self.assertFalse(did_recover)
+        self.assertEqual(result.capability_id, "web-b")
+        self.assertEqual(result.failure_class, CanonicalFailureClass.VALIDATION_FAILED)
 
     def test_exhausted_alternatives_are_bounded_and_sanitized(self):
         registry = CapabilityRegistry()

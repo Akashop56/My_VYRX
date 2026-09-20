@@ -124,6 +124,16 @@ MAX_AGENT_STEPS = 8
 #: This is deliberately separate from the ReAct step budget.
 MAX_CAPABILITY_RECOVERY_ATTEMPTS = 2
 
+#: Failure classes for which backend substitution is appropriate by default.
+#: Validation, authorization, policy, and deterministic input failures remain
+#: available to the ReAct correction path instead of being blindly swapped.
+_RECOVERY_ELIGIBLE_FAILURES = frozenset({
+    CanonicalFailureClass.TRANSIENT,
+    CanonicalFailureClass.NETWORK_ISOLATED,
+    CanonicalFailureClass.UNSUPPORTED_OPERATION,
+    CanonicalFailureClass.UNKNOWN_FATAL,
+})
+
 #: Truncation for tool observations fed back into the context window.
 MAX_OBSERVATION_CHARS = 6000
 
@@ -175,11 +185,24 @@ class CapabilitySubGoal:
     # this sub-goal so an alternative in one semantic domain cannot blacklist
     # an unrelated sub-goal.
     attempted_capabilities: list[str] = field(default_factory=list)
+    # Internal, sanitized recovery audit trail. It is not included in user
+    # observations or prompts.
+    recovery_history: list[dict[str, Any]] = field(default_factory=list)
 
     def mark_attempted(self, capability_id: str | None) -> None:
         """Record one attempted implementation exactly once."""
         if capability_id and capability_id not in self.attempted_capabilities:
             self.attempted_capabilities.append(capability_id)
+
+    def record_recovery_event(self, **event: Any) -> None:
+        """Keep a sanitized internal record of one recovery decision."""
+        self.recovery_history.append({
+            key: value for key, value in event.items()
+            if key in {
+                "event", "capability_id", "failure_class", "outcome",
+                "reason", "selected", "attempt",
+            }
+        })
 
     @property
     def candidate_ids(self) -> tuple[str, ...]:
@@ -615,6 +638,13 @@ def _sub_goal_for_tool(plan: CapabilityPlan | None, tool_name: str) -> str | Non
     return requirement.sub_goal_id if requirement else None
 
 
+def recovery_eligible(result: ExecutionResult) -> bool:
+    """Decide whether backend substitution is appropriate for this failure."""
+    if result.outcome in {ExecutionOutcome.SUCCESS, ExecutionOutcome.PARTIAL_SUCCESS}:
+        return False
+    return _failure_class_for_result(result) in _RECOVERY_ELIGIBLE_FAILURES
+
+
 def _affected_sub_goal_id(
     plan: CapabilityPlan,
     result: ExecutionResult,
@@ -696,9 +726,46 @@ def recover_failed_subgoal(
 
     failed_id = result.capability_id or current.selected_capability_id
     current.mark_attempted(failed_id)
+    failure_class = _failure_class_for_result(result)
+    current.record_recovery_event(
+        event="failed",
+        capability_id=failed_id,
+        failure_class=failure_class.value if failure_class else None,
+        outcome=result.outcome.value,
+    )
+    if not recovery_eligible(result):
+        current.record_recovery_event(
+            event="recovery_skipped",
+            capability_id=failed_id,
+            reason="failure_class_not_eligible",
+        )
+        plan.record_outcome(sub_goal_id, result)
+        return result, None, False
+
     _refresh_sub_goal_candidates(current, registry)
+    for descriptor in registry.query_by_semantic_type(current.requirement.capability_type):
+        if not _descriptor_matches_requirement(descriptor, current.requirement):
+            continue
+        if descriptor.id in current.attempted_capabilities:
+            reason = "already_attempted"
+        elif descriptor.health == CapabilityHealth.UNKNOWN:
+            reason = "unknown_health"
+        elif descriptor.health == CapabilityHealth.UNAVAILABLE:
+            reason = "unavailable"
+        else:
+            continue
+        current.record_recovery_event(
+            event="candidate_rejected",
+            capability_id=descriptor.id,
+            reason=reason,
+        )
+
     last_result = result
     if execute_candidate is None:
+        current.record_recovery_event(
+            event="recovery_skipped",
+            reason="no_executor",
+        )
         plan.record_outcome(sub_goal_id, last_result)
         return last_result, sub_goal_id, False
 
@@ -718,6 +785,13 @@ def recover_failed_subgoal(
         # retry the same implementation.
         current.mark_attempted(candidate.id)
         current.selected_capability_id = candidate.id
+        current.record_recovery_event(
+            event="candidate_selected",
+            capability_id=candidate.id,
+            selected=True,
+            reason="first_eligible_untried_candidate",
+            attempt=len(current.attempted_capabilities) - 1,
+        )
         try:
             candidate_result = execute_candidate(candidate)
         except Exception as exc:
@@ -737,13 +811,31 @@ def recover_failed_subgoal(
             "capability_id": candidate.id,
         })
         last_result = candidate_result
+        candidate_failure = _failure_class_for_result(candidate_result)
         if candidate_result.outcome in {
             ExecutionOutcome.SUCCESS,
             ExecutionOutcome.PARTIAL_SUCCESS,
         }:
+            current.record_recovery_event(
+                event="recovered",
+                capability_id=candidate.id,
+                outcome=candidate_result.outcome.value,
+                reason="validated_execution_result",
+            )
             plan.record_outcome(sub_goal_id, candidate_result)
             return candidate_result, sub_goal_id, True
+        current.record_recovery_event(
+            event="candidate_rejected",
+            capability_id=candidate.id,
+            failure_class=candidate_failure.value if candidate_failure else None,
+            outcome=candidate_result.outcome.value,
+            reason="execution_failed",
+        )
 
+    current.record_recovery_event(
+        event="recovery_exhausted",
+        reason="no_eligible_untried_alternative_or_attempt_bound",
+    )
     plan.record_outcome(sub_goal_id, last_result)
     return last_result, sub_goal_id, False
 
@@ -2030,6 +2122,15 @@ async def _react_loop(
                     ) or tool_name
                     result_text, tool_ok = _tool_execution_observation(
                         effective_tool_name, exec_result,
+                    )
+                    log.log(
+                        f"Recovered {affected_sub_goal_id} via {exec_result.capability_id}",
+                        "success",
+                    )
+                elif affected_sub_goal_id:
+                    log.log(
+                        f"Recovery exhausted for {affected_sub_goal_id}; returning sanitized observation",
+                        "warning",
                     )
 
             catalog_id = _tool_catalog_id(effective_tool_name)
