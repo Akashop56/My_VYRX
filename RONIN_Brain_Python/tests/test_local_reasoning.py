@@ -15,6 +15,7 @@ from core.capabilities import (
     CapabilityDescriptor,
     CapabilityHealth,
     ExecutionOutcome,
+    ExecutionResult,
     SemanticCapabilityType,
 )
 from core.capability_lifecycle import (
@@ -24,7 +25,10 @@ from core.capability_lifecycle import (
 )
 from core.execution_boundary import execute_llm_boundary
 from core.local_reasoning import LocalReasoningAdapter
-from core.planner import build_capability_plan
+from core.planner import (
+    build_capability_plan,
+    recover_failed_subgoal,
+)
 from core.registry import CapabilityRegistry
 
 
@@ -41,18 +45,24 @@ _RUNTIME = textwrap.dedent(
             raise SystemExit(1)
         print(json.dumps({"ready": True}))
         raise SystemExit(0)
-    if mode == "timeout":
-        time.sleep(2)
-    if mode == "oom":
-        print("out of memory", file=sys.stderr)
-        raise SystemExit(1)
-    if mode == "crash":
-        raise SystemExit(7)
-    if mode == "malformed":
-        print("{not-json", end="")
+    if "--serve" in sys.argv:
+        print(json.dumps({"ready": True}), flush=True)
+        for raw in sys.stdin:
+            if mode == "timeout":
+                time.sleep(2)
+            if mode == "slow":
+                time.sleep(0.1)
+            if mode == "oom":
+                print("out of memory", file=sys.stderr, flush=True)
+                raise SystemExit(1)
+            if mode == "crash":
+                raise SystemExit(7)
+            if mode == "malformed":
+                print("{not-json", flush=True)
+                continue
+            request = json.loads(raw)
+            print(json.dumps({"text": "local answer", "received": request["messages"]}), flush=True)
         raise SystemExit(0)
-    request = json.load(sys.stdin)
-    print(json.dumps({"text": "local answer", "received": request["messages"]}))
     """
 )
 
@@ -161,6 +171,118 @@ class LocalReasoningTests(unittest.TestCase):
         )
         self.assertIsNotNone(plan.sub_goal("subgoal-web-retrieval"))
         self.assertIsNotNone(plan.sub_goal("subgoal-local-files"))
+
+    def test_reuses_one_serving_process_and_serializes_concurrent_requests(self):
+        adapter = self.adapter("slow", timeout_seconds=1.0)
+        adapter.initialize()
+        worker_pid = adapter._worker.pid
+        results: list[str] = []
+        failures: list[BaseException] = []
+
+        def call() -> None:
+            try:
+                completion = adapter.complete("hello", [], [])
+                results.append(completion["choices"][0]["message"]["content"])
+            except BaseException as exc:  # test harness should surface any worker race
+                failures.append(exc)
+
+        import threading
+        threads = [threading.Thread(target=call) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=4)
+
+        self.assertFalse(failures)
+        self.assertEqual(results, ["local answer"] * 3)
+        self.assertEqual(adapter._worker.pid, worker_pid)
+        adapter.close()
+
+    def test_provider_failure_recovers_to_local_without_disabling_web(self):
+        registry = CapabilityRegistry()
+        remote = CapabilityDescriptor(
+            id="provider-remote",
+            capability_type=SemanticCapabilityType.REASONING,
+            description="Remote reasoning",
+            requires_internet=True,
+            requires_auth=True,
+            is_local=False,
+        )
+        local = CapabilityDescriptor(
+            id=LOCAL_REASONING_CAPABILITY_ID,
+            capability_type=SemanticCapabilityType.REASONING,
+            description="Local reasoning",
+            requires_internet=False,
+            requires_auth=False,
+            is_local=True,
+        )
+        web = CapabilityDescriptor(
+            id="web-search",
+            capability_type=SemanticCapabilityType.WEB_RETRIEVAL,
+            description="Web retrieval",
+            requires_internet=True,
+            is_local=False,
+        )
+        for descriptor in (remote, local, web):
+            registry.register(descriptor)
+            registry.update_health(descriptor.id, success=True)
+        plan = build_capability_plan("use current external information", registry)
+        failure = ExecutionResult(
+            outcome=ExecutionOutcome.FATAL_FAILURE,
+            capability_id="provider-remote",
+            failure_class=CanonicalFailureClass.UNKNOWN_FATAL,
+        )
+        calls: list[str] = []
+
+        def execute(candidate: CapabilityDescriptor) -> ExecutionResult:
+            calls.append(candidate.id)
+            return ExecutionResult(
+                outcome=ExecutionOutcome.SUCCESS,
+                capability_id=candidate.id,
+                data={"text": "local result"},
+            )
+
+        recovered, affected, did_recover = recover_failed_subgoal(
+            plan,
+            registry,
+            failure,
+            execute_candidate=execute,
+        )
+
+        self.assertTrue(did_recover)
+        self.assertEqual(affected, "subgoal-reasoning")
+        self.assertEqual(calls, [LOCAL_REASONING_CAPABILITY_ID])
+        self.assertEqual(recovered.outcome, ExecutionOutcome.SUCCESS)
+        self.assertEqual(registry.get("web-search").health, CapabilityHealth.AVAILABLE)
+        self.assertEqual(plan.sub_goal("subgoal-web-retrieval").health_state,
+                         CapabilityHealth.AVAILABLE)
+
+    def test_internet_failure_does_not_remove_local_reasoning_candidate(self):
+        registry = CapabilityRegistry()
+        remote = CapabilityDescriptor(
+            id="provider-remote",
+            capability_type=SemanticCapabilityType.REASONING,
+            description="Remote reasoning",
+            requires_internet=True,
+            is_local=False,
+        )
+        local = CapabilityDescriptor(
+            id=LOCAL_REASONING_CAPABILITY_ID,
+            capability_type=SemanticCapabilityType.REASONING,
+            description="Local reasoning",
+            requires_internet=False,
+            is_local=True,
+        )
+        for descriptor in (remote, local):
+            registry.register(descriptor)
+        registry.update_health("provider-remote", success=False,
+                              failure_class=CanonicalFailureClass.NETWORK_ISOLATED)
+        registry.update_health(LOCAL_REASONING_CAPABILITY_ID, success=True)
+
+        plan = build_capability_plan("answer this", registry)
+        reasoning = plan.sub_goal("subgoal-reasoning")
+        self.assertEqual(reasoning.candidate_ids, (LOCAL_REASONING_CAPABILITY_ID,))
+        self.assertEqual(reasoning.selected_capability_id, LOCAL_REASONING_CAPABILITY_ID)
 
     def test_close_blocks_future_execution(self):
         adapter = self.adapter()

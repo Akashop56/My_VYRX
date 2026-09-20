@@ -102,7 +102,7 @@ def local_reasoning_descriptor(
         estimated_cost_tier="free",
         metadata={
             "adapter": "LocalReasoningAdapter",
-            "runtime_protocol": "stdin_json_stdout_completion",
+            "runtime_protocol": "health_probe_and_jsonl_serving_process",
             "runtime_command": readiness.runtime_command,
             "readiness": readiness.health.value,
             "readiness_reason": readiness.reason,
@@ -110,8 +110,8 @@ def local_reasoning_descriptor(
             "max_output_chars": adapter.max_output_chars if adapter is not None else None,
             "timeout_seconds": adapter.timeout_seconds if adapter is not None else None,
             "concurrency": "serialized",
-            "process_lifecycle": "per_request",
-            "model_loading": "runtime-owned; no automatic download",
+            "process_lifecycle": "lifecycle_scoped_worker",
+            "model_loading": "worker-loaded; no automatic download",
         },
     )
 

@@ -4,8 +4,9 @@ The adapter intentionally does not ship or download a model. It speaks a small
 JSON-lines-like process contract to a locally configured runtime command:
 
 * ``COMMAND --health`` must exit successfully and may return ``{"ready": true}``.
-* inference receives a JSON request on stdin and returns either an
-  OpenAI-shaped completion or ``{"text": "..."}`` on stdout.
+* ``COMMAND --serve`` stays resident, emits ``{"ready": true}``, then
+  receives one JSON request per stdin line and returns one completion per
+  stdout line (OpenAI-shaped or ``{"text": "..."}``).
 
 This keeps runtime/model selection outside planner semantics and makes missing
 local infrastructure an honest unavailable capability rather than a fake
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import shlex
 import shutil
 import subprocess
@@ -50,10 +52,10 @@ class LocalReasoningReadiness:
 class LocalReasoningAdapter:
     """Serialized, process-backed local reasoning adapter.
 
-    A new inference process is launched for each request. This is deliberately
-    conservative: it avoids keeping a model resident in the Brain when the
-    development environment has no known local runtime, and the lock prevents
-    concurrent requests from overcommitting a single external runtime/model.
+    One serving process is owned by the adapter lifecycle and reused across
+    requests. This avoids reloading a model for every request, while the lock
+    prevents concurrent requests from overcommitting a single external
+    runtime/model.
     """
 
     def __init__(
@@ -69,8 +71,10 @@ class LocalReasoningAdapter:
         self.max_context_chars = max(1000, int(max_context_chars))
         self.max_output_chars = max(1000, int(max_output_chars))
         self._state_lock = threading.RLock()
+        self._initialize_lock = threading.Lock()
         self._inference_lock = threading.Lock()
         self._active: set[subprocess.Popen[str]] = set()
+        self._worker: subprocess.Popen[str] | None = None
         self._closed = False
         self._initialized = False
         self._readiness = LocalReasoningReadiness(
@@ -122,95 +126,125 @@ class LocalReasoningAdapter:
             return self._readiness
 
     def initialize(self) -> LocalReasoningReadiness:
-        """Probe executable and runtime readiness exactly once per adapter."""
-        with self._state_lock:
-            if self._initialized:
-                return self._readiness
-            self._initialized = True
-            if self._closed:
-                self._readiness = LocalReasoningReadiness(
-                    CapabilityHealth.UNAVAILABLE,
-                    "Unsupported operation: local reasoning adapter is closed",
-                    CanonicalFailureClass.UNSUPPORTED_OPERATION,
-                    self.display_command,
-                )
-                return self._readiness
-            if not self.command:
-                self._readiness = LocalReasoningReadiness(
-                    CapabilityHealth.UNAVAILABLE,
-                    "VYRX_LOCAL_REASONING_COMMAND is not configured; no local runtime was selected",
-                    CanonicalFailureClass.UNSUPPORTED_OPERATION,
-                )
-                return self._readiness
-            executable = self.command[0]
-            if shutil.which(executable) is None and not os.path.isfile(executable):
-                self._readiness = LocalReasoningReadiness(
-                    CapabilityHealth.UNAVAILABLE,
-                    f"Local reasoning executable is not available: {executable}",
-                    CanonicalFailureClass.UNSUPPORTED_OPERATION,
-                    self.display_command,
-                )
-                return self._readiness
+        """Probe readiness and start one lifecycle-scoped serving process."""
+        with self._initialize_lock:
+            with self._state_lock:
+                if self._initialized:
+                    return self._readiness
+                if self._closed:
+                    self._initialized = True
+                    self._readiness = LocalReasoningReadiness(
+                        CapabilityHealth.UNAVAILABLE,
+                        "Unsupported operation: local reasoning adapter is closed",
+                        CanonicalFailureClass.UNSUPPORTED_OPERATION,
+                        self.display_command,
+                    )
+                    return self._readiness
+                if not self.command:
+                    self._initialized = True
+                    self._readiness = LocalReasoningReadiness(
+                        CapabilityHealth.UNAVAILABLE,
+                        "VYRX_LOCAL_REASONING_COMMAND is not configured; no local runtime was selected",
+                        CanonicalFailureClass.UNSUPPORTED_OPERATION,
+                    )
+                    return self._readiness
+                executable = self.command[0]
+                if shutil.which(executable) is None and not os.path.isfile(executable):
+                    self._initialized = True
+                    self._readiness = LocalReasoningReadiness(
+                        CapabilityHealth.UNAVAILABLE,
+                        f"Local reasoning executable is not available: {executable}",
+                        CanonicalFailureClass.UNSUPPORTED_OPERATION,
+                        self.display_command,
+                    )
+                    return self._readiness
 
-        try:
-            stdout, stderr, returncode = self._run_process(
-                [*self.command, "--health"],
-                None,
-                self.timeout_seconds,
-            )
-        except TimeoutError:
-            readiness = LocalReasoningReadiness(
-                CapabilityHealth.UNAVAILABLE,
-                "Local reasoning readiness probe timed out",
-                CanonicalFailureClass.TRANSIENT,
-                self.display_command,
-            )
-        except Exception as exc:
-            detail = " ".join(str(exc).split())[:240]
-            reason = f"Local reasoning readiness probe failed: {type(exc).__name__}"
-            if detail:
-                reason += f": {detail}"
-            readiness = LocalReasoningReadiness(
-                CapabilityHealth.UNAVAILABLE,
-                reason,
-                CanonicalFailureClass.UNKNOWN_FATAL,
-                self.display_command,
-            )
-        else:
-            ready = returncode == 0
-            health_detail = ""
-            if stdout.strip():
-                try:
-                    payload = json.loads(stdout)
-                    if isinstance(payload, dict):
-                        if payload.get("ready") is False:
-                            ready = False
-                        health_detail = str(payload.get("reason") or "").strip()
-                except json.JSONDecodeError:
-                    # Exit status remains authoritative for the generic
-                    # process contract; arbitrary health text is not exposed.
-                    pass
-            if ready:
-                readiness = LocalReasoningReadiness(
-                    CapabilityHealth.AVAILABLE,
-                    "Local reasoning runtime passed its readiness probe",
-                    runtime_command=self.display_command,
+            try:
+                stdout, stderr, returncode = self._run_process(
+                    [*self.command, "--health"],
+                    None,
+                    self.timeout_seconds,
                 )
-            else:
-                detail = (
-                    " ".join(health_detail.split())[:240]
-                    or " ".join(stderr.split())[:240]
-                    or "runtime returned a non-zero health status"
-                )
+            except TimeoutError:
                 readiness = LocalReasoningReadiness(
                     CapabilityHealth.UNAVAILABLE,
-                    f"Local reasoning runtime is not ready: {detail}",
+                    "Local reasoning readiness probe timed out",
+                    CanonicalFailureClass.TRANSIENT,
+                    self.display_command,
+                )
+            except Exception as exc:
+                detail = " ".join(str(exc).split())[:240]
+                reason = f"Local reasoning readiness probe failed: {type(exc).__name__}"
+                if detail:
+                    reason += f": {detail}"
+                readiness = LocalReasoningReadiness(
+                    CapabilityHealth.UNAVAILABLE,
+                    reason,
                     CanonicalFailureClass.UNKNOWN_FATAL,
                     self.display_command,
                 )
-        with self._state_lock:
-            self._readiness = readiness
-            return readiness
+            else:
+                ready = returncode == 0
+                health_detail = ""
+                if stdout.strip():
+                    try:
+                        payload = json.loads(stdout)
+                        if isinstance(payload, dict):
+                            if payload.get("ready") is False:
+                                ready = False
+                            health_detail = str(payload.get("reason") or "").strip()
+                    except json.JSONDecodeError:
+                        pass
+                if not ready:
+                    detail = (
+                        " ".join(health_detail.split())[:240]
+                        or " ".join(stderr.split())[:240]
+                        or "runtime returned a non-zero health status"
+                    )
+                    readiness = LocalReasoningReadiness(
+                        CapabilityHealth.UNAVAILABLE,
+                        f"Local reasoning runtime is not ready: {detail}",
+                        CanonicalFailureClass.UNKNOWN_FATAL,
+                        self.display_command,
+                    )
+                else:
+                    try:
+                        self._start_worker()
+                    except TimeoutError:
+                        readiness = LocalReasoningReadiness(
+                            CapabilityHealth.UNAVAILABLE,
+                            "Local reasoning serving process did not become ready before the timeout",
+                            CanonicalFailureClass.TRANSIENT,
+                            self.display_command,
+                        )
+                    except ValueError as exc:
+                        readiness = LocalReasoningReadiness(
+                            CapabilityHealth.UNAVAILABLE,
+                            f"Malformed local reasoning readiness output: {exc}",
+                            CanonicalFailureClass.VALIDATION_FAILED,
+                            self.display_command,
+                        )
+                    except Exception as exc:
+                        detail = " ".join(str(exc).split())[:240]
+                        reason = f"Local reasoning serving process failed to start: {type(exc).__name__}"
+                        if detail:
+                            reason += f": {detail}"
+                        readiness = LocalReasoningReadiness(
+                            CapabilityHealth.UNAVAILABLE,
+                            reason,
+                            CanonicalFailureClass.UNKNOWN_FATAL,
+                            self.display_command,
+                        )
+                    else:
+                        readiness = LocalReasoningReadiness(
+                            CapabilityHealth.AVAILABLE,
+                            "Local reasoning runtime passed its readiness probe",
+                            runtime_command=self.display_command,
+                        )
+            with self._state_lock:
+                self._readiness = readiness
+                self._initialized = True
+                return readiness
 
     def complete(
         self,
@@ -232,17 +266,14 @@ class LocalReasoningAdapter:
             "tools": kwargs.get("tools") or [],
             "max_context_chars": self.max_context_chars,
         }
-        stdout, stderr, returncode = self._run_process(
-            list(self.command),
+        stdout, stderr = self._run_worker(
             json.dumps(request, ensure_ascii=False),
             self.timeout_seconds,
         )
-        if returncode != 0:
-            detail = " ".join(stderr.split())[:240] or f"runtime exited with code {returncode}"
-            lowered = detail.casefold()
+        if stderr:
+            lowered = stderr.casefold()
             if "out of memory" in lowered or "oom" in lowered:
                 raise MemoryError("local reasoning runtime reported out of memory")
-            raise RuntimeError(f"local reasoning runtime crashed: {detail}")
         completion = self._normalize_output(stdout)
         on_delta: Callable[[str], None] | None = kwargs.get("on_delta")
         if on_delta is not None:
@@ -255,12 +286,112 @@ class LocalReasoningAdapter:
         """Stop active processes and prevent future inference calls."""
         with self._state_lock:
             self._closed = True
+            self._readiness = LocalReasoningReadiness(
+                CapabilityHealth.UNAVAILABLE,
+                "Unsupported operation: local reasoning adapter is closed",
+                CanonicalFailureClass.UNSUPPORTED_OPERATION,
+                self.display_command,
+            )
             active = list(self._active)
         for process in active:
+            self._terminate_process(process)
+
+    def _start_worker(self) -> None:
+        """Start and validate the one persistent serving process."""
+        process = subprocess.Popen(
+            [*self.command, "--serve"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        with self._state_lock:
+            if self._closed:
+                self._terminate_process(process)
+                raise RuntimeError("local reasoning adapter is closed")
+            self._worker = process
+            self._active.add(process)
+        line = self._readline_with_timeout(process, self.timeout_seconds)
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as exc:
+            self._terminate_process(process)
+            raise ValueError("serving process returned non-JSON readiness") from exc
+        if not isinstance(payload, dict) or payload.get("ready") is not True:
+            self._terminate_process(process)
+            reason = str(payload.get("reason") or "serving process did not report ready") if isinstance(payload, dict) else "serving process did not report ready"
+            raise ValueError(reason)
+
+    def _run_worker(self, request_text: str, timeout: float) -> tuple[str, str]:
+        """Send one line to the persistent worker while holding the adapter lock."""
+        with self._inference_lock:
+            with self._state_lock:
+                process = self._worker
+                if self._closed:
+                    raise RuntimeError("local reasoning adapter is closed")
+            if process is None or process.poll() is not None or process.stdin is None:
+                raise RuntimeError("local reasoning runtime crashed: serving process is not running")
             try:
-                process.terminate()
-            except OSError:
+                process.stdin.write(request_text + "\n")
+                process.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                self._terminate_process(process)
+                raise RuntimeError("local reasoning runtime crashed: serving process pipe closed") from exc
+            line = self._readline_with_timeout(process, timeout)
+            if not line:
+                stderr = ""
+                if process.stderr is not None:
+                    stderr = process.stderr.read(2000)
+                self._terminate_process(process)
+                detail = " ".join(stderr.split())[:240] or "serving process exited without output"
+                lowered = detail.casefold()
+                if "out of memory" in lowered or "oom" in lowered:
+                    raise MemoryError("local reasoning runtime reported out of memory")
+                if "context" in lowered and any(word in lowered for word in ("limit", "length", "overflow")):
+                    raise ValueError("local reasoning runtime context limit exceeded")
+                raise RuntimeError(f"local reasoning runtime crashed: {detail}")
+            stderr = ""
+            if process.stderr is not None:
+                # Non-blocking stderr consumption is intentionally omitted;
+                # stderr is read only when the worker exits so it cannot block
+                # an otherwise healthy inference call.
+                stderr = ""
+            return line[: self.max_output_chars], stderr
+
+    def _readline_with_timeout(self, process: subprocess.Popen[str], timeout: float) -> str:
+        if process.stdout is None:
+            raise RuntimeError("local reasoning runtime has no stdout pipe")
+        result: queue.Queue[str] = queue.Queue(maxsize=1)
+
+        def read_line() -> None:
+            try:
+                result.put(process.stdout.readline())
+            except Exception:
+                result.put("")
+
+        reader = threading.Thread(target=read_line, daemon=True)
+        reader.start()
+        try:
+            return result.get(timeout=timeout)
+        except queue.Empty as exc:
+            self._terminate_process(process)
+            raise TimeoutError("local reasoning runtime timed out") from exc
+
+    def _terminate_process(self, process: subprocess.Popen[str]) -> None:
+        try:
+            process.terminate()
+            process.wait(timeout=0.5)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                process.kill()
+                process.wait(timeout=0.5)
+            except (OSError, subprocess.TimeoutExpired):
                 pass
+        with self._state_lock:
+            self._active.discard(process)
+            if self._worker is process:
+                self._worker = None
 
     def _run_process(
         self,
