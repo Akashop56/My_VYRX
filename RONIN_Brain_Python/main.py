@@ -26,6 +26,13 @@ from core.planner import (
     plan_request_stream,
 )
 from core.capability_lifecycle import bootstrap_application_capabilities
+from core.knowledge.engine import KnowledgeEngine
+from core.knowledge.integration import (
+    ingest_knowledge,
+    ingestion_report_dict,
+    scan_knowledge,
+    scan_report_dict,
+)
 from core.provider_manager import KNOWN_PROVIDERS, ProviderManager
 from core.streaming import (
     MEDIA_TYPE_SSE,
@@ -86,6 +93,8 @@ STATE.add_listener(ACTION_LOG.publish_state)
 MEMORY_ENGINE = MemoryEngine(DATABASE_PATH)
 STATS = StatsTracker(DATABASE_PATH)
 PROVIDER_MANAGER = ProviderManager(PROVIDER_STATE_PATH)
+_KNOWLEDGE_ENGINE_INITIALIZED = False
+
 CTX = BrainContext(
     log=ACTION_LOG,
     state=STATE,
@@ -109,6 +118,18 @@ async def lifespan(_: FastAPI):
     await initialize_database()
     await MEMORY_ENGINE.init()
     await STATS.init()
+    # Exactly one KnowledgeEngine is created by the application lifecycle and
+    # then passed through BrainContext.  The planner only consumes this
+    # instance; it never constructs or initializes one.
+    global _KNOWLEDGE_ENGINE_INITIALIZED
+    if not _KNOWLEDGE_ENGINE_INITIALIZED:
+        _KNOWLEDGE_ENGINE_INITIALIZED = True
+        try:
+            if CTX.knowledge_engine is None:
+                CTX.knowledge_engine = KnowledgeEngine(db_path=DATABASE_PATH)
+        except Exception as exc:
+            CTX.knowledge_engine = None
+            ACTION_LOG.log(f"Local knowledge unavailable: {type(exc).__name__}", "warning")
     # Capability registration belongs to the application lifecycle.  The
     # planner receives this active registry and only queries it per request.
     bootstrap_application_capabilities(
@@ -116,6 +137,7 @@ async def lifespan(_: FastAPI):
         PROVIDER_MANAGER,
         available_tools=get_available_tools(),
         device_tools=device_tool_schemas(),
+        knowledge_engine=CTX.knowledge_engine,
     )
     ACTION_LOG.log("VYRX Brain online", "success")
     ACTION_LOG.log(f"Core engine v{BRAIN_VERSION} ready", "info")
@@ -343,6 +365,34 @@ async def api_health() -> dict:
         "memory_db_bytes": db_bytes,
         "python": sys.version.split()[0],
     }
+
+
+@app.post("/admin/knowledge/scan")
+async def admin_knowledge_scan() -> dict:
+    """Run one deterministic knowledge scan; never exposed as a ReAct tool."""
+    engine = CTX.knowledge_engine
+    if engine is None:
+        raise HTTPException(503, "Local knowledge is unavailable")
+    try:
+        report = await asyncio.to_thread(scan_knowledge, engine)
+    except Exception as exc:
+        ACTION_LOG.log(f"Knowledge scan failed: {type(exc).__name__}", "error")
+        raise HTTPException(503, "Local knowledge scan failed") from exc
+    return {"status": "ok", "report": scan_report_dict(report)}
+
+
+@app.post("/admin/knowledge/ingest")
+async def admin_knowledge_ingest() -> dict:
+    """Run one deterministic knowledge ingestion pass from the admin surface."""
+    engine = CTX.knowledge_engine
+    if engine is None:
+        raise HTTPException(503, "Local knowledge is unavailable")
+    try:
+        report = await asyncio.to_thread(ingest_knowledge, engine)
+    except Exception as exc:
+        ACTION_LOG.log(f"Knowledge ingestion failed: {type(exc).__name__}", "error")
+        raise HTTPException(503, "Local knowledge ingestion failed") from exc
+    return {"status": "ok", "report": ingestion_report_dict(report)}
 
 
 @app.get("/api/action_logs")

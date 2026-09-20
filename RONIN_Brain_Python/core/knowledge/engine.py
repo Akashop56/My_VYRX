@@ -18,6 +18,7 @@ from typing import Any
 
 from core.knowledge.chunking import Chunk, ChunkingConfig, iter_chunks
 from core.knowledge.embeddings import EmbeddingAdapter, normalize_embedding_result
+from core.capabilities import CapabilityHealth
 from core.knowledge.models import (
     ChangeKind,
     FileObservation,
@@ -636,6 +637,25 @@ class KnowledgeEngine:
         return results
 
     # -- inspection / lifecycle ------------------------------------------
+
+    def health_status(self) -> CapabilityHealth:
+        """Return the startup health of the lexical storage substrate.
+
+        This is intentionally a read-only SQLite probe.  It does not ingest,
+        change the schema, or perform a search, so lifecycle health discovery
+        cannot change the Phase 9 indexing behavior.  A healthy database is
+        available; a usable connection with a non-healthy integrity result is
+        degraded; operational SQLite/connection failures are unavailable.
+        """
+        with self._lock:
+            try:
+                quick_check = self._db.execute("PRAGMA quick_check").fetchone()
+                if not quick_check or str(quick_check[0]).casefold() != "ok":
+                    return CapabilityHealth.DEGRADED
+                self._db.execute("SELECT 1 FROM knowledge_chunks_fts LIMIT 1").fetchone()
+                return CapabilityHealth.AVAILABLE
+            except (sqlite3.Error, OSError):
+                return CapabilityHealth.UNAVAILABLE
 
     def file_metadata(self, relative_path: str) -> dict[str, Any] | None:
         with self._lock:

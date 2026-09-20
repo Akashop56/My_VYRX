@@ -57,6 +57,12 @@ from core.execution_boundary import (
     execute_search_boundary,
     execute_tool_boundary,
 )
+from core.knowledge.engine import KnowledgeEngine
+from core.knowledge.integration import (
+    KNOWLEDGE_CAPABILITY_ID,
+    KNOWLEDGE_TOOL_NAME,
+    knowledge_tool_schema,
+)
 from core.llm_handler import (
     SYSTEM_PROMPT,
     LLMError,
@@ -251,6 +257,7 @@ _CAPABILITY_HEALTH_ORDER = {
 _TOOL_CAPABILITY_TYPES: dict[str, SemanticCapabilityType] = {
     "search": SemanticCapabilityType.WEB_RETRIEVAL,
     "web_search": SemanticCapabilityType.WEB_RETRIEVAL,
+    KNOWLEDGE_TOOL_NAME: SemanticCapabilityType.LOCAL_KNOWLEDGE_SEARCH,
     "save_memory": SemanticCapabilityType.MEMORY_PERSISTENCE,
     "retrieve_memory": SemanticCapabilityType.MEMORY_PERSISTENCE,
     "read_file": SemanticCapabilityType.FILE_SYSTEM_IO,
@@ -314,10 +321,21 @@ def identify_required_capabilities(task: str) -> tuple[CapabilityRequirement, ..
         capability_type=SemanticCapabilityType.REASONING,
     )
 
+    local_knowledge_requested = (
+        "local knowledge" in normalized
+        or "knowledge base" in normalized
+        or "indexed knowledge" in normalized
+        or "knowledge index" in normalized
+        or "search my documents" in normalized
+        or "search local documents" in normalized
+        or "local docs" in normalized
+        or "offline knowledge" in normalized
+    )
+
     if any(token in normalized for token in (
         "current", "latest", "today", "news", "web", "internet", "external",
-        "online", "search", "up-to-date", "up to date",
-    )):
+        "online", "up-to-date", "up to date",
+    )) or ("search" in normalized and not local_knowledge_requested):
         _add_capability_requirement(
             requirements,
             sub_goal_id="subgoal-web-retrieval",
@@ -326,7 +344,7 @@ def identify_required_capabilities(task: str) -> tuple[CapabilityRequirement, ..
             requires_internet=True,
         )
 
-    if any(token in normalized for token in (
+    if not local_knowledge_requested and any(token in normalized for token in (
         "file", "files", "project", "codebase", "repository", "repo", "folder",
         "directory", "path", "local", "workspace",
     )):
@@ -338,7 +356,7 @@ def identify_required_capabilities(task: str) -> tuple[CapabilityRequirement, ..
             requires_local=True,
         )
 
-    if "local knowledge" in normalized or "knowledge base" in normalized:
+    if local_knowledge_requested:
         _add_capability_requirement(
             requirements,
             sub_goal_id="subgoal-local-knowledge",
@@ -765,6 +783,9 @@ class BrainContext:
     # The application owns registration/bootstrap during its lifespan.  The
     # planner receives this registry as read/write health state only.
     capability_registry: CapabilityRegistry = field(default_factory=CapabilityRegistry)
+    # The application creates this once during its lifespan.  The planner
+    # receives the established instance and never constructs or initializes it.
+    knowledge_engine: KnowledgeEngine | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -929,14 +950,24 @@ def _execute_llm_request(message: str, history: list, providers: list,
     return execute_llm_boundary(message, history, providers, **kwargs)
 
 
-def _execute_tool_request(tool_name: str, arguments: dict[str, Any]) -> ExecutionResult:
-    """Run a Brain tool through its normalized execution boundary.
+def _execute_tool_request(
+    tool_name: str,
+    arguments: dict[str, Any],
+    ctx: BrainContext | None = None,
+) -> ExecutionResult:
+    """Run a Brain tool through the existing normalized execution boundary.
 
-    As with :func:`_execute_llm_request`, the compatibility branch is only for
-    callers that replace the old planner-local ``execute_tool`` seam.  It is
-    normalized before it reaches the ReAct interpreter below.
+    ``search_local_knowledge`` is the one context-bound server tool: its
+    callable closes over the lifecycle-owned engine from ``BrainContext``.
+    The boundary still owns exception capture, canonical classification, and
+    diagnostic retention.  No global engine or planner-created engine exists.
     """
-    if execute_tool_boundary is not _ORIGINAL_EXECUTE_TOOL_BOUNDARY:
+    if tool_name == KNOWLEDGE_TOOL_NAME and execute_tool_boundary is not _ORIGINAL_EXECUTE_TOOL_BOUNDARY:
+        # Preserve the established planner test/injection seam.
+        result = execute_tool_boundary(tool_name, arguments)
+    elif tool_name == KNOWLEDGE_TOOL_NAME:
+        result = execute_tool_boundary(tool_name, arguments, context=ctx)
+    elif execute_tool_boundary is not _ORIGINAL_EXECUTE_TOOL_BOUNDARY:
         result = execute_tool_boundary(tool_name, arguments)
     elif execute_tool is not _ORIGINAL_EXECUTE_TOOL:
         result = execute_boundary(execute_tool, tool_name, arguments)
@@ -1147,6 +1178,21 @@ _REASONING_META_CAP_ID = "reasoning-request"
 def _get_registry(ctx: BrainContext) -> CapabilityRegistry | None:
     """Get the capability registry from context, or None if unavailable."""
     return getattr(ctx, "capability_registry", None)
+
+
+def _knowledge_tool_is_selectable(ctx: BrainContext) -> bool:
+    """Return whether lifecycle health permits the read-only local tool."""
+    engine = getattr(ctx, "knowledge_engine", None)
+    registry = _get_registry(ctx)
+    descriptor = registry.get(KNOWLEDGE_CAPABILITY_ID) if registry is not None else None
+    return bool(
+        engine is not None
+        and descriptor is not None
+        and descriptor.health in {
+            CapabilityHealth.AVAILABLE,
+            CapabilityHealth.DEGRADED,
+        }
+    )
 
 
 def _sort_providers_by_health(
@@ -1500,6 +1546,8 @@ async def _run_llm_unchecked(request: AskRequest, ctx: BrainContext) -> AskRespo
             if tool.get("function", {}).get("name") not in HIDDEN_LEGACY_TOOLS
         ]
         server_tools = _filter_tools(server_tools, _enabled_map(request))
+        if _knowledge_tool_is_selectable(ctx):
+            server_tools.append(knowledge_tool_schema())
         device_tools = _filter_tools(device_tool_schemas(), _enabled_map(request))
         available_tools = server_tools + device_tools
     else:
@@ -1784,7 +1832,7 @@ async def _react_loop(
                        label=f"Executing {tool_name} in the Brain")
             tool_started = time.monotonic()
             exec_result = await asyncio.to_thread(
-                _execute_tool_request, tool_name, arguments,
+                _execute_tool_request, tool_name, arguments, ctx,
             )
             tool_ms = exec_result.elapsed_ms or int((time.monotonic() - tool_started) * 1000)
             result_text, tool_ok = _tool_execution_observation(tool_name, exec_result)

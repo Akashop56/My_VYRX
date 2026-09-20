@@ -204,6 +204,9 @@ def _classify_tool_error(error_message: str) -> tuple[CanonicalFailureClass, Dia
 def execute_tool_boundary(
     tool_name: str,
     arguments: dict[str, Any] | str,
+    *,
+    context: Any | None = None,
+    executor: Callable[[str, dict[str, Any] | str], Any] | None = None,
 ) -> ExecutionResult:
     """Execute a brain tool and normalize the result.
 
@@ -220,6 +223,12 @@ def execute_tool_boundary(
         The registered tool function name (e.g. ``"search"``, ``"read_file"``).
     arguments:
         Tool arguments as a dict (or JSON string, handled by ``execute_tool``).
+    context:
+        Optional execution context. The local knowledge tool uses its
+        lifecycle-owned ``knowledge_engine`` from this object.
+    executor:
+        Optional context-bound callable. When supplied it is invoked instead of
+        the global tool registry while the same normalization path is used.
 
     Returns
     -------
@@ -232,9 +241,23 @@ def execute_tool_boundary(
         no partial-data path in the current tool registry).
         On unexpected exception (defensive): classified failure with stack trace.
     """
+    if executor is None and context is not None and tool_name == "search_local_knowledge":
+        # Keep the boundary generic for the existing registry while allowing
+        # the one context-bound local tool to use the lifecycle-owned engine.
+        # The import is local so execution_boundary remains independent of the
+        # planner and avoids an integration import cycle at module load time.
+        from core.knowledge.integration import execute_knowledge_search
+        executor = lambda name, payload: execute_knowledge_search(
+            getattr(context, "knowledge_engine", None), payload,
+        )
+
     started = time.monotonic()
     try:
-        result_text = _execute_tool(tool_name, arguments)
+        result_text = (
+            executor(tool_name, arguments)
+            if executor is not None
+            else _execute_tool(tool_name, arguments)
+        )
         elapsed_ms = int((time.monotonic() - started) * 1000)
 
         # Tools may return {"error": "..."} without raising.
