@@ -891,8 +891,20 @@ class KnowledgeEngine:
         return self._search_lexical(query, limit)
 
     def semantic_health_status(self) -> CapabilityHealth:
-        """Report semantic backend availability without affecting lexical health."""
-        return CapabilityHealth.AVAILABLE if self.embedding_adapter is not None else CapabilityHealth.UNAVAILABLE
+        """Report semantic backend status without affecting lexical health.
+
+        Adapter presence alone is not proof that the backend can serve a
+        vector. Adapters may expose an ``available`` readiness flag; otherwise
+        semantic readiness remains UNKNOWN until an embedding request succeeds.
+        """
+        if self.embedding_adapter is None:
+            return CapabilityHealth.UNAVAILABLE
+        available = getattr(self.embedding_adapter, "available", None)
+        if available is False:
+            return CapabilityHealth.UNAVAILABLE
+        if available is True:
+            return CapabilityHealth.AVAILABLE
+        return CapabilityHealth.UNKNOWN
 
     # -- inspection / lifecycle ------------------------------------------
 

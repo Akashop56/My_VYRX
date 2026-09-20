@@ -43,6 +43,7 @@ class NullEmbeddingAdapter:
     adapter_name: str = "none"
     model_name: str | None = None
     embedding_version: str = "none"
+    available: bool = False
 
     def embed(self, text: str) -> EmbeddingResult:
         raise RuntimeError("semantic embedding backend is unavailable")
