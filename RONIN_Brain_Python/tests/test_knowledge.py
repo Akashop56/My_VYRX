@@ -176,8 +176,10 @@ class KnowledgeEngineTests(unittest.TestCase):
     def test_failure_recording_error_does_not_abort_later_files(self):
         bad = self.root / "broken.json"
         good = self.root / "valid.txt"
+        third = self.root / "third.txt"
         bad.write_text("{ not valid json", encoding="utf-8")
         good.write_text("valid file continues", encoding="utf-8")
+        third.write_text("third file continues", encoding="utf-8")
         engine = self.engine()
 
         with patch.object(
@@ -189,6 +191,7 @@ class KnowledgeEngineTests(unittest.TestCase):
 
         self.assertIn("broken.json", {item.path for item in report.failed})
         self.assertIn("valid.txt", {item.path for item in report.indexed})
+        self.assertIn("third.txt", {item.path for item in report.indexed})
         engine.close()
 
     def test_directory_traversal_error_does_not_become_mass_deletion(self):

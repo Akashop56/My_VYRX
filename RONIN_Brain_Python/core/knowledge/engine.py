@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import heapq
 import json
+import logging
 import math
 import os
 import re
@@ -40,6 +41,7 @@ from memory.db_manager import DATABASE_PATH as DEFAULT_DATABASE_PATH
 
 _HASH_READ_SIZE = 1024 * 1024
 _DEFAULT_ROOT = Path(__file__).resolve().parents[2] / "brain"
+_LOGGER = logging.getLogger(__name__)
 
 
 class SourceChangedError(RuntimeError):
@@ -372,10 +374,17 @@ class KnowledgeEngine:
                         parser_name=getattr(parser, "name", None),
                         error=error,
                     )
-                except Exception:
+                except Exception as record_error:
                     # Failure recording is deliberately best-effort. A locked
-                    # database must not prevent later files in this sweep.
-                    pass
+                    # database must not prevent later files in this sweep, but
+                    # the secondary failure remains available to internal logs.
+                    _LOGGER.warning(
+                        "Knowledge failure status could not be recorded for %s "
+                        "(original=%s, recording=%s)",
+                        observation.path,
+                        error,
+                        _safe_error(record_error),
+                    )
                 results.append(IngestionFileResult(
                     observation.path,
                     IngestionStatus.FAILED,

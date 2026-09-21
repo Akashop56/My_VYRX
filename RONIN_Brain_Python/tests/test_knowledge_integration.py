@@ -20,6 +20,7 @@ from core.capabilities import (
 from core.capability_lifecycle import bootstrap_application_capabilities
 from core.execution_boundary import execute_tool_boundary
 from core.knowledge.engine import KnowledgeEngine
+from core.knowledge.parsers import ParsedUnit, ParserRegistry
 from core.knowledge.integration import (
     KNOWLEDGE_CAPABILITY_ID,
     KNOWLEDGE_TOOL_NAME,
@@ -73,19 +74,53 @@ class KnowledgeIntegrationTests(unittest.TestCase):
             capability_registry=self.registry,
         )
 
-    def test_application_lifespan_recreates_engine_after_clean_shutdown(self):
+    def test_application_lifespan_stops_watcher_before_closing_engine(self):
         import main
+
+        events: list[str] = []
 
         class FakeEngine:
             root = Path("/tmp/fake-knowledge")
 
-        calls = []
+            def __init__(self) -> None:
+                self.close_calls = 0
+
+            def scan(self):
+                return None
+
+            def ingest(self, scan):
+                return None
+
+            def close(self) -> None:
+                self.close_calls += 1
+                events.append("engine-close")
+
+        class FakeWatcher:
+            def __init__(self, engine, **kwargs) -> None:
+                self.engine = engine
+
+            def start(self):
+                events.append("watcher-start")
+
+            async def stop(self) -> None:
+                events.append("watcher-stop")
+
+        engines: list[FakeEngine] = []
         original_engine = main.CTX.knowledge_engine
+        original_watcher = main.CTX.knowledge_watcher
         original_initialized = main._KNOWLEDGE_ENGINE_INITIALIZED
         try:
             main.CTX.knowledge_engine = None
+            main.CTX.knowledge_watcher = None
             main._KNOWLEDGE_ENGINE_INITIALIZED = False
-            with patch.object(main, "KnowledgeEngine", side_effect=lambda **kwargs: calls.append(kwargs) or FakeEngine()), \
+
+            def make_engine(**kwargs):
+                engine = FakeEngine()
+                engines.append(engine)
+                return engine
+
+            with patch.object(main, "KnowledgeEngine", side_effect=make_engine), \
+                    patch.object(main, "KnowledgeIngestionWatcher", FakeWatcher), \
                     patch.object(main, "initialize_database", new=AsyncMock()), \
                     patch.object(main.MEMORY_ENGINE, "init", new=AsyncMock()), \
                     patch.object(main.STATS, "init", new=AsyncMock()), \
@@ -93,14 +128,16 @@ class KnowledgeIntegrationTests(unittest.TestCase):
                 async def exercise():
                     async with main.lifespan(main.app):
                         pass
-                    async with main.lifespan(main.app):
-                        pass
 
                 asyncio.run(exercise())
-            self.assertEqual(len(calls), 2)
+
+            self.assertEqual(events, ["watcher-start", "watcher-stop", "engine-close"])
+            self.assertEqual(len(engines), 1)
+            self.assertEqual(engines[0].close_calls, 1)
             self.assertIsNone(main.CTX.knowledge_engine)
         finally:
             main.CTX.knowledge_engine = original_engine
+            main.CTX.knowledge_watcher = original_watcher
             main._KNOWLEDGE_ENGINE_INITIALIZED = original_initialized
 
     def test_lifecycle_registers_one_local_descriptor_and_health(self):
@@ -200,6 +237,44 @@ class KnowledgeIntegrationTests(unittest.TestCase):
         self.assertNotIn("absolute_path", first_scan["observations"][0])
         ingestion = self.engine.ingest(scan)
         self.assertEqual(ingestion_report_dict(ingestion), ingestion_report_dict(ingestion))
+
+    def test_reader_remains_usable_during_real_background_writer(self):
+        class BlockingParser:
+            name = "blocking-test"
+
+            def __init__(self) -> None:
+                self.started = threading.Event()
+                self.release = threading.Event()
+
+            def parse(self, path: Path, *, read_size: int = 65536):
+                self.started.set()
+                self.release.wait(timeout=2)
+                yield ParsedUnit("real reader writer overlap", 0, 26, 1, 1)
+
+        async def exercise() -> None:
+            source = self.root / "overlap.md"
+            source.write_text("source", encoding="utf-8")
+            parser = BlockingParser()
+            self.engine.parsers = ParserRegistry({".md": parser})
+            scan = self.engine.scan()
+
+            ingestion = asyncio.create_task(asyncio.to_thread(self.engine.ingest, scan))
+            self.assertTrue(await asyncio.to_thread(parser.started.wait, 1))
+
+            # This is the real KnowledgeEngine reader connection while the
+            # writer connection holds BEGIN IMMEDIATE inside _index_one().
+            during_write = await asyncio.to_thread(
+                self.engine.search,
+                "real reader writer overlap",
+            )
+            self.assertEqual(during_write, [])
+
+            parser.release.set()
+            report = await ingestion
+            self.assertEqual(len(report.indexed), 1)
+            self.assertTrue(self.engine.search("real reader writer overlap"))
+
+        asyncio.run(exercise())
 
     def test_sqlite_storage_coexists_with_concurrent_memory_style_writes(self):
         # Use the same SQLite file and WAL connection model as the existing
