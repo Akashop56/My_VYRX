@@ -104,6 +104,18 @@ class KnowledgeEngine:
         self._db.execute("PRAGMA synchronous = NORMAL")
         self._db.execute("PRAGMA busy_timeout = 5000")
         self._initialize_schema()
+        # A separate read connection lets foreground FTS/vector queries use
+        # SQLite WAL snapshots while the writer connection ingests a file.
+        self._read_db = sqlite3.connect(
+            str(self.db_path),
+            check_same_thread=False,
+            isolation_level=None,
+        )
+        self._read_db.row_factory = sqlite3.Row
+        self._read_db.execute("PRAGMA foreign_keys = ON")
+        self._read_db.execute("PRAGMA journal_mode = WAL")
+        self._read_db.execute("PRAGMA busy_timeout = 5000")
+        self._read_lock = threading.Lock()
 
     def _initialize_schema(self) -> None:
         with self._lock:
@@ -740,8 +752,8 @@ class KnowledgeEngine:
         fts_query = self._fts_query(query)
         if not fts_query:
             return []
-        with self._lock:
-            rows = self._db.execute(
+        with self._read_lock:
+            rows = self._read_db.execute(
                 """SELECT c.id, c.content, c.file_path, c.char_start,
                           c.char_end, c.line_start, c.line_end, c.source_kind,
                           bm25(knowledge_chunks_fts) AS score
@@ -783,8 +795,8 @@ class KnowledgeEngine:
             return []
         adapter_name, model_name, embedding_version = signature
         candidates: list[tuple[float, int, sqlite3.Row]] = []
-        with self._lock:
-            cursor = self._db.execute(
+        with self._read_lock:
+            cursor = self._read_db.execute(
                 """SELECT c.id, c.content, c.file_path, c.char_start,
                           c.char_end, c.line_start, c.line_end, c.source_kind,
                           em.vector_json
@@ -954,6 +966,8 @@ class KnowledgeEngine:
     def close(self) -> None:
         with self._lock:
             self._db.close()
+        with self._read_lock:
+            self._read_db.close()
 
     def __enter__(self) -> "KnowledgeEngine":
         return self

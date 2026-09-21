@@ -28,6 +28,7 @@ from core.planner import (
 from core.capability_lifecycle import bootstrap_application_capabilities
 from core.local_reasoning import LocalReasoningAdapter
 from core.knowledge.engine import KnowledgeEngine
+from core.knowledge.watcher import KnowledgeIngestionWatcher
 from core.knowledge.integration import (
     ingest_knowledge,
     ingestion_report_dict,
@@ -146,11 +147,38 @@ async def lifespan(_: FastAPI):
         knowledge_engine=CTX.knowledge_engine,
         local_reasoning=CTX.local_reasoning,
     )
+    if (
+        CTX.knowledge_engine is not None
+        and CTX.knowledge_watcher is None
+        and hasattr(CTX.knowledge_engine, "scan")
+        and hasattr(CTX.knowledge_engine, "ingest")
+    ):
+        try:
+            CTX.knowledge_watcher = KnowledgeIngestionWatcher(
+                CTX.knowledge_engine,
+                log=ACTION_LOG.log,
+            )
+            CTX.knowledge_watcher.start()
+        except Exception as exc:
+            CTX.knowledge_watcher = None
+            ACTION_LOG.log(
+                f"Knowledge background watcher unavailable: {type(exc).__name__}",
+                "warning",
+            )
     ACTION_LOG.log("VYRX Brain online", "success")
     ACTION_LOG.log(f"Core engine v{BRAIN_VERSION} ready", "info")
     try:
         yield
     finally:
+        if CTX.knowledge_watcher is not None:
+            try:
+                await CTX.knowledge_watcher.stop()
+            except Exception as exc:
+                ACTION_LOG.log(
+                    f"Knowledge background watcher shutdown failed: {type(exc).__name__}",
+                    "warning",
+                )
+            CTX.knowledge_watcher = None
         # The adapter owns no persistent model in this environment, but it can
         # still have an active subprocess. Shutdown is explicit and safe.
         if CTX.local_reasoning is not None:

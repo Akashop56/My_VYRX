@@ -63,6 +63,7 @@ from core.knowledge.integration import (
     KNOWLEDGE_TOOL_NAME,
     knowledge_tool_schema,
 )
+from core.knowledge.watcher import KnowledgeIngestionWatcher
 from core.local_reasoning import LOCAL_REASONING_CAPABILITY_ID, LocalReasoningAdapter
 from core.llm_handler import (
     SYSTEM_PROMPT,
@@ -994,6 +995,9 @@ class BrainContext:
     # The application creates this once during its lifespan.  The planner
     # receives the established instance and never constructs or initializes it.
     knowledge_engine: KnowledgeEngine | None = None
+    # The application lifecycle owns this optional periodic scanner. The
+    # planner does not start, stop, or call it.
+    knowledge_watcher: KnowledgeIngestionWatcher | None = None
     # The application lifecycle may establish one serialized local reasoning
     # adapter. The planner only consumes it when the capability plan selects
     # its registry candidate.

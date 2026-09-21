@@ -34,6 +34,7 @@ from core.knowledge.parsers import (
     UnsupportedFormatError,
     default_parser_registry,
 )
+from core.knowledge.watcher import IngestionWatcherConfig, KnowledgeIngestionWatcher
 
 __all__ = [
     "ChangeKind",
@@ -42,6 +43,8 @@ __all__ = [
     "EmbeddingAdapter",
     "EmbeddingResult",
     "FileObservation",
+    "IngestionWatcherConfig",
+    "KnowledgeIngestionWatcher",
     "IngestionReport",
     "IngestionStatus",
     "KnowledgeEngine",
