@@ -26,6 +26,17 @@ class FakeEngine:
         return {"ingested": scan}
 
 
+class GateSleep:
+    def __init__(self) -> None:
+        self.calls: list[float] = []
+        self.gate = asyncio.Event()
+
+    async def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+        await self.gate.wait()
+        self.gate.clear()
+
+
 class ConcurrentFakeEngine(FakeEngine):
     def __init__(self) -> None:
         super().__init__()
@@ -56,7 +67,9 @@ class KnowledgeWatcherTests(unittest.IsolatedAsyncioTestCase):
         )
 
         task = watcher.start()
-        await asyncio.sleep(0.02)
+        duplicate = watcher.start()
+        await asyncio.sleep(0)
+        self.assertIs(task, duplicate)
         self.assertTrue(watcher.running)
         await watcher.stop()
 
@@ -65,37 +78,60 @@ class KnowledgeWatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_periodic_execution_triggers_scan_and_ingest(self):
         engine = FakeEngine()
+        sleeper = GateSleep()
         watcher = KnowledgeIngestionWatcher(
             engine,
-            config=IngestionWatcherConfig(interval_seconds=0.01),
+            config=IngestionWatcherConfig(interval_seconds=300),
+            sleep=sleeper,
         )
 
         watcher.start()
-        await asyncio.sleep(0.055)
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if len(sleeper.calls) >= 1:
+                break
+        self.assertEqual(engine.scan_calls, 1)
+        self.assertEqual(engine.ingest_calls, 1)
+        sleeper.gate.set()
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if len(sleeper.calls) >= 2:
+                break
+        self.assertEqual(engine.scan_calls, 2)
+        self.assertEqual(engine.ingest_calls, 2)
+        sleeper.gate.set()
         await watcher.stop()
-
-        self.assertGreaterEqual(engine.scan_calls, 2)
-        self.assertEqual(engine.scan_calls, engine.ingest_calls)
         self.assertGreaterEqual(watcher.sweeps_completed, 2)
 
     async def test_fault_is_logged_and_loop_survives_next_cycle(self):
         engine = FakeEngine()
         engine.fail_scan_once = True
+        sleeper = GateSleep()
         logs: list[tuple[str, str]] = []
         watcher = KnowledgeIngestionWatcher(
             engine,
-            config=IngestionWatcherConfig(interval_seconds=0.01),
+            config=IngestionWatcherConfig(interval_seconds=300),
             log=lambda message, level: logs.append((message, level)),
+            sleep=sleeper,
         )
 
         watcher.start()
-        await asyncio.sleep(0.055)
-        self.assertTrue(watcher.running)
-        await watcher.stop()
-
-        self.assertGreaterEqual(engine.scan_calls, 2)
-        self.assertGreaterEqual(engine.ingest_calls, 1)
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if len(sleeper.calls) >= 1:
+                break
+        self.assertEqual(engine.scan_calls, 1)
+        self.assertEqual(engine.ingest_calls, 0)
+        sleeper.gate.set()
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if len(sleeper.calls) >= 2:
+                break
+        self.assertEqual(engine.scan_calls, 2)
+        self.assertEqual(engine.ingest_calls, 1)
         self.assertTrue(any(level == "warning" for _, level in logs))
+        sleeper.gate.set()
+        await watcher.stop()
         self.assertGreaterEqual(watcher.sweeps_completed, 1)
 
     async def test_foreground_read_can_run_during_background_write(self):
@@ -113,6 +149,16 @@ class KnowledgeWatcherTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, ["foreground query"])
         self.assertTrue(engine.read_during_write)
+        await watcher.stop()
+
+    async def test_disabled_configuration_creates_no_task(self):
+        watcher = KnowledgeIngestionWatcher(
+            FakeEngine(),
+            config=IngestionWatcherConfig(enabled=False, interval_seconds=300),
+        )
+
+        self.assertIsNone(watcher.start())
+        self.assertFalse(watcher.running)
         await watcher.stop()
 
     async def test_run_once_fault_does_not_escape_to_caller(self):

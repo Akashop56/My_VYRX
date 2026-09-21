@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any, Awaitable, Callable
 
 from core.knowledge.engine import KnowledgeEngine
 
@@ -13,6 +16,7 @@ from core.knowledge.engine import KnowledgeEngine
 class IngestionWatcherConfig:
     """Bounded polling configuration for the application-owned watcher."""
 
+    enabled: bool = True
     interval_seconds: float = 300.0
 
     def __post_init__(self) -> None:
@@ -20,13 +24,34 @@ class IngestionWatcherConfig:
             raise ValueError("interval_seconds must be positive")
 
     @classmethod
-    def from_environment(cls) -> "IngestionWatcherConfig":
-        raw = os.getenv("VYRX_KNOWLEDGE_WATCH_INTERVAL_SECONDS", "300")
+    def from_environment(cls, settings_path: str | Path | None = None) -> "IngestionWatcherConfig":
+        """Read settings JSON first, with environment variables as overrides."""
+        values: dict[str, Any] = {}
+        path = Path(settings_path) if settings_path else Path(__file__).resolve().parents[2] / "config" / "settings.json"
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                values = loaded
+        except (OSError, ValueError):
+            pass
+
+        enabled_value: Any = os.getenv(
+            "VYRX_KNOWLEDGE_BACKGROUND_WATCH_ENABLED",
+            values.get("knowledge_background_watch_enabled", True),
+        )
+        if isinstance(enabled_value, str):
+            enabled = enabled_value.strip().casefold() not in {"0", "false", "off", "no"}
+        else:
+            enabled = bool(enabled_value)
+        raw = os.getenv(
+            "VYRX_KNOWLEDGE_WATCH_INTERVAL_SECONDS",
+            values.get("knowledge_background_watch_interval_seconds", 300),
+        )
         try:
             interval = float(raw)
         except (TypeError, ValueError):
             interval = 300.0
-        return cls(max(1.0, interval))
+        return cls(enabled=enabled, interval_seconds=max(1.0, interval))
 
 
 class KnowledgeIngestionWatcher:
@@ -44,10 +69,12 @@ class KnowledgeIngestionWatcher:
         *,
         config: IngestionWatcherConfig | None = None,
         log: Callable[[str, str], Any] | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
         self.engine = engine
         self.config = config or IngestionWatcherConfig.from_environment()
         self._log = log or (lambda message, level="info": None)
+        self._sleep = sleep or asyncio.sleep
         self._task: asyncio.Task[None] | None = None
         self._sweep_lock = asyncio.Lock()
         self._inflight: set[asyncio.Task[Any]] = set()
@@ -59,11 +86,17 @@ class KnowledgeIngestionWatcher:
     def running(self) -> bool:
         return self._task is not None and not self._task.done()
 
-    def start(self) -> asyncio.Task[None]:
+    def start(self) -> asyncio.Task[None] | None:
         """Start exactly one task on the currently running event loop."""
+        if not self.config.enabled:
+            return None
         if self.running:
-            return self._task  # type: ignore[return-value]
+            return self._task
         self._stopping = False
+        self._safe_log(
+            f"Knowledge watcher started (interval={self.config.interval_seconds:g}s)",
+            "info",
+        )
         self._task = asyncio.create_task(
             self._run(),
             name="vyrx-knowledge-ingestion",
@@ -82,37 +115,69 @@ class KnowledgeIngestionWatcher:
                 pass
         await self._drain_inflight()
         self._task = None
+        self._safe_log("Knowledge watcher stopped", "info")
+
+    def _safe_log(self, message: str, level: str = "info") -> None:
+        try:
+            self._log(message, level)
+        except Exception:
+            pass
 
     async def run_once(self) -> bool:
         """Run one isolated scan/ingest cycle; return whether it succeeded."""
         async with self._sweep_lock:
+            started = time.monotonic()
+            self._safe_log("Knowledge background sweep started", "info")
             try:
                 scan = await self._call_blocking(self.engine.scan)
+                observations = getattr(scan, "observations", ())
+                deleted = getattr(scan, "deleted", ())
+                changed = sum(
+                    1 for item in (*observations, *deleted)
+                    if getattr(getattr(item, "change", None), "value", None) != "unchanged"
+                )
                 # Yield between discovery and ingestion even when the scan is
                 # small, so callers can service pending chat/stream events.
                 await asyncio.sleep(0)
-                await self._call_blocking(self.engine.ingest, scan)
+                report = await self._call_blocking(self.engine.ingest, scan)
+                files = getattr(report, "files", ())
+                indexed = sum(
+                    1 for item in files
+                    if getattr(getattr(item, "status", None), "value", None) == "indexed"
+                )
+                failed = sum(
+                    1 for item in files
+                    if getattr(getattr(item, "status", None), "value", None) == "failed"
+                )
                 await asyncio.sleep(0)
                 self.sweeps_completed += 1
                 self.last_error = None
+                duration_ms = int((time.monotonic() - started) * 1000)
+                self._safe_log(
+                    "Knowledge background sweep complete: "
+                    f"discovered={len(observations) + len(deleted)} "
+                    f"changed={changed} indexed={indexed} failed={failed} "
+                    f"duration_ms={duration_ms}",
+                    "info",
+                )
                 return True
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self.last_error = f"{type(exc).__name__}: {' '.join(str(exc).split())[:300]}"
-                try:
-                    self._log(f"Knowledge background sweep failed: {self.last_error}", "warning")
-                except Exception:
-                    # Logging must never turn an ingestion fault into an app
-                    # fault, especially during shutdown.
-                    pass
+                lowered = self.last_error.casefold()
+                level = "warning"
+                prefix = "Knowledge background sweep failed"
+                if "locked" in lowered or "busy" in lowered or "database" in lowered:
+                    prefix = "Knowledge background sweep database contention"
+                self._safe_log(f"{prefix}: {self.last_error}", level)
                 return False
 
     async def _run(self) -> None:
         try:
             while not self._stopping:
                 await self.run_once()
-                await asyncio.sleep(self.config.interval_seconds)
+                await self._sleep(self.config.interval_seconds)
         except asyncio.CancelledError:
             await self._drain_inflight()
             raise
@@ -120,10 +185,10 @@ class KnowledgeIngestionWatcher:
             # This is a final defensive boundary. A watcher crash is never
             # allowed to escape into FastAPI lifespan handling.
             self.last_error = f"{type(exc).__name__}: {' '.join(str(exc).split())[:300]}"
-            try:
-                self._log(f"Knowledge watcher stopped after internal fault: {self.last_error}", "error")
-            except Exception:
-                pass
+            self._safe_log(
+                f"Knowledge watcher stopped after internal fault: {self.last_error}",
+                "error",
+            )
 
     async def _call_blocking(self, function: Callable[..., Any], *args: Any) -> Any:
         """Run synchronous engine work without blocking the asyncio loop."""
@@ -132,7 +197,11 @@ class KnowledgeIngestionWatcher:
         operation.add_done_callback(self._inflight.discard)
         # Shield lets shutdown cancel the watcher while the SQLite operation
         # finishes cleanly; stop() drains the still-running operation below.
-        return await asyncio.shield(operation)
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            await asyncio.shield(operation)
+            raise
 
     async def _drain_inflight(self) -> None:
         pending = tuple(self._inflight)

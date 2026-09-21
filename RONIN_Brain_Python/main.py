@@ -28,7 +28,10 @@ from core.planner import (
 from core.capability_lifecycle import bootstrap_application_capabilities
 from core.local_reasoning import LocalReasoningAdapter
 from core.knowledge.engine import KnowledgeEngine
-from core.knowledge.watcher import KnowledgeIngestionWatcher
+from core.knowledge.watcher import (
+    IngestionWatcherConfig,
+    KnowledgeIngestionWatcher,
+)
 from core.knowledge.integration import (
     ingest_knowledge,
     ingestion_report_dict,
@@ -147,8 +150,10 @@ async def lifespan(_: FastAPI):
         knowledge_engine=CTX.knowledge_engine,
         local_reasoning=CTX.local_reasoning,
     )
+    watcher_config = IngestionWatcherConfig.from_environment()
     if (
-        CTX.knowledge_engine is not None
+        watcher_config.enabled
+        and CTX.knowledge_engine is not None
         and CTX.knowledge_watcher is None
         and hasattr(CTX.knowledge_engine, "scan")
         and hasattr(CTX.knowledge_engine, "ingest")
@@ -156,6 +161,7 @@ async def lifespan(_: FastAPI):
         try:
             CTX.knowledge_watcher = KnowledgeIngestionWatcher(
                 CTX.knowledge_engine,
+                config=watcher_config,
                 log=ACTION_LOG.log,
             )
             CTX.knowledge_watcher.start()
