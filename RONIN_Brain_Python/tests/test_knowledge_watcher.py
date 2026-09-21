@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import unittest
+from unittest.mock import patch
 
 from core.knowledge.watcher import IngestionWatcherConfig, KnowledgeIngestionWatcher
 
@@ -150,6 +151,36 @@ class KnowledgeWatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, ["foreground query"])
         self.assertTrue(engine.read_during_write)
         await watcher.stop()
+
+    async def test_shutdown_bounds_a_hung_worker_and_logs_warning(self):
+        class HangingEngine(FakeEngine):
+            def __init__(self) -> None:
+                super().__init__()
+                self.started = threading.Event()
+                self.release = threading.Event()
+
+            def scan(self):
+                self.started.set()
+                self.release.wait(timeout=2)
+                return super().scan()
+
+        engine = HangingEngine()
+        logs: list[tuple[str, str]] = []
+        watcher = KnowledgeIngestionWatcher(
+            engine,
+            config=IngestionWatcherConfig(interval_seconds=300),
+            log=lambda message, level: logs.append((message, level)),
+        )
+
+        task = watcher.start()
+        await asyncio.to_thread(engine.started.wait, 1)
+        with patch("core.knowledge.watcher._INFLIGHT_DRAIN_TIMEOUT_SECONDS", 0.01):
+            await watcher.stop()
+        engine.release.set()
+
+        self.assertTrue(task.done())
+        self.assertFalse(watcher.running)
+        self.assertTrue(any(level == "warning" for _, level in logs))
 
     async def test_disabled_configuration_creates_no_task(self):
         watcher = KnowledgeIngestionWatcher(

@@ -73,7 +73,7 @@ class KnowledgeIntegrationTests(unittest.TestCase):
             capability_registry=self.registry,
         )
 
-    def test_application_lifespan_constructs_the_engine_once(self):
+    def test_application_lifespan_recreates_engine_after_clean_shutdown(self):
         import main
 
         class FakeEngine:
@@ -97,8 +97,8 @@ class KnowledgeIntegrationTests(unittest.TestCase):
                         pass
 
                 asyncio.run(exercise())
-            self.assertEqual(len(calls), 1)
-            self.assertIsInstance(main.CTX.knowledge_engine, FakeEngine)
+            self.assertEqual(len(calls), 2)
+            self.assertIsNone(main.CTX.knowledge_engine)
         finally:
             main.CTX.knowledge_engine = original_engine
             main._KNOWLEDGE_ENGINE_INITIALIZED = original_initialized

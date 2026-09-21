@@ -187,6 +187,16 @@ async def lifespan(_: FastAPI):
             CTX.knowledge_watcher = None
         # The adapter owns no persistent model in this environment, but it can
         # still have an active subprocess. Shutdown is explicit and safe.
+        if CTX.knowledge_engine is not None:
+            try:
+                CTX.knowledge_engine.close()
+            except Exception as exc:
+                ACTION_LOG.log(
+                    f"Local knowledge shutdown failed: {type(exc).__name__}",
+                    "warning",
+                )
+            CTX.knowledge_engine = None
+        _KNOWLEDGE_ENGINE_INITIALIZED = False
         if CTX.local_reasoning is not None:
             CTX.local_reasoning.close()
         CTX.local_reasoning = None

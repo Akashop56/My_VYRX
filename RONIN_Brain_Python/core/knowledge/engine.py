@@ -204,15 +204,34 @@ class KnowledgeEngine:
         return path.resolve().relative_to(self.root).as_posix()
 
     def _source_paths(self) -> list[Path]:
+        """Return discoverable files or fail the scan on traversal errors.
+
+        An incomplete directory walk must not be mistaken for a clean walk:
+        scan() would otherwise classify every unseen stored path as deleted.
+        File-level stat/hash failures are still handled by scan() below, but
+        directory traversal failures abort this sweep before deletion logic.
+        """
         paths: list[Path] = []
-        try:
-            for path in self.root.rglob("*"):
-                if path.is_file() and not path.is_symlink():
-                    paths.append(path)
-        except OSError:
-            # Individual stat/hash errors are handled below; directory walk
-            # failure simply leaves discoverable entries out of this pass.
-            pass
+
+        def raise_walk_error(error: OSError) -> None:
+            raise error
+
+        for directory, directories, filenames in os.walk(
+            self.root,
+            topdown=True,
+            onerror=raise_walk_error,
+            followlinks=False,
+        ):
+            directories.sort(key=str.casefold)
+            for filename in sorted(filenames, key=str.casefold):
+                path = Path(directory) / filename
+                try:
+                    if path.is_file() and not path.is_symlink():
+                        paths.append(path)
+                except OSError:
+                    # Do not silently omit a path: an incomplete walk must
+                    # never turn into a false deletion during scan().
+                    raise
         return sorted(paths, key=lambda item: item.as_posix().casefold())
 
     def _stored_files(self) -> dict[str, sqlite3.Row]:
@@ -309,29 +328,32 @@ class KnowledgeEngine:
         report = scan or self.scan()
         results: list[IngestionFileResult] = []
         for observation in report.observations:
-            if observation.change == ChangeKind.UNCHANGED:
-                # Source chunks remain unchanged, but a changed embedding
-                # implementation/version must rebuild only their vectors.
-                with self._lock:
-                    if self._embedding_rows_need_refresh(observation.path):
-                        self._refresh_file_embeddings(observation.path)
-                results.append(IngestionFileResult(
-                    observation.path,
-                    IngestionStatus.SKIPPED,
-                    observation.change,
-                ))
-                continue
-            parser = self.parsers.parser_for(Path(observation.path))
-            if parser is None:
-                self._record_unsupported(observation)
-                results.append(IngestionFileResult(
-                    observation.path,
-                    IngestionStatus.UNSUPPORTED,
-                    observation.change,
-                    error="no parser registered for suffix",
-                ))
-                continue
+            parser: Any | None = None
             try:
+                parser = self.parsers.parser_for(Path(observation.path))
+                if observation.change == ChangeKind.UNCHANGED:
+                    # Source chunks remain unchanged, but a changed embedding
+                    # implementation/version must rebuild only their vectors.
+                    with self._lock:
+                        if self._embedding_rows_need_refresh(observation.path):
+                            self._refresh_file_embeddings(observation.path)
+                    results.append(IngestionFileResult(
+                        observation.path,
+                        IngestionStatus.SKIPPED,
+                        observation.change,
+                    ))
+                    continue
+
+                if parser is None:
+                    self._record_unsupported(observation)
+                    results.append(IngestionFileResult(
+                        observation.path,
+                        IngestionStatus.UNSUPPORTED,
+                        observation.change,
+                        error="no parser registered for suffix",
+                    ))
+                    continue
+
                 chunks = self._index_one(observation, parser)
                 results.append(IngestionFileResult(
                     observation.path,
@@ -340,9 +362,20 @@ class KnowledgeEngine:
                     chunks=chunks,
                 ))
             except Exception as exc:
-                # _index_one has rolled back before this status transaction.
+                # Every observation, including parser lookup, status writes,
+                # and unchanged-file embedding refresh, is isolated here.
+                # _index_one has already rolled back before this status path.
                 error = _safe_error(exc)
-                self._record_failure(observation, parser_name=getattr(parser, "name", None), error=error)
+                try:
+                    self._record_failure(
+                        observation,
+                        parser_name=getattr(parser, "name", None),
+                        error=error,
+                    )
+                except Exception:
+                    # Failure recording is deliberately best-effort. A locked
+                    # database must not prevent later files in this sweep.
+                    pass
                 results.append(IngestionFileResult(
                     observation.path,
                     IngestionStatus.FAILED,

@@ -12,6 +12,9 @@ from typing import Any, Awaitable, Callable
 from core.knowledge.engine import KnowledgeEngine
 
 
+_INFLIGHT_DRAIN_TIMEOUT_SECONDS = 5.0
+
+
 @dataclass(frozen=True)
 class IngestionWatcherConfig:
     """Bounded polling configuration for the application-owned watcher."""
@@ -78,6 +81,7 @@ class KnowledgeIngestionWatcher:
         self._task: asyncio.Task[None] | None = None
         self._sweep_lock = asyncio.Lock()
         self._inflight: set[asyncio.Task[Any]] = set()
+        self._timed_out: set[asyncio.Task[Any]] = set()
         self._stopping = False
         self.sweeps_completed = 0
         self.last_error: str | None = None
@@ -194,23 +198,43 @@ class KnowledgeIngestionWatcher:
         """Run synchronous engine work without blocking the asyncio loop."""
         operation = asyncio.create_task(asyncio.to_thread(function, *args))
         self._inflight.add(operation)
-        operation.add_done_callback(self._inflight.discard)
+
+        def forget_operation(done: asyncio.Task[Any]) -> None:
+            self._inflight.discard(done)
+            self._timed_out.discard(done)
+
+        operation.add_done_callback(forget_operation)
         # Shield lets shutdown cancel the watcher while the SQLite operation
-        # finishes cleanly; stop() drains the still-running operation below.
+        # continues independently; _drain_inflight applies the bounded wait.
         try:
             return await asyncio.shield(operation)
         except asyncio.CancelledError:
-            await asyncio.shield(operation)
+            # Do not await the thread here: _run() performs one bounded drain
+            # before propagating cancellation to the lifecycle owner.
             raise
 
     async def _drain_inflight(self) -> None:
-        pending = tuple(self._inflight)
+        pending = tuple(
+            operation for operation in self._inflight
+            if operation not in self._timed_out
+        )
         if not pending:
             return
-        await asyncio.gather(
-            *(asyncio.shield(operation) for operation in pending),
-            return_exceptions=True,
-        )
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    *(asyncio.shield(operation) for operation in pending),
+                    return_exceptions=True,
+                ),
+                timeout=_INFLIGHT_DRAIN_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            self._timed_out.update(pending)
+            self._safe_log(
+                "Knowledge watcher shutdown timed out waiting for "
+                f"{len(pending)} in-flight worker operation(s)",
+                "warning",
+            )
 
 
 __all__ = ["IngestionWatcherConfig", "KnowledgeIngestionWatcher"]

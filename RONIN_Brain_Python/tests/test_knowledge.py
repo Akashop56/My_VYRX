@@ -4,6 +4,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from core.knowledge import (
     ChangeKind,
@@ -171,6 +172,41 @@ class KnowledgeEngineTests(unittest.TestCase):
         # from being indexed.
         self.assertEqual(engine.file_metadata("broken.json")["parser_status"], "failed")
         self.assertTrue(engine.search("replacement"))
+
+    def test_failure_recording_error_does_not_abort_later_files(self):
+        bad = self.root / "broken.json"
+        good = self.root / "valid.txt"
+        bad.write_text("{ not valid json", encoding="utf-8")
+        good.write_text("valid file continues", encoding="utf-8")
+        engine = self.engine()
+
+        with patch.object(
+            engine,
+            "_record_failure",
+            side_effect=RuntimeError("synthetic database locked"),
+        ):
+            report = engine.ingest()
+
+        self.assertIn("broken.json", {item.path for item in report.failed})
+        self.assertIn("valid.txt", {item.path for item in report.indexed})
+        engine.close()
+
+    def test_directory_traversal_error_does_not_become_mass_deletion(self):
+        source = self.root / "stable.txt"
+        source.write_text("stable indexed content", encoding="utf-8")
+        engine = self.engine()
+        engine.ingest()
+
+        with patch(
+            "core.knowledge.engine.os.walk",
+            side_effect=PermissionError("synthetic directory denial"),
+        ):
+            with self.assertRaises(PermissionError):
+                engine.scan()
+
+        self.assertTrue(engine.search("stable"))
+        self.assertIsNotNone(engine.file_metadata("stable.txt"))
+        engine.close()
 
     def test_transaction_rollback_and_recovery_with_midstream_parser_failure(self):
         class FlakyParser:
