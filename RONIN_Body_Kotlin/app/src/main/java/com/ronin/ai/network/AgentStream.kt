@@ -39,14 +39,45 @@ sealed class AgentEvent {
         val args: JSONObject,
         val device: Boolean,
         val thought: String?,
-        val action: AgentAction?
+        val action: AgentAction?,
+        val callId: String? = null,
+        val semanticCapability: String? = null,
+        val locality: String? = null,
+        val sequence: Int = 0
     ) : AgentEvent()
 
     /** The tool came back. [result] is a display-sized digest, not the raw payload. */
-    data class Observation(val step: Int, val tool: String, val ok: Boolean, val ms: Int, val result: String) : AgentEvent()
+    data class Observation(
+        val step: Int,
+        val tool: String,
+        val ok: Boolean,
+        val ms: Int,
+        val result: String,
+        val callId: String? = null,
+        val outcome: String? = null,
+        val requestedMode: String? = null,
+        val retrievalMethod: String? = null,
+        val semanticCapability: String? = null,
+        val locality: String? = null,
+        val sequence: Int = 0
+    ) : AgentEvent()
 
     /** A failure the agent is healing from (Brain's `self_correction` / `reflexion` frame). */
-    data class SelfCorrection(val step: Int, val tool: String?, val reason: String, val strategy: String, val attempt: Int) : AgentEvent()
+    data class SelfCorrection(
+        val step: Int,
+        val tool: String?,
+        val reason: String,
+        val strategy: String,
+        val attempt: Int,
+        val callId: String? = null,
+        val transitionType: String? = null,
+        val semanticCapability: String? = null,
+        val previousCandidate: String? = null,
+        val selectedCandidate: String? = null,
+        val outcome: String? = null,
+        val locality: String? = null,
+        val sequence: Int = 0
+    ) : AgentEvent()
 
     /** A chunk of the final answer — append to the active bubble for the typing effect. */
     data class Token(val index: Int, val text: String) : AgentEvent()
@@ -115,7 +146,11 @@ object AgentEventCodec {
                         action.optString("tool_call_id").takeIf { it.isNotBlank() },
                         action.optString("thought").takeIf { it.isNotBlank() }
                     )
-                }
+                },
+                callId = data.optStringOrNull("call_id"),
+                semanticCapability = data.optStringOrNull("semantic_capability"),
+                locality = data.optStringOrNull("locality"),
+                sequence = data.optInt("seq", 0)
             )
 
             "observation" -> AgentEvent.Observation(
@@ -123,7 +158,14 @@ object AgentEventCodec {
                 tool = data.optString("tool", "?"),
                 ok = data.optBoolean("ok", true),
                 ms = data.optInt("ms", 0),
-                result = data.optString("result", "")
+                result = data.optString("result", ""),
+                callId = data.optStringOrNull("call_id"),
+                outcome = data.optStringOrNull("outcome"),
+                requestedMode = data.optStringOrNull("requested_mode"),
+                retrievalMethod = data.optStringOrNull("retrieval_method"),
+                semanticCapability = data.optStringOrNull("semantic_capability"),
+                locality = data.optStringOrNull("locality"),
+                sequence = data.optInt("seq", 0)
             )
 
             // `reflexion` is the semantic alias the Brain may emit instead.
@@ -132,7 +174,15 @@ object AgentEventCodec {
                 tool = data.optStringOrNull("tool"),
                 reason = data.optString("reason", data.optString("reflexion", "")),
                 strategy = data.optString("strategy", ""),
-                attempt = data.optInt("attempt", 0)
+                attempt = data.optInt("attempt", 0),
+                callId = data.optStringOrNull("call_id"),
+                transitionType = data.optStringOrNull("transition_type"),
+                semanticCapability = data.optStringOrNull("semantic_capability"),
+                previousCandidate = data.optStringOrNull("previous_candidate"),
+                selectedCandidate = data.optStringOrNull("selected_candidate"),
+                outcome = data.optStringOrNull("outcome"),
+                locality = data.optStringOrNull("locality"),
+                sequence = data.optInt("seq", 0)
             )
 
             "token" -> AgentEvent.Token(index = data.optInt("i", 0), text = data.optString("text", ""))

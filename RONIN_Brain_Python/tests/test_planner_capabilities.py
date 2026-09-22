@@ -149,7 +149,7 @@ class CapabilityAwarePlannerTests(unittest.TestCase):
         plan.record_outcome("subgoal-web-retrieval", ExecutionResultForTest.fatal("web-search-a"))
         plan.record_outcome("subgoal-local-files", ExecutionResultForTest.success("local-files-a"))
 
-        self.assertEqual(plan.outcome, ExecutionOutcome.PARTIAL_SUCCESS)
+        self.assertEqual(plan.outcome, ExecutionOutcome.FATAL_FAILURE)
         self.assertEqual(plan.outcomes["subgoal-local-files"], ExecutionOutcome.SUCCESS)
 
     def test_failed_subgoal_can_be_reconsidered_without_replaying_parent(self):

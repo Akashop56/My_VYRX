@@ -82,6 +82,8 @@ data class ChatMessage(
     val streaming: Boolean = false,
     /** The turn's CoT / action log, kept on the bubble so it stays reviewable. */
     val thoughts: List<ThoughtLine> = emptyList(),
+    /** Safe, capability-level activity; no planner objects or raw JSON. */
+    val capabilityEvents: List<CapabilityActivity> = emptyList(),
     val phase: AgentPhase = AgentPhase.IDLE,
     val steps: Int = 0,
     val elapsedMs: Int = 0,
@@ -94,6 +96,35 @@ enum class BrainStatus { CHECKING, STARTING, ONLINE, OFFLINE }
 private fun uiMessageOrNull(value: String?): String? = value
     ?.trim()
     ?.takeIf { it.isNotEmpty() && !it.equals("null", ignoreCase = true) }
+
+/** Deterministic identity used by the request-scoped stream deduplicator. */
+internal object AgentEventIdentity {
+    fun key(event: AgentEvent): String? = when (event) {
+        is AgentEvent.Thinking -> "thinking:${event.step}:${event.phase}:${event.text}"
+        is AgentEvent.Thought -> "thought:${event.step}:${event.streamId}:${event.delta}:${event.isFinal}:${event.text}"
+        // call_id is the authoritative identity. Legacy frames fall back to
+        // their turn-local step/tool pair; transport seq is never primary.
+        is AgentEvent.ToolCall -> "tool:${event.callId ?: "${event.step}:${event.tool}"}"
+        is AgentEvent.Observation -> "observation:${event.callId ?: "${event.step}:${event.tool}"}"
+        is AgentEvent.SelfCorrection -> "recovery:${event.callId ?: "${event.step}:${event.tool}"}:${event.attempt}"
+        is AgentEvent.Token -> "token:${event.index}"
+        is AgentEvent.AnswerEnd -> "answer_end"
+        is AgentEvent.Done -> "done"
+        else -> null
+    }
+}
+
+/** A fresh ledger is reset at every request; no event identity crosses turns. */
+internal class RequestEventLedger {
+    private val seen = mutableSetOf<String>()
+
+    fun reset() = seen.clear()
+
+    fun accept(event: AgentEvent): Boolean {
+        val key = AgentEventIdentity.key(event) ?: return true
+        return seen.add(key)
+    }
+}
 
 /**
  * Owns the conversation lifecycle (brain startup, sending, command execution,
@@ -158,9 +189,12 @@ class ChatController(
     /** Live log lines of the running turn (the terminal block reads this). */
     val turnLines = mutableStateListOf<ThoughtLine>()
 
+    /** Independent capability events for this request; no global online flag. */
+    val turnCapabilities = mutableStateListOf<CapabilityActivity>()
+
     /**
-     * Bumped on every reveal/line change. Compose screens use it as a key to
-     * follow the typing without reading the whole buffer each frame.
+     * Bumped on every reveal/line/capability change. Compose screens use it as a
+     * key to follow the typing without reading the whole buffer each frame.
      */
     var streamSeq by mutableStateOf(0); private set
 
@@ -282,6 +316,7 @@ class ChatController(
     }
 
     private suspend fun handleEvent(event: AgentEvent) {
+        if (!eventLedger.accept(event)) return
         when (event) {
             is AgentEvent.Start -> {
                 turnStepCount = 0
@@ -319,6 +354,7 @@ class ChatController(
                 if (answerTarget.isEmpty() && event.ask.response.isNotBlank()) {
                     replaceAnswerTarget(event.ask.response)
                 }
+                completeReasoningActivity(event.ask.error == null)
                 finishWithAsk(event.ask, typedIn = true, elapsedMs = event.elapsedMs)
             }
 
@@ -348,6 +384,14 @@ class ChatController(
             else -> AgentPhase.REASONING
         }
         phaseLabel = event.text
+        CapabilityPresentationAdapter.fromThinking(event, nextCapabilitySequence())?.let { activity ->
+            val previousIndex = turnCapabilities.indexOfLast {
+                it.capability == CapabilityKind.REASONING && it.recovery == null
+            }
+            if (previousIndex >= 0) turnCapabilities[previousIndex] = activity
+            else turnCapabilities.add(activity)
+            streamSeq++
+        }
         addLine(
             if (event.phase == "answer") ThoughtLine.LEVEL_ANSWER else ThoughtLine.LEVEL_PLAN,
             event.text
@@ -375,10 +419,14 @@ class ChatController(
         agentPhase = AgentPhase.ACTING
         phaseLabel = event.label
         turnStepCount = maxOf(turnStepCount, event.step + 1)
+        CapabilityPresentationAdapter.fromToolCall(event, nextCapabilitySequence())?.let { activity ->
+            turnCapabilities.add(activity)
+            streamSeq++
+        }
         addLine(
             ThoughtLine.LEVEL_CALL,
             event.label,
-            detail = previewArgs(event.args),
+            detail = CapabilityPresentationAdapter.safeToolDetail(event),
             tool = event.tool
         )
         if (!event.device || event.action == null) return
@@ -409,9 +457,21 @@ class ChatController(
     private fun onObservation(event: AgentEvent.Observation) {
         agentPhase = if (event.ok) AgentPhase.REASONING else AgentPhase.CORRECTING
         phaseLabel = if (event.ok) "${event.tool} → ${event.ms} ms" else "${event.tool} failed"
+        val correlation = event.callId ?: "legacy:${event.step}:${event.tool}"
+        val previousIndex = turnCapabilities.indexOfLast { it.correlationKey == correlation }
+        val previous = previousIndex.takeIf { it >= 0 }?.let { turnCapabilities[it] }
+        CapabilityPresentationAdapter.fromObservation(
+            event,
+            previous,
+            nextCapabilitySequence()
+        )?.let { activity ->
+            if (previousIndex >= 0) turnCapabilities[previousIndex] = activity else turnCapabilities.add(activity)
+            streamSeq++
+        }
         addLine(
             if (event.ok) ThoughtLine.LEVEL_OK else ThoughtLine.LEVEL_FAIL,
-            "${if (event.ok) "result ok" else "result failed"} · ${oneLine(event.result, 200)}",
+            "${if (event.ok) "result ok" else "result failed"} · " +
+                CapabilityPresentationAdapter.safeObservationText(event),
             tool = event.tool,
             ms = event.ms
         )
@@ -420,12 +480,40 @@ class ChatController(
     private fun onSelfCorrection(event: AgentEvent.SelfCorrection) {
         agentPhase = AgentPhase.CORRECTING
         phaseLabel = "Self-correcting: ${event.tool ?: "provider"}"
+        val previous = event.callId?.let { key ->
+            turnCapabilities.lastOrNull { it.correlationKey == key }
+        }
+        CapabilityPresentationAdapter.fromSelfCorrection(
+            event,
+            nextCapabilitySequence(),
+            previous
+        )?.let { activity ->
+            turnCapabilities.add(activity)
+            streamSeq++
+        }
+        // Keep the terminal useful without copying planner strategy text or
+        // provider diagnostics into the normal answer surface.
         addLine(
             ThoughtLine.LEVEL_FIX,
-            event.reason.ifBlank { "recovering from a failed step" } +
-                (if (event.strategy.isBlank()) "" else " → ${event.strategy}"),
+            if (event.tool.isNullOrBlank()) "Capability recovery in progress" else "Capability recovery: ${event.tool}",
             tool = event.tool
         )
+    }
+
+    private fun completeReasoningActivity(success: Boolean) {
+        val previousIndex = turnCapabilities.indexOfLast {
+            it.capability == CapabilityKind.REASONING && it.recovery == null
+        }
+        if (previousIndex < 0) return
+        val previous = turnCapabilities[previousIndex]
+        CapabilityPresentationAdapter.completeReasoning(
+            previous,
+            success,
+            nextCapabilitySequence()
+        )?.let { activity ->
+            turnCapabilities[previousIndex] = activity
+            streamSeq++
+        }
     }
 
     private fun onBrainLog(entry: ActionLogEntry) {
@@ -508,7 +596,10 @@ class ChatController(
     private var speechQueued = false
     private var userPinnedTerminal = false
     private var activeId: String? = null
+    /** Cleared for every turn: event identity must never leak across requests. */
+    private val eventLedger = RequestEventLedger()
     private var lineSeq = 0
+    private var capabilitySeq = 0
     private var liveThoughtId: Int? = null
     private var ticker: Job? = null
     private var turnStartedAt = 0L
@@ -529,6 +620,9 @@ class ChatController(
 
     private fun beginTurn() {
         turnLines.clear()
+        turnCapabilities.clear()
+        eventLedger.reset()
+        capabilitySeq = 0
         replaceAnswerTarget("")
         thoughtDelta = ""
         revealed = 0
@@ -621,7 +715,10 @@ class ChatController(
         val index = messages.indexOfFirst { it.id == id }
         if (index < 0) return
         val current = messages[index]
-        messages[index] = current.copy(text = text, phase = agentPhase)
+        messages[index] = current.copy(
+            text = CapabilityPresentationAdapter.sanitizeAnswer(text),
+            phase = agentPhase
+        )
     }
 
     private fun commitActiveMessage() {
@@ -633,9 +730,10 @@ class ChatController(
         val text = answerTarget.ifBlank { current.text }
         val failed = !error.isNullOrBlank() && text.isBlank()
         messages[index] = current.copy(
-            text = text,
+            text = CapabilityPresentationAdapter.sanitizeAnswer(text),
             streaming = false,
             thoughts = turnLines.toList(),
+            capabilityEvents = turnCapabilities.toList(),
             phase = AgentPhase.DONE,
             steps = turnStepCount,
             elapsedMs = turnElapsedMs,
@@ -648,8 +746,13 @@ class ChatController(
     }
 
     // ------------------------------------------------------------------
-    // Terminal log lines
+    // Terminal log lines and capability activity
     // ------------------------------------------------------------------
+
+    private fun nextCapabilitySequence(): Int {
+        capabilitySeq += 1
+        return capabilitySeq
+    }
 
     private fun addLine(level: String, text: String, detail: String? = null, tool: String? = null, ms: Int = 0): Int {
         val line = ThoughtLine(
