@@ -20,7 +20,12 @@ sealed class AgentEvent {
     data class Start(val requestId: String, val message: String, val state: BrainState?) : AgentEvent()
 
     /** A reasoning phase began: plan | route | recall | prompt | call | reason | verify | answer. */
-    data class Thinking(val step: Int, val phase: String, val text: String) : AgentEvent()
+    data class Thinking(
+        val step: Int,
+        val phase: String,
+        val text: String,
+        val sequence: Int = 0
+    ) : AgentEvent()
 
     /** Live chain-of-thought text. [text] (when final) is authoritative: replace, don't append. */
     data class Thought(
@@ -28,7 +33,8 @@ sealed class AgentEvent {
         val streamId: String,
         val delta: String,
         val isFinal: Boolean,
-        val text: String?
+        val text: String?,
+        val sequence: Int = 0
     ) : AgentEvent()
 
     /** The agent decided to run a tool. [action] is non-null for device tools the Body must execute. */
@@ -43,7 +49,8 @@ sealed class AgentEvent {
         val callId: String? = null,
         val semanticCapability: String? = null,
         val locality: String? = null,
-        val sequence: Int = 0
+        val sequence: Int = 0,
+        val attempt: Int = 0
     ) : AgentEvent()
 
     /** The tool came back. [result] is a display-sized digest, not the raw payload. */
@@ -59,7 +66,8 @@ sealed class AgentEvent {
         val retrievalMethod: String? = null,
         val semanticCapability: String? = null,
         val locality: String? = null,
-        val sequence: Int = 0
+        val sequence: Int = 0,
+        val attempt: Int = 0
     ) : AgentEvent()
 
     /** A failure the agent is healing from (Brain's `self_correction` / `reflexion` frame). */
@@ -121,7 +129,8 @@ object AgentEventCodec {
             "thinking" -> AgentEvent.Thinking(
                 step = data.optInt("step", 0),
                 phase = data.optString("phase", "plan"),
-                text = data.optString("text", "")
+                text = data.optString("text", ""),
+                sequence = data.optInt("seq", 0)
             )
 
             "thought" -> AgentEvent.Thought(
@@ -129,7 +138,8 @@ object AgentEventCodec {
                 streamId = data.optString("stream", "t0"),
                 delta = data.optString("delta", ""),
                 isFinal = data.optBoolean("final", false),
-                text = data.optStringOrNull("text")
+                text = data.optStringOrNull("text"),
+                sequence = data.optInt("seq", 0)
             )
 
             "tool_call" -> AgentEvent.ToolCall(
@@ -150,7 +160,8 @@ object AgentEventCodec {
                 callId = data.optStringOrNull("call_id"),
                 semanticCapability = data.optStringOrNull("semantic_capability"),
                 locality = data.optStringOrNull("locality"),
-                sequence = data.optInt("seq", 0)
+                sequence = data.optInt("seq", 0),
+                attempt = data.optInt("attempt", 0)
             )
 
             "observation" -> AgentEvent.Observation(
@@ -165,7 +176,8 @@ object AgentEventCodec {
                 retrievalMethod = data.optStringOrNull("retrieval_method"),
                 semanticCapability = data.optStringOrNull("semantic_capability"),
                 locality = data.optStringOrNull("locality"),
-                sequence = data.optInt("seq", 0)
+                sequence = data.optInt("seq", 0),
+                attempt = data.optInt("attempt", 0)
             )
 
             // `reflexion` is the semantic alias the Brain may emit instead.

@@ -1019,11 +1019,24 @@ def _thinking(text: str, *, step: int = 0, phase: str = "plan") -> None:
 
 def _capability_transport_metadata(
     descriptor: CapabilityDescriptor | None,
-) -> dict[str, str]:
-    """Serialize only facts from the authoritative selected descriptor."""
+    producer_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Assemble transport metadata with one authoritative locality source.
+
+    Producer metadata may carry orthogonal facts such as retrieval method, but
+    locality is never accepted from it. The selected descriptor overwrites any
+    conflicting semantic metadata and is the only source allowed to add
+    locality.
+    """
+    metadata = {
+        key: value
+        for key, value in (producer_metadata or {}).items()
+        if key != "locality" and value is not None
+    }
     if descriptor is None:
-        return {}
-    metadata = {"semantic_capability": descriptor.capability_type.value}
+        return metadata
+    metadata["semantic_capability"] = descriptor.capability_type.value
+    metadata.pop("locality", None)
     if descriptor.is_local is True:
         metadata["locality"] = "local"
     elif descriptor.is_local is False:
@@ -1034,7 +1047,8 @@ def _capability_transport_metadata(
 def _tool_call(step: int, tool: str, arguments: dict, *, device: bool,
                label: str | None = None, thought: str | None = None,
                action: dict | None = None, call_id: str | None = None,
-               descriptor: CapabilityDescriptor | None = None) -> None:
+               descriptor: CapabilityDescriptor | None = None,
+               attempt: int = 0) -> None:
     event_call_id = call_id or f"step-{step}:{tool}"
     emit_event(
         EVENT_TOOL_CALL,
@@ -1046,13 +1060,15 @@ def _tool_call(step: int, tool: str, arguments: dict, *, device: bool,
         device=device,
         thought=thought or None,
         action=action,
+        attempt=attempt,
         **_capability_transport_metadata(descriptor),
     )
 
 
 def _observation(step: int, tool: str, ok: bool, result: str, ms: int,
                  *, call_id: str | None = None, outcome: str | None = None,
-                 metadata: dict[str, Any] | None = None) -> None:
+                 metadata: dict[str, Any] | None = None,
+                 attempt: int = 0) -> None:
     payload: dict[str, Any] = {
         "step": step,
         "tool": tool,
@@ -1063,6 +1079,7 @@ def _observation(step: int, tool: str, ok: bool, result: str, ms: int,
     }
     if outcome is not None:
         payload["outcome"] = outcome
+    payload["attempt"] = attempt
     if metadata:
         payload.update({key: value for key, value in metadata.items() if value is not None})
     emit_event(EVENT_OBSERVATION, **payload)
@@ -2274,6 +2291,7 @@ async def _react_loop(
             selected_descriptor = _selected_candidate_descriptor(
                 capability_plan, _get_registry(ctx), tool_name,
             )
+            tool_attempt = 0
 
             raw_thought = assistant_message.get("content")
             thought = strip_tool_tags(raw_thought)[:2000] if isinstance(raw_thought, str) else None
@@ -2306,7 +2324,8 @@ async def _react_loop(
                 log.log(f"Dispatching device tool: {tool_name} { _clip(json.dumps(arguments, ensure_ascii=False), 80)}", "tool")
                 _tool_call(steps, tool_name, arguments, device=True, thought=thought,
                            label=f"Executing {tool_name} on the Body", action=action_payload,
-                           call_id=call_id, descriptor=selected_descriptor)
+                           call_id=call_id, descriptor=selected_descriptor,
+                           attempt=tool_attempt)
                 if stream is None:
                     return AskResponse(
                         response="",
@@ -2339,6 +2358,7 @@ async def _react_loop(
                              ExecutionOutcome.RETRYABLE_FAILURE.value if timed_out else
                              ExecutionOutcome.FATAL_FAILURE.value),
                     metadata=_capability_transport_metadata(selected_descriptor),
+                    attempt=tool_attempt,
                 )
                 if not device_ok:
                     _self_correction(
@@ -2398,7 +2418,7 @@ async def _react_loop(
             log.log(f"Executing tool: {tool_name}", "tool")
             _tool_call(steps, tool_name, arguments, device=False, thought=thought,
                        label=f"Executing {tool_name} in the Brain", call_id=call_id,
-                       descriptor=selected_descriptor)
+                       descriptor=selected_descriptor, attempt=tool_attempt)
             tool_started = time.monotonic()
             exec_result = await asyncio.to_thread(
                 _execute_tool_request, tool_name, arguments, ctx,
@@ -2409,23 +2429,55 @@ async def _react_loop(
             affected_sub_goal_id: str | None = None
 
             # Backend recovery happens before the failed observation is handed
-            # to the model. Only this tool's semantic sub-goal is retried; all
-            # earlier successful observations remain in ``messages``.
+            # to the model. The original attempt is still transported to the
+            # Body, and each verified alternative gets the same call ID with a
+            # distinct attempt number.
             failed_candidate_id = selected_descriptor.id if selected_descriptor is not None else None
+            initial_observation_emitted = False
             if not tool_ok:
+                _observation(
+                    steps, tool_name, False, result_text, tool_ms,
+                    call_id=call_id,
+                    outcome=exec_result.outcome.value,
+                    metadata=_capability_transport_metadata(
+                        selected_descriptor, exec_result.metadata,
+                    ),
+                    attempt=tool_attempt,
+                )
+                initial_observation_emitted = True
+
+                def _execute_recovery_candidate(candidate: CapabilityDescriptor) -> ExecutionResult:
+                    nonlocal tool_attempt
+                    tool_attempt += 1
+                    candidate_tool_name = (
+                        _capability_tool_name(candidate, tool_name) or tool_name
+                    )
+                    _tool_call(
+                        steps,
+                        candidate_tool_name,
+                        arguments,
+                        device=False,
+                        thought=thought,
+                        label=f"Executing {candidate_tool_name} in the Brain",
+                        call_id=call_id,
+                        descriptor=candidate,
+                        attempt=tool_attempt,
+                    )
+                    return _execute_registered_candidate(
+                        candidate,
+                        original_tool_name=tool_name,
+                        arguments=arguments,
+                        ctx=ctx,
+                    )
+
                 recovered_result, affected_sub_goal_id, recovered = recover_failed_subgoal(
                     capability_plan,
                     _get_registry(ctx),
                     exec_result,
                     tool_name=tool_name,
-                    execute_candidate=lambda candidate: _execute_registered_candidate(
-                        candidate,
-                        original_tool_name=tool_name,
-                        arguments=arguments,
-                        ctx=ctx,
-                    ),
+                    execute_candidate=_execute_recovery_candidate,
                 )
-                if recovered:
+                if recovered_result is not exec_result:
                     exec_result = recovered_result
                     registry = _get_registry(ctx)
                     descriptor = (
@@ -2442,35 +2494,37 @@ async def _react_loop(
                     result_text, tool_ok = _tool_execution_observation(
                         effective_tool_name, exec_result,
                     )
-                    log.log(
-                        f"Recovered {affected_sub_goal_id} via {exec_result.capability_id}",
-                        "success",
-                    )
-                    if (
-                        failed_candidate_id
-                        and exec_result.capability_id
-                        and failed_candidate_id != exec_result.capability_id
-                    ):
-                        replacement_metadata = _capability_transport_metadata(selected_descriptor)
-                        _self_correction(
-                            steps,
-                            effective_tool_name,
-                            "A verified capability replacement completed successfully",
-                            "capability replacement",
-                            attempt=steps,
-                            call_id=call_id,
-                            transition_type="capability_replacement",
-                            semantic_capability=replacement_metadata.get("semantic_capability"),
-                            previous_candidate=failed_candidate_id,
-                            selected_candidate=exec_result.capability_id,
-                            outcome=exec_result.outcome.value,
-                            locality=replacement_metadata.get("locality"),
+                    tool_ms = exec_result.elapsed_ms or tool_ms
+                    if recovered:
+                        log.log(
+                            f"Recovered {affected_sub_goal_id} via {exec_result.capability_id}",
+                            "success",
                         )
-                elif affected_sub_goal_id:
-                    log.log(
-                        f"Recovery exhausted for {affected_sub_goal_id}; returning sanitized observation",
-                        "warning",
-                    )
+                        if (
+                            failed_candidate_id
+                            and exec_result.capability_id
+                            and failed_candidate_id != exec_result.capability_id
+                        ):
+                            replacement_metadata = _capability_transport_metadata(selected_descriptor)
+                            _self_correction(
+                                steps,
+                                effective_tool_name,
+                                "A verified capability replacement completed successfully",
+                                "capability replacement",
+                                attempt=tool_attempt,
+                                call_id=call_id,
+                                transition_type="capability_replacement",
+                                semantic_capability=replacement_metadata.get("semantic_capability"),
+                                previous_candidate=failed_candidate_id,
+                                selected_candidate=exec_result.capability_id,
+                                outcome=exec_result.outcome.value,
+                                locality=replacement_metadata.get("locality"),
+                            )
+                    elif affected_sub_goal_id:
+                        log.log(
+                            f"Recovery exhausted for {affected_sub_goal_id}; returning sanitized observation",
+                            "warning",
+                        )
 
             catalog_id = _tool_catalog_id(effective_tool_name)
             await stats.record_tool_usage(
@@ -2485,16 +2539,18 @@ async def _react_loop(
             if catalog_id in {"agent_memory", "note_creator"} and tool_ok:
                 await stats.bump("learned")
             brain_tools_called.append(effective_tool_name)
-            transport_metadata = dict(exec_result.metadata or {})
-            # Producer metadata may add retrieval facts, but selected
-            # descriptor facts are authoritative for semantic type/locality.
-            transport_metadata.update(_capability_transport_metadata(selected_descriptor))
-            _observation(
-                steps, effective_tool_name, tool_ok, result_text, tool_ms,
-                call_id=call_id,
-                outcome=exec_result.outcome.value,
-                metadata=transport_metadata,
+            transport_metadata = _capability_transport_metadata(
+                selected_descriptor,
+                exec_result.metadata,
             )
+            if not initial_observation_emitted or tool_attempt > 0:
+                _observation(
+                    steps, effective_tool_name, tool_ok, result_text, tool_ms,
+                    call_id=call_id,
+                    outcome=exec_result.outcome.value,
+                    metadata=transport_metadata,
+                    attempt=tool_attempt,
+                )
             if tool_ok:
                 log.log(f"Tool {effective_tool_name} finished in {tool_ms} ms", "success")
                 _record_capability_result(
@@ -2516,7 +2572,7 @@ async def _react_loop(
                     _correction_for_failure_class(
                         _failure_class_for_result(exec_result), effective_tool_name,
                     ),
-                    attempt=steps,
+                    attempt=tool_attempt,
                     call_id=call_id,
                     semantic_capability=_capability_transport_metadata(
                         selected_descriptor,

@@ -90,6 +90,12 @@ fun VyRxMessageBubble(message: ChatMessage, controller: ChatController, modifier
     } else {
         message.thoughts
     }
+    val capabilities = if (live) {
+        controller.streamSeq
+        controller.turnCapabilities.toList()
+    } else {
+        message.capabilityEvents
+    }
     var openHistory by remember(message.id) { mutableStateOf(false) }
     val expanded = if (live) controller.turnExpanded else openHistory
     val phase = if (live) controller.agentPhase else message.phase
@@ -150,6 +156,14 @@ fun VyRxMessageBubble(message: ChatMessage, controller: ChatController, modifier
                 )
             }
 
+            if (!message.mine && capabilities.isNotEmpty()) {
+                Spacer(Modifier.height(4.dp))
+                CapabilityActivityStrip(
+                    events = capabilities,
+                    modifier = Modifier.padding(vertical = 2.dp)
+                )
+            }
+
             Spacer(Modifier.height(6.dp))
             if (message.text.isBlank() && live) {
                 // Nothing typed yet: the terminal + this line carry the turn.
@@ -171,10 +185,29 @@ fun VyRxMessageBubble(message: ChatMessage, controller: ChatController, modifier
                     lineHeight = 21.sp
                 )
             } else {
-                ChatMarkdownText(
-                    text = message.text,
-                    streaming = live
-                )
+                val answerIsStreamed = if (live) controller.answerIsStreamed else message.answerIsStreamed
+                val safeAnswer = if (answerIsStreamed) {
+                    message.text
+                } else {
+                    CapabilityPresentationAdapter.sanitizeLegacyAnswer(message.text)
+                }
+                if (!answerIsStreamed &&
+                    CapabilityPresentationAdapter.isInternalMetadata(message.text)
+                ) {
+                    // Keep the existing typed-answer contract as the safe fallback
+                    // when a legacy response contains only internal metadata.
+                    Text(
+                        typedAnswer(safeAnswer, live),
+                        color = VyRxColors.TextPrimary,
+                        fontSize = 14.sp,
+                        lineHeight = 21.sp
+                    )
+                } else {
+                    ChatMarkdownText(
+                        text = safeAnswer,
+                        streaming = live
+                    )
+                }
             }
             if (!message.mine && !live) {
                 Spacer(Modifier.height(8.dp))

@@ -80,6 +80,8 @@ data class ChatMessage(
     val time: String = LocalTime.now().format(DateTimeFormatter.ofPattern("h:mm a")),
     /** True while the answer is still streaming in (typewriter + live terminal). */
     val streaming: Boolean = false,
+    /** Answer arrived as SSE token content and must not be legacy-sanitized. */
+    val answerIsStreamed: Boolean = false,
     /** The turn's CoT / action log, kept on the bubble so it stays reviewable. */
     val thoughts: List<ThoughtLine> = emptyList(),
     /** Safe, capability-level activity; no planner objects or raw JSON. */
@@ -100,13 +102,26 @@ private fun uiMessageOrNull(value: String?): String? = value
 /** Deterministic identity used by the request-scoped stream deduplicator. */
 internal object AgentEventIdentity {
     fun key(event: AgentEvent): String? = when (event) {
-        is AgentEvent.Thinking -> "thinking:${event.step}:${event.phase}:${event.text}"
-        is AgentEvent.Thought -> "thought:${event.step}:${event.streamId}:${event.delta}:${event.isFinal}:${event.text}"
-        // call_id is the authoritative identity. Legacy frames fall back to
-        // their turn-local step/tool pair; transport seq is never primary.
-        is AgentEvent.ToolCall -> "tool:${event.callId ?: "${event.step}:${event.tool}"}"
-        is AgentEvent.Observation -> "observation:${event.callId ?: "${event.step}:${event.tool}"}"
-        is AgentEvent.SelfCorrection -> "recovery:${event.callId ?: "${event.step}:${event.tool}"}:${event.attempt}"
+        is AgentEvent.Start -> "start:${event.requestId}"
+        is AgentEvent.Thinking -> if (event.sequence > 0) {
+            "thinking:seq:${event.sequence}"
+        } else {
+            "thinking:legacy:${event.step}:${event.phase}:${event.text}"
+        }
+        is AgentEvent.Thought -> if (event.sequence > 0) {
+            "thought:seq:${event.sequence}"
+        } else {
+            "thought:legacy:${event.step}:${event.streamId}:${event.delta}:${event.isFinal}:${event.text}"
+        }
+        // call_id plus attempt is the authoritative event identity. The
+        // request ledger supplies the turn/request scope; transport seq is
+        // retained for ordering but is not the semantic key.
+        is AgentEvent.ToolCall ->
+            "tool:${event.callId ?: "${event.step}:${event.tool}"}:attempt:${event.attempt}"
+        is AgentEvent.Observation ->
+            "observation:${event.callId ?: "${event.step}:${event.tool}"}:attempt:${event.attempt}"
+        is AgentEvent.SelfCorrection ->
+            "recovery:${event.callId ?: "${event.step}:${event.tool}"}:${event.attempt}"
         is AgentEvent.Token -> "token:${event.index}"
         is AgentEvent.AnswerEnd -> "answer_end"
         is AgentEvent.Done -> "done"
@@ -117,12 +132,20 @@ internal object AgentEventIdentity {
 /** A fresh ledger is reset at every request; no event identity crosses turns. */
 internal class RequestEventLedger {
     private val seen = mutableSetOf<String>()
+    private var turnId: String? = null
 
-    fun reset() = seen.clear()
+    fun reset(requestId: String? = null) {
+        seen.clear()
+        turnId = requestId
+    }
 
     fun accept(event: AgentEvent): Boolean {
+        if (event is AgentEvent.Start && turnId != event.requestId) {
+            seen.clear()
+            turnId = event.requestId
+        }
         val key = AgentEventIdentity.key(event) ?: return true
-        return seen.add(key)
+        return seen.add("${turnId ?: "turn-unknown"}:$key")
     }
 }
 
@@ -191,6 +214,9 @@ class ChatController(
 
     /** Independent capability events for this request; no global online flag. */
     val turnCapabilities = mutableStateListOf<CapabilityActivity>()
+
+    /** Whether the active answer is structural SSE token content, not legacy JSON. */
+    internal val answerIsStreamed: Boolean get() = streamedAnswer
 
     /**
      * Bumped on every reveal/line/capability change. Compose screens use it as a
@@ -330,6 +356,7 @@ class ChatController(
             is AgentEvent.SelfCorrection -> onSelfCorrection(event)
 
             is AgentEvent.Token -> {
+                streamedAnswer = true
                 agentPhase = AgentPhase.TYPING
                 phaseLabel = "Typing answer…"
                 if (!typingStarted) {
@@ -349,6 +376,9 @@ class ChatController(
             is AgentEvent.BrainStateUpdate -> onBrainState(event.state)
 
             is AgentEvent.Done -> {
+                // A complete answer carried by the SSE terminal is still
+                // answer content, not a legacy control envelope.
+                streamedAnswer = true
                 // The `done` frame repeats the full answer: use it only if no
                 // token ever arrived, so the typewriter never restarts or jumps.
                 if (answerTarget.isEmpty() && event.ask.response.isNotBlank()) {
@@ -407,8 +437,14 @@ class ChatController(
                 // Authoritative text wins over whatever partial deltas arrived.
                 thoughtDelta = ""
                 val id = liveThoughtId
-                if (id == null) liveThoughtId = addLine(ThoughtLine.LEVEL_THINK, oneLine(authoritative, 600))
-                else updateLine(id) { it.copy(text = oneLine(authoritative, 600)) }
+                if (id == null ||
+                    (event.sequence > 0 && event.sequence != liveThoughtSequence)
+                ) {
+                    liveThoughtId = addLine(ThoughtLine.LEVEL_THINK, oneLine(authoritative, 600))
+                } else {
+                    updateLine(id) { it.copy(text = oneLine(authoritative, 600)) }
+                }
+                liveThoughtSequence = event.sequence.takeIf { it > 0 }
             }
             return
         }
@@ -589,6 +625,7 @@ class ChatController(
     // replacing the previous one. The active ChatMessage is then updated by the
     // ticker, so every visible slice is an observable SnapshotStateList update.
     private var answerTarget by mutableStateOf("")
+    private var streamedAnswer = false
     private var thoughtDelta: String = ""
     private var revealed = 0
     private var typingStarted = false
@@ -601,6 +638,7 @@ class ChatController(
     private var lineSeq = 0
     private var capabilitySeq = 0
     private var liveThoughtId: Int? = null
+    private var liveThoughtSequence: Int? = null
     private var ticker: Job? = null
     private var turnStartedAt = 0L
 
@@ -623,6 +661,7 @@ class ChatController(
         turnCapabilities.clear()
         eventLedger.reset()
         capabilitySeq = 0
+        streamedAnswer = false
         replaceAnswerTarget("")
         thoughtDelta = ""
         revealed = 0
@@ -633,6 +672,7 @@ class ChatController(
         turnElapsedMs = 0
         turnExpanded = true
         liveThoughtId = null
+        liveThoughtSequence = null
         agentPhase = AgentPhase.PLANNING
         phaseLabel = "Starting…"
         turnStartedAt = System.currentTimeMillis()
@@ -716,7 +756,7 @@ class ChatController(
         if (index < 0) return
         val current = messages[index]
         messages[index] = current.copy(
-            text = CapabilityPresentationAdapter.sanitizeAnswer(text),
+            text = if (streamedAnswer) text else CapabilityPresentationAdapter.sanitizeLegacyAnswer(text),
             phase = agentPhase
         )
     }
@@ -730,8 +770,9 @@ class ChatController(
         val text = answerTarget.ifBlank { current.text }
         val failed = !error.isNullOrBlank() && text.isBlank()
         messages[index] = current.copy(
-            text = CapabilityPresentationAdapter.sanitizeAnswer(text),
+            text = if (streamedAnswer) text else CapabilityPresentationAdapter.sanitizeLegacyAnswer(text),
             streaming = false,
+            answerIsStreamed = streamedAnswer,
             thoughts = turnLines.toList(),
             capabilityEvents = turnCapabilities.toList(),
             phase = AgentPhase.DONE,

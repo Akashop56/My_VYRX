@@ -189,16 +189,16 @@ class CapabilityPresentationTest {
 
     @Test
     fun structured_control_boundary_does_not_hide_legitimate_json_or_partial_text() {
-        assertEquals("", CapabilityPresentationAdapter.sanitizeAnswer(
-            "{\"type\":\"tool_call\",\"tool\":\"open_app\"}"
-        ))
-        assertEquals("", CapabilityPresentationAdapter.sanitizeAnswer(
-            "{\"route\":\"agent_action\",\"action\":{\"tool\":\"open_app\"}}"
-        ))
+        val toolJson = "{\"type\":\"tool_call\",\"tool\":\"open_app\"}"
+        assertEquals(toolJson, CapabilityPresentationAdapter.sanitizeAnswer(toolJson))
+        assertEquals("", CapabilityPresentationAdapter.sanitizeLegacyAnswer(toolJson))
+        val routeJson = "{\"route\":\"agent_action\",\"action\":{\"tool\":\"open_app\"}}"
+        assertEquals(routeJson, CapabilityPresentationAdapter.sanitizeAnswer(routeJson))
+        assertEquals("", CapabilityPresentationAdapter.sanitizeLegacyAnswer(routeJson))
         assertTrue(CapabilityPresentationAdapter.isInternalMetadata("{\"type\":\"observation\"}"))
-        assertEquals("The safe answer", CapabilityPresentationAdapter.sanitizeAnswer(
-            "{\"response\":\"The safe answer\",\"capability\":\"reasoning\"}"
-        ))
+        val responseJson = "{\"response\":\"The safe answer\",\"capability\":\"reasoning\"}"
+        assertEquals(responseJson, CapabilityPresentationAdapter.sanitizeAnswer(responseJson))
+        assertEquals("The safe answer", CapabilityPresentationAdapter.sanitizeLegacyAnswer(responseJson))
         val userJson = "{\"action\":\"explain\",\"tool\":\"camera\",\"capability\":\"user-data\"}"
         assertEquals(userJson, CapabilityPresentationAdapter.sanitizeAnswer(userJson))
         val code = "if (x) {\n  return {\"action\": \"keep\"}\n"
@@ -213,15 +213,36 @@ class CapabilityPresentationTest {
 
     @Test
     fun event_codec_preserves_stable_identity_metadata() {
+        val thinking = AgentEventCodec.decode(
+            "thinking",
+            "{\"type\":\"thinking\",\"seq\":41,\"step\":2,\"phase\":\"reason\",\"text\":\"checking\"}"
+        ) as AgentEvent.Thinking
+        assertEquals(41, thinking.sequence)
+
+        val thought = AgentEventCodec.decode(
+            "thought",
+            "{\"type\":\"thought\",\"seq\":42,\"step\":2,\"stream\":\"t1\",\"delta\":\"checking\"}"
+        ) as AgentEvent.Thought
+        assertEquals(42, thought.sequence)
+
         val event = AgentEventCodec.decode(
             "tool_call",
-            "{\"type\":\"tool_call\",\"seq\":42,\"step\":2,\"tool\":\"search_local_knowledge\"," +
+            "{\"type\":\"tool_call\",\"seq\":43,\"attempt\":2,\"step\":2,\"tool\":\"search_local_knowledge\"," +
                 "\"call_id\":\"call-7\",\"semantic_capability\":\"local_knowledge_search\",\"locality\":\"local\"}"
         ) as AgentEvent.ToolCall
-        assertEquals(42, event.sequence)
+        assertEquals(43, event.sequence)
+        assertEquals(2, event.attempt)
         assertEquals("call-7", event.callId)
         assertEquals("local_knowledge_search", event.semanticCapability)
         assertEquals("local", event.locality)
+
+        val observation = AgentEventCodec.decode(
+            "observation",
+            "{\"type\":\"observation\",\"seq\":44,\"attempt\":2,\"step\":2,\"tool\":\"search_local_knowledge\",\"call_id\":\"call-7\"}"
+        ) as AgentEvent.Observation
+        assertEquals(44, observation.sequence)
+        assertEquals(2, observation.attempt)
+        assertEquals("call-7", observation.callId)
     }
 
     @Test
@@ -232,10 +253,14 @@ class CapabilityPresentationTest {
             callId = "call-a", semanticCapability = "local_knowledge_search", locality = "local", sequence = 50
         )
         val replay = first.copy()
-        val secondAttempt = first.copy(callId = "call-b", sequence = 51)
+        val secondAttempt = first.copy(attempt = 1, sequence = 51)
         assertTrue(ledger.accept(first))
         assertFalse(ledger.accept(replay))
         assertTrue(ledger.accept(secondAttempt))
+        val thinking = AgentEvent.Thinking(1, "reason", "same words", sequence = 60)
+        assertTrue(ledger.accept(thinking))
+        assertFalse(ledger.accept(thinking.copy()))
+        assertTrue(ledger.accept(thinking.copy(sequence = 61)))
         val recovery = AgentEvent.SelfCorrection(
             1, "search", "failed", "retry", 1, callId = "call-a"
         )

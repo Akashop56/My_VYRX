@@ -214,11 +214,14 @@ object CapabilityPresentationAdapter {
     }
 
     /**
-     * Sanitize only an explicitly marked control envelope. Ordinary JSON,
-     * code, partial JSON, and user text remain ordinary answer content even if
-     * they contain keys named action, tool, or capability.
+     * Answer/token content is never removed by key-name heuristics. Structural
+     * SSE control frames are decoded separately and therefore do not enter
+     * this function.
      */
-    fun sanitizeAnswer(text: String): String {
+    fun sanitizeAnswer(text: String): String = text
+
+    /** Compatibility sanitizer for the legacy monolithic response envelope. */
+    fun sanitizeLegacyAnswer(text: String): String {
         val parsed = internalControlObject(text) ?: return text
         return parsed.optString("response", "").trim()
     }
@@ -241,7 +244,7 @@ object CapabilityPresentationAdapter {
         if (capabilityKind(event.semanticCapability) == CapabilityKind.LOCAL_KNOWLEDGE_SEARCH) {
             return if (event.ok) "Local knowledge result received" else "Local knowledge search failed"
         }
-        val sanitized = sanitizeAnswer(event.result).trim()
+        val sanitized = sanitizeLegacyAnswer(event.result).trim()
         if (sanitized.isBlank() && event.result.isNotBlank()) return "Tool result received"
         return sanitized.replace(Regex("\\s+"), " ").take(200)
     }
@@ -283,6 +286,15 @@ object CapabilityPresentationAdapter {
         // a normal user JSON object with an action/tool/capability key does not.
         val route = parsed.optString("route").trim().lowercase(Locale.US)
         if (route in setOf("agent_action", "android_command") && parsed.opt("action") is JSONObject) {
+            return parsed
+        }
+        // Legacy AskResponse envelopes may omit `type` but include the
+        // structured capability marker alongside the response.
+        val capability = parsed.optString("capability").trim().lowercase(Locale.US)
+        if (parsed.has("response") && capability in setOf(
+                "reasoning", "web_retrieval", "local_knowledge_search", "device_interaction"
+            )
+        ) {
             return parsed
         }
         return null

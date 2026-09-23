@@ -185,21 +185,23 @@ def _safe_relative_source(
     )):
         return None
 
-    if engine is not None:
-        try:
-            root = Path(engine.root).resolve()
-            candidate = (root / Path(*normalized.parts)).resolve()
-            candidate.relative_to(root)
-            indexed = engine.file_metadata(value)
-        except (AttributeError, OSError, ValueError, TypeError):
+    if engine is None:
+        return None
+
+    try:
+        root = Path(engine.root).resolve()
+        candidate = (root / Path(*normalized.parts)).resolve()
+        candidate.relative_to(root)
+        indexed = engine.file_metadata(value)
+    except (AttributeError, OSError, ValueError, TypeError):
+        return None
+    if not indexed or str(indexed.get("parser_status", "")).casefold() != "indexed":
+        return None
+    try:
+        if int(indexed.get("chunk_count", 0)) <= 0:
             return None
-        if not indexed or str(indexed.get("parser_status", "")).casefold() != "indexed":
-            return None
-        try:
-            if int(indexed.get("chunk_count", 0)) <= 0:
-                return None
-        except (TypeError, ValueError):
-            return None
+    except (TypeError, ValueError):
+        return None
     return value if value and value != "." else None
 
 
@@ -292,7 +294,6 @@ def execute_knowledge_search_with_metadata(
     metadata: dict[str, Any] = {
         "requested_mode": mode,
         "semantic_capability": SemanticCapabilityType.LOCAL_KNOWLEDGE_SEARCH.value,
-        "locality": "local",
     }
     # An empty semantic search, for example, does not prove that semantic
     # retrieval actually ran. Only expose a method verified by returned data.
