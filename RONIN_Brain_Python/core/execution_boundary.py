@@ -250,8 +250,8 @@ def execute_tool_boundary(
         # the one context-bound local tool to use the lifecycle-owned engine.
         # The import is local so execution_boundary remains independent of the
         # planner and avoids an integration import cycle at module load time.
-        from core.knowledge.integration import execute_knowledge_search
-        executor = lambda name, payload: execute_knowledge_search(
+        from core.knowledge.integration import execute_knowledge_search_with_metadata
+        executor = lambda name, payload: execute_knowledge_search_with_metadata(
             getattr(context, "knowledge_engine", None), payload,
         )
 

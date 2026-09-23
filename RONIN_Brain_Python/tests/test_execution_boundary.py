@@ -301,27 +301,30 @@ class TestToolBoundarySuccess(unittest.TestCase):
 
     def test_metadata_envelope_survives_boundary_and_planner_transport(self):
         """Execution metadata remains available to the Phase 15.3 transport."""
-        from core.knowledge.integration import KnowledgeSearchExecution
+        from types import SimpleNamespace
+
         from core.planner import _capability_transport_metadata
         from core.capabilities import CapabilityDescriptor, SemanticCapabilityType
 
-        envelope = KnowledgeSearchExecution(
-            text="Local knowledge results (1) for: x",
-            metadata={
-                "requested_mode": "hybrid",
-                "semantic_capability": "local_knowledge_search",
-                "retrieval_method": "lexical_fts5",
-            },
-        )
+        class EmptyKnowledgeEngine:
+            def search(self, query, limit, mode):
+                return []
+
         result = execute_tool_boundary(
             "search_local_knowledge",
-            {"query": "x"},
-            executor=lambda name, arguments: envelope,
+            {"query": "x", "mode": "hybrid"},
+            context=SimpleNamespace(knowledge_engine=EmptyKnowledgeEngine()),
         )
 
         self.assertEqual(result.outcome, ExecutionOutcome.SUCCESS)
-        self.assertEqual(result.data, envelope.text)
-        self.assertEqual(result.metadata, envelope.metadata)
+        self.assertEqual(result.data, "No local knowledge matches found for: x")
+        self.assertEqual(
+            result.metadata,
+            {
+                "requested_mode": "hybrid",
+                "semantic_capability": "local_knowledge_search",
+            },
+        )
         self.assertIsNone(result.failure_class)
         self.assertIsNone(result.diagnostics)
         self.assertIsNone(result.partial_data)
@@ -337,7 +340,7 @@ class TestToolBoundarySuccess(unittest.TestCase):
         )
         transported = _capability_transport_metadata(descriptor, result.metadata)
         self.assertEqual(transported["requested_mode"], "hybrid")
-        self.assertEqual(transported["retrieval_method"], "lexical_fts5")
+        self.assertEqual(transported["semantic_capability"], "local_knowledge_search")
         self.assertEqual(transported["locality"], "local")
 
 
