@@ -299,6 +299,47 @@ class TestToolBoundarySuccess(unittest.TestCase):
         self.assertIsNotNone(result.elapsed_ms)
         self.assertGreaterEqual(result.elapsed_ms, 0)
 
+    def test_metadata_envelope_survives_boundary_and_planner_transport(self):
+        """Execution metadata remains available to the Phase 15.3 transport."""
+        from core.knowledge.integration import KnowledgeSearchExecution
+        from core.planner import _capability_transport_metadata
+        from core.capabilities import CapabilityDescriptor, SemanticCapabilityType
+
+        envelope = KnowledgeSearchExecution(
+            text="Local knowledge results (1) for: x",
+            metadata={
+                "requested_mode": "hybrid",
+                "semantic_capability": "local_knowledge_search",
+                "retrieval_method": "lexical_fts5",
+            },
+        )
+        result = execute_tool_boundary(
+            "search_local_knowledge",
+            {"query": "x"},
+            executor=lambda name, arguments: envelope,
+        )
+
+        self.assertEqual(result.outcome, ExecutionOutcome.SUCCESS)
+        self.assertEqual(result.data, envelope.text)
+        self.assertEqual(result.metadata, envelope.metadata)
+        self.assertIsNone(result.failure_class)
+        self.assertIsNone(result.diagnostics)
+        self.assertIsNone(result.partial_data)
+        self.assertEqual(ExecutionResult(outcome=ExecutionOutcome.SUCCESS).metadata, {})
+
+        descriptor = CapabilityDescriptor(
+            id="knowledge-local",
+            capability_type=SemanticCapabilityType.LOCAL_KNOWLEDGE_SEARCH,
+            description="local knowledge",
+            requires_internet=False,
+            requires_auth=False,
+            is_local=True,
+        )
+        transported = _capability_transport_metadata(descriptor, result.metadata)
+        self.assertEqual(transported["requested_mode"], "hybrid")
+        self.assertEqual(transported["retrieval_method"], "lexical_fts5")
+        self.assertEqual(transported["locality"], "local")
+
 
 class TestToolBoundaryErrorDetection(unittest.TestCase):
     """execute_tool() never raises — it returns {"error": "..."} JSON."""

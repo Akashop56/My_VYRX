@@ -257,11 +257,21 @@ def execute_tool_boundary(
 
     started = time.monotonic()
     try:
-        result_text = (
+        raw_result = (
             executor(tool_name, arguments)
             if executor is not None
             else _execute_tool(tool_name, arguments)
         )
+        # Context-bound tools may return a safe text/metadata envelope. Keep
+        # metadata on the normalized result instead of serializing it into the
+        # model-visible tool text.
+        result_metadata: dict[str, Any] = {}
+        if hasattr(raw_result, "text") and hasattr(raw_result, "metadata"):
+            result_text = str(raw_result.text)
+            value = raw_result.metadata
+            result_metadata = dict(value) if isinstance(value, dict) else {}
+        else:
+            result_text = raw_result
         elapsed_ms = int((time.monotonic() - started) * 1000)
 
         # Tools may return {"error": "..."} without raising.
@@ -280,12 +290,14 @@ def execute_tool_boundary(
                 data=result_text,        # Preserve raw result for caller
                 failure_class=failure_class,
                 diagnostics=diagnostics,
+                metadata=result_metadata,
                 elapsed_ms=elapsed_ms,
             )
 
         return ExecutionResult(
             outcome=ExecutionOutcome.SUCCESS,
             data=result_text,
+            metadata=result_metadata,
             elapsed_ms=elapsed_ms,
         )
 

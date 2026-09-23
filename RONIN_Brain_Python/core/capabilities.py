@@ -255,6 +255,10 @@ class ExecutionResult(BaseModel):
     partial_data: Any = None
     failure_class: CanonicalFailureClass | None = None
     diagnostics: DiagnosticContext | None = None
+    # Safe producer metadata for transport adapters. This is deliberately
+    # separate from outcome, health, and diagnostics; callers must not derive
+    # one of those concepts from the other.
+    metadata: dict[str, Any] = Field(default_factory=dict)
     elapsed_ms: int | None = Field(default=None, ge=0)
 
 
