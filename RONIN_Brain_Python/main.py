@@ -25,6 +25,19 @@ from core.planner import (
     plan_request,
     plan_request_stream,
 )
+from core.capability_lifecycle import bootstrap_application_capabilities
+from core.local_reasoning import LocalReasoningAdapter
+from core.knowledge.engine import KnowledgeEngine
+from core.knowledge.watcher import (
+    IngestionWatcherConfig,
+    KnowledgeIngestionWatcher,
+)
+from core.knowledge.integration import (
+    ingest_knowledge,
+    ingestion_report_dict,
+    scan_knowledge,
+    scan_report_dict,
+)
 from core.provider_manager import KNOWN_PROVIDERS, ProviderManager
 from core.streaming import (
     MEDIA_TYPE_SSE,
@@ -52,7 +65,7 @@ from core.state_manager import StateManager
 from core.stats import StatsTracker
 from core.system_updater import safe_hot_reload
 from core.tool_registry import execute_tool, get_available_tools
-from core.tools_catalog import TOOLS_CATALOG, tool_label, tool_reason
+from core.tools_catalog import TOOLS_CATALOG, device_tool_schemas, tool_label, tool_reason
 from memory.db_manager import initialize_database, recent_history, save_conversation, store_fact
 from memory.memory_engine import MemoryEngine
 from tools.system_control import AndroidCommand, command_for_request
@@ -85,6 +98,9 @@ STATE.add_listener(ACTION_LOG.publish_state)
 MEMORY_ENGINE = MemoryEngine(DATABASE_PATH)
 STATS = StatsTracker(DATABASE_PATH)
 PROVIDER_MANAGER = ProviderManager(PROVIDER_STATE_PATH)
+_KNOWLEDGE_ENGINE_INITIALIZED = False
+_LOCAL_REASONING_INITIALIZED = False
+
 CTX = BrainContext(
     log=ACTION_LOG,
     state=STATE,
@@ -108,9 +124,83 @@ async def lifespan(_: FastAPI):
     await initialize_database()
     await MEMORY_ENGINE.init()
     await STATS.init()
+    # Exactly one KnowledgeEngine is created by the application lifecycle and
+    # then passed through BrainContext.  The planner only consumes this
+    # instance; it never constructs or initializes one.
+    global _KNOWLEDGE_ENGINE_INITIALIZED, _LOCAL_REASONING_INITIALIZED
+    if not _LOCAL_REASONING_INITIALIZED:
+        _LOCAL_REASONING_INITIALIZED = True
+        if CTX.local_reasoning is None:
+            CTX.local_reasoning = LocalReasoningAdapter.from_environment()
+    if not _KNOWLEDGE_ENGINE_INITIALIZED:
+        _KNOWLEDGE_ENGINE_INITIALIZED = True
+        try:
+            if CTX.knowledge_engine is None:
+                CTX.knowledge_engine = KnowledgeEngine(db_path=DATABASE_PATH)
+        except Exception as exc:
+            CTX.knowledge_engine = None
+            ACTION_LOG.log(f"Local knowledge unavailable: {type(exc).__name__}", "warning")
+    # Capability registration belongs to the application lifecycle.  The
+    # planner receives this active registry and only queries it per request.
+    bootstrap_application_capabilities(
+        CTX.capability_registry,
+        PROVIDER_MANAGER,
+        available_tools=get_available_tools(),
+        device_tools=device_tool_schemas(),
+        knowledge_engine=CTX.knowledge_engine,
+        local_reasoning=CTX.local_reasoning,
+    )
+    watcher_config = IngestionWatcherConfig.from_environment()
+    if (
+        watcher_config.enabled
+        and CTX.knowledge_engine is not None
+        and CTX.knowledge_watcher is None
+        and hasattr(CTX.knowledge_engine, "scan")
+        and hasattr(CTX.knowledge_engine, "ingest")
+    ):
+        try:
+            CTX.knowledge_watcher = KnowledgeIngestionWatcher(
+                CTX.knowledge_engine,
+                config=watcher_config,
+                log=ACTION_LOG.log,
+            )
+            CTX.knowledge_watcher.start()
+        except Exception as exc:
+            CTX.knowledge_watcher = None
+            ACTION_LOG.log(
+                f"Knowledge background watcher unavailable: {type(exc).__name__}",
+                "warning",
+            )
     ACTION_LOG.log("VYRX Brain online", "success")
     ACTION_LOG.log(f"Core engine v{BRAIN_VERSION} ready", "info")
-    yield
+    try:
+        yield
+    finally:
+        if CTX.knowledge_watcher is not None:
+            try:
+                await CTX.knowledge_watcher.stop()
+            except Exception as exc:
+                ACTION_LOG.log(
+                    f"Knowledge background watcher shutdown failed: {type(exc).__name__}",
+                    "warning",
+                )
+            CTX.knowledge_watcher = None
+        # The adapter owns no persistent model in this environment, but it can
+        # still have an active subprocess. Shutdown is explicit and safe.
+        if CTX.knowledge_engine is not None:
+            try:
+                CTX.knowledge_engine.close()
+            except Exception as exc:
+                ACTION_LOG.log(
+                    f"Local knowledge shutdown failed: {type(exc).__name__}",
+                    "warning",
+                )
+            CTX.knowledge_engine = None
+        _KNOWLEDGE_ENGINE_INITIALIZED = False
+        if CTX.local_reasoning is not None:
+            CTX.local_reasoning.close()
+        CTX.local_reasoning = None
+        _LOCAL_REASONING_INITIALIZED = False
 
 
 app = FastAPI(title="VYRX Brain (RONIN core)", version=BRAIN_VERSION, lifespan=lifespan)
@@ -334,6 +424,34 @@ async def api_health() -> dict:
         "memory_db_bytes": db_bytes,
         "python": sys.version.split()[0],
     }
+
+
+@app.post("/admin/knowledge/scan")
+async def admin_knowledge_scan() -> dict:
+    """Run one deterministic knowledge scan; never exposed as a ReAct tool."""
+    engine = CTX.knowledge_engine
+    if engine is None:
+        raise HTTPException(503, "Local knowledge is unavailable")
+    try:
+        report = await asyncio.to_thread(scan_knowledge, engine)
+    except Exception as exc:
+        ACTION_LOG.log(f"Knowledge scan failed: {type(exc).__name__}", "error")
+        raise HTTPException(503, "Local knowledge scan failed") from exc
+    return {"status": "ok", "report": scan_report_dict(report)}
+
+
+@app.post("/admin/knowledge/ingest")
+async def admin_knowledge_ingest() -> dict:
+    """Run one deterministic knowledge ingestion pass from the admin surface."""
+    engine = CTX.knowledge_engine
+    if engine is None:
+        raise HTTPException(503, "Local knowledge is unavailable")
+    try:
+        report = await asyncio.to_thread(ingest_knowledge, engine)
+    except Exception as exc:
+        ACTION_LOG.log(f"Knowledge ingestion failed: {type(exc).__name__}", "error")
+        raise HTTPException(503, "Local knowledge ingestion failed") from exc
+    return {"status": "ok", "report": ingestion_report_dict(report)}
 
 
 @app.get("/api/action_logs")

@@ -2,7 +2,8 @@
 
 Every user request flows through:
 
-    1. Planner   : receive request, inject persistent memory into the prompt
+    1. Planner   : identify semantic capability requirements, query the active
+                   Registry, and inject the current capability plan
     2. Agent loop: LLM emits native function calls or ``<tool>`` JSON tags
     3. Executor  : Brain tools run inline (memory / web / shell); device tools
                    (open app / read screen / click / …) are dispatched to the
@@ -33,11 +34,10 @@ import asyncio
 import json
 import threading
 import time
-import traceback
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 from core.action_log import ActionLog
 from core.capabilities import (
@@ -45,16 +45,26 @@ from core.capabilities import (
     CapabilityDescriptor,
     CapabilityHealth,
     ExecutionOutcome,
+    ExecutionResult,
     SemanticCapabilityType,
     classify_exception,
+    outcome_for_failure,
 )
-from core.capability_bootstrap import bootstrap_registry as _bootstrap_registry_fn
 from core.capability_executor import execute_capability as _execute_capability_fn
 from core.execution_boundary import (
+    execute_boundary,
     execute_llm_boundary,
     execute_search_boundary,
     execute_tool_boundary,
 )
+from core.knowledge.engine import KnowledgeEngine
+from core.knowledge.integration import (
+    KNOWLEDGE_CAPABILITY_ID,
+    KNOWLEDGE_TOOL_NAME,
+    knowledge_tool_schema,
+)
+from core.knowledge.watcher import KnowledgeIngestionWatcher
+from core.local_reasoning import LOCAL_REASONING_CAPABILITY_ID, LocalReasoningAdapter
 from core.llm_handler import (
     SYSTEM_PROMPT,
     LLMError,
@@ -98,8 +108,33 @@ from tools.system_control import command_for_request
 from tools.web_search import search
 
 
+# Keep the original callables so the compatibility shim below can preserve
+# the planner's established test/injection seam while production execution
+# always goes through the specialized normalized boundaries.  The shim is
+# intentionally local to this module; it does not change boundary signatures
+# or pass registry state into them.
+_ORIGINAL_COMPLETE = complete
+_ORIGINAL_EXECUTE_TOOL = execute_tool
+_ORIGINAL_EXECUTE_LLM_BOUNDARY = execute_llm_boundary
+_ORIGINAL_EXECUTE_TOOL_BOUNDARY = execute_tool_boundary
+
+
 #: Maximum LLM round-trips per user request (device callbacks included).
 MAX_AGENT_STEPS = 8
+
+#: Maximum alternative implementations attempted for one failed sub-goal.
+#: This is deliberately separate from the ReAct step budget.
+MAX_CAPABILITY_RECOVERY_ATTEMPTS = 2
+
+#: Failure classes for which backend substitution is appropriate by default.
+#: Validation, authorization, policy, and deterministic input failures remain
+#: available to the ReAct correction path instead of being blindly swapped.
+_RECOVERY_ELIGIBLE_FAILURES = frozenset({
+    CanonicalFailureClass.TRANSIENT,
+    CanonicalFailureClass.NETWORK_ISOLATED,
+    CanonicalFailureClass.UNSUPPORTED_OPERATION,
+    CanonicalFailureClass.UNKNOWN_FATAL,
+})
 
 #: Truncation for tool observations fed back into the context window.
 MAX_OBSERVATION_CHARS = 6000
@@ -108,6 +143,738 @@ MAX_OBSERVATION_CHARS = 6000
 #: module constant so tests and local runs can retune it without patching
 #: ``asyncio.sleep`` globally.
 RATE_LIMIT_PAUSE_SECONDS: float = 2.0
+
+
+# ---------------------------------------------------------------------------
+# Capability-aware task planning
+# ---------------------------------------------------------------------------
+#
+# This is intentionally a capability plan, not a second execution graph.
+# ``AgentAction`` and the existing ReAct message/tool protocol remain the
+# execution representation.  These small records only describe which semantic
+# capabilities a task/sub-goal needs and which registered implementations are
+# currently eligible to satisfy it.
+
+
+@dataclass(frozen=True)
+class CapabilityRequirement:
+    """One semantic capability requirement for one planner sub-goal."""
+
+    sub_goal_id: str
+    description: str
+    capability_type: SemanticCapabilityType
+    requires_internet: bool | None = None
+    requires_local: bool | None = None
+    required_permissions: tuple[str, ...] = ()
+
+
+@dataclass
+class CapabilitySubGoal:
+    """Capability requirement plus current selectable implementations.
+
+    ``candidates`` contains only implementations that the current planner
+    policy may select: AVAILABLE and DEGRADED.  UNKNOWN implementations are
+    retained separately so uncertainty is visible without being mislabeled as
+    healthy or selectable.
+    """
+
+    requirement: CapabilityRequirement
+    candidates: tuple[CapabilityDescriptor, ...] = ()
+    unknown_candidates: tuple[CapabilityDescriptor, ...] = ()
+    unavailable_candidates: tuple[CapabilityDescriptor, ...] = ()
+    selected_capability_id: str | None = None
+    # Per-plan-instance execution history. This is intentionally scoped to
+    # this sub-goal so an alternative in one semantic domain cannot blacklist
+    # an unrelated sub-goal.
+    attempted_capabilities: list[str] = field(default_factory=list)
+    # Internal, sanitized recovery audit trail. It is not included in user
+    # observations or prompts.
+    recovery_history: list[dict[str, Any]] = field(default_factory=list)
+
+    def mark_attempted(self, capability_id: str | None) -> None:
+        """Record one attempted implementation exactly once."""
+        if capability_id and capability_id not in self.attempted_capabilities:
+            self.attempted_capabilities.append(capability_id)
+
+    def record_recovery_event(self, **event: Any) -> None:
+        """Keep a sanitized internal record of one recovery decision."""
+        self.recovery_history.append({
+            key: value for key, value in event.items()
+            if key in {
+                "event", "capability_id", "failure_class", "outcome",
+                "reason", "selected", "attempt",
+            }
+        })
+
+    @property
+    def candidate_ids(self) -> tuple[str, ...]:
+        return tuple(candidate.id for candidate in self.candidates)
+
+    @property
+    def unknown_candidate_ids(self) -> tuple[str, ...]:
+        return tuple(candidate.id for candidate in self.unknown_candidates)
+
+    @property
+    def unavailable_candidate_ids(self) -> tuple[str, ...]:
+        return tuple(candidate.id for candidate in self.unavailable_candidates)
+
+    @property
+    def available(self) -> bool:
+        """Whether this sub-goal has a currently selectable implementation."""
+        return bool(self.candidates)
+
+    @property
+    def health_state(self) -> CapabilityHealth:
+        """Summarize Registry health without collapsing UNKNOWN into healthy."""
+        if any(candidate.health == CapabilityHealth.AVAILABLE for candidate in self.candidates):
+            return CapabilityHealth.AVAILABLE
+        if self.candidates:
+            return CapabilityHealth.DEGRADED
+        if self.unknown_candidates:
+            return CapabilityHealth.UNKNOWN
+        return CapabilityHealth.UNAVAILABLE
+
+
+@dataclass
+class CapabilityPlan:
+    """A task-level semantic plan; actions still belong to the ReAct loop."""
+
+    task: str
+    sub_goals: list[CapabilitySubGoal] = field(default_factory=list)
+    outcomes: dict[str, ExecutionOutcome] = field(default_factory=dict)
+
+    def sub_goal(self, sub_goal_id: str) -> CapabilitySubGoal | None:
+        return next((item for item in self.sub_goals if item.requirement.sub_goal_id == sub_goal_id), None)
+
+    def requirement_for_type(self, capability_type: SemanticCapabilityType) -> CapabilityRequirement | None:
+        for item in self.sub_goals:
+            if item.requirement.capability_type == capability_type:
+                return item.requirement
+        return None
+
+    @property
+    def outcome(self) -> ExecutionOutcome | None:
+        """Summarize completed sub-goals without hiding partial success."""
+        if not self.outcomes:
+            return None
+        values = list(self.outcomes.values())
+        # PARTIAL_SUCCESS is a producer assertion, never an aggregate guess
+        # made from one successful and one failed sub-goal.
+        if any(value == ExecutionOutcome.PARTIAL_SUCCESS for value in values):
+            return ExecutionOutcome.PARTIAL_SUCCESS
+        for value in values:
+            if value != ExecutionOutcome.SUCCESS:
+                return value
+        return ExecutionOutcome.SUCCESS
+
+    def record_outcome(self, sub_goal_id: str, result: ExecutionResult) -> None:
+        """Record one sub-goal result; unrelated sub-goals remain untouched."""
+        current = self.sub_goal(sub_goal_id)
+        if current is not None:
+            self.outcomes[sub_goal_id] = result.outcome
+            current.mark_attempted(result.capability_id or current.selected_capability_id)
+
+
+# The planner consumes these states; it does not calculate or mutate health.
+# UNKNOWN is deliberately not a selectable/dispatchable candidate.  The
+# separate ``unknown_candidates`` field preserves uncertainty for a future,
+# explicitly defined validation policy without implementing that policy here.
+_USABLE_CAPABILITY_HEALTH = frozenset({
+    CapabilityHealth.AVAILABLE,
+    CapabilityHealth.DEGRADED,
+})
+_CAPABILITY_HEALTH_ORDER = {
+    CapabilityHealth.AVAILABLE: 0,
+    CapabilityHealth.DEGRADED: 1,
+    CapabilityHealth.UNKNOWN: 2,
+}
+
+# Semantic mapping for the existing action/tool surface.  No provider or model
+# identities appear here.
+_TOOL_CAPABILITY_TYPES: dict[str, SemanticCapabilityType] = {
+    "search": SemanticCapabilityType.WEB_RETRIEVAL,
+    "web_search": SemanticCapabilityType.WEB_RETRIEVAL,
+    KNOWLEDGE_TOOL_NAME: SemanticCapabilityType.LOCAL_KNOWLEDGE_SEARCH,
+    "save_memory": SemanticCapabilityType.MEMORY_PERSISTENCE,
+    "retrieve_memory": SemanticCapabilityType.MEMORY_PERSISTENCE,
+    "read_file": SemanticCapabilityType.FILE_SYSTEM_IO,
+    "write_file": SemanticCapabilityType.FILE_SYSTEM_IO,
+    "list_files": SemanticCapabilityType.FILE_SYSTEM_IO,
+    "run_termux_command": SemanticCapabilityType.SYSTEM_COMMAND,
+    "open_app": SemanticCapabilityType.DEVICE_INTERACTION,
+    "list_apps": SemanticCapabilityType.DEVICE_INTERACTION,
+    "read_screen": SemanticCapabilityType.DEVICE_INTERACTION,
+    "click": SemanticCapabilityType.DEVICE_INTERACTION,
+    "click_xy": SemanticCapabilityType.DEVICE_INTERACTION,
+    "click_node": SemanticCapabilityType.DEVICE_INTERACTION,
+    "set_text": SemanticCapabilityType.DEVICE_INTERACTION,
+    "scroll": SemanticCapabilityType.DEVICE_INTERACTION,
+    "press_back": SemanticCapabilityType.DEVICE_INTERACTION,
+    "press_home": SemanticCapabilityType.DEVICE_INTERACTION,
+    "get_notifications": SemanticCapabilityType.DEVICE_INTERACTION,
+}
+
+
+def _add_capability_requirement(
+    requirements: list[CapabilityRequirement],
+    *,
+    sub_goal_id: str,
+    description: str,
+    capability_type: SemanticCapabilityType,
+    requires_internet: bool | None = None,
+    requires_local: bool | None = None,
+    required_permissions: tuple[str, ...] = (),
+) -> None:
+    if any(item.capability_type == capability_type for item in requirements):
+        return
+    requirements.append(CapabilityRequirement(
+        sub_goal_id=sub_goal_id,
+        description=description,
+        capability_type=capability_type,
+        requires_internet=requires_internet,
+        requires_local=requires_local,
+        required_permissions=required_permissions,
+    ))
+
+
+def identify_required_capabilities(task: str) -> tuple[CapabilityRequirement, ...]:
+    """Infer semantic requirements without selecting a vendor or model.
+
+    This is deliberately conservative: it identifies requirements implied by
+    the request, while the Registry remains the source of truth for whether an
+    implementation exists and is usable.  It does not implement retrieval,
+    routing policy, or an offline fallback chain.
+    """
+    normalized = " ".join(str(task or "").casefold().split())
+    requirements: list[CapabilityRequirement] = []
+
+    # Every current ReAct task needs a reasoning step.  The meta-capability
+    # used for health bookkeeping is excluded later from implementation
+    # candidates, so this remains a semantic requirement rather than a vendor.
+    _add_capability_requirement(
+        requirements,
+        sub_goal_id="subgoal-reasoning",
+        description="Understand the request and orchestrate the next ReAct step.",
+        capability_type=SemanticCapabilityType.REASONING,
+    )
+
+    local_knowledge_requested = (
+        "local knowledge" in normalized
+        or "knowledge base" in normalized
+        or "indexed knowledge" in normalized
+        or "knowledge index" in normalized
+        or "search my documents" in normalized
+        or "search local documents" in normalized
+        or "local docs" in normalized
+        or "offline knowledge" in normalized
+    )
+
+    if any(token in normalized for token in (
+        "current", "latest", "today", "news", "web", "internet", "external",
+        "online", "up-to-date", "up to date",
+    )) or ("search" in normalized and not local_knowledge_requested):
+        _add_capability_requirement(
+            requirements,
+            sub_goal_id="subgoal-web-retrieval",
+            description="Retrieve current external information.",
+            capability_type=SemanticCapabilityType.WEB_RETRIEVAL,
+            requires_internet=True,
+        )
+
+    if not local_knowledge_requested and any(token in normalized for token in (
+        "file", "files", "project", "codebase", "repository", "repo", "folder",
+        "directory", "path", "local", "workspace",
+    )):
+        _add_capability_requirement(
+            requirements,
+            sub_goal_id="subgoal-local-files",
+            description="Inspect or operate on local project/file data.",
+            capability_type=SemanticCapabilityType.FILE_SYSTEM_IO,
+            requires_local=True,
+        )
+
+    if local_knowledge_requested:
+        _add_capability_requirement(
+            requirements,
+            sub_goal_id="subgoal-local-knowledge",
+            description="Search locally available knowledge.",
+            capability_type=SemanticCapabilityType.LOCAL_KNOWLEDGE_SEARCH,
+            requires_local=True,
+        )
+
+    if any(token in normalized for token in ("compare", "comparison", "contrast", "synthesize")):
+        _add_capability_requirement(
+            requirements,
+            sub_goal_id="subgoal-synthesis",
+            description="Compare or synthesize the independently gathered results.",
+            capability_type=SemanticCapabilityType.SYNTHESIS,
+        )
+
+    if any(token in normalized for token in (
+        "open app", "launch", "click", "tap", "screen", "notification", "device",
+        "phone",
+    )):
+        _add_capability_requirement(
+            requirements,
+            sub_goal_id="subgoal-device",
+            description="Interact with the Android device.",
+            capability_type=SemanticCapabilityType.DEVICE_INTERACTION,
+        )
+
+    if any(token in normalized for token in (
+        "calculate", "compute", "formula", "sort", "transform", "arithmetic",
+    )):
+        _add_capability_requirement(
+            requirements,
+            sub_goal_id="subgoal-compute",
+            description="Perform deterministic computation.",
+            capability_type=SemanticCapabilityType.DETERMINISTIC_COMPUTE,
+        )
+
+    if any(token in normalized for token in (
+        "remember", "memory", "recall preference", "save this",
+    )):
+        _add_capability_requirement(
+            requirements,
+            sub_goal_id="subgoal-memory",
+            description="Persist or recall user-provided memory.",
+            capability_type=SemanticCapabilityType.MEMORY_PERSISTENCE,
+            requires_local=True,
+        )
+
+    return tuple(requirements)
+
+
+def _descriptor_matches_requirement(
+    descriptor: CapabilityDescriptor,
+    requirement: CapabilityRequirement,
+) -> bool:
+    """Apply semantic/dependency matching without inspecting health."""
+    if descriptor.id == _REASONING_META_CAP_ID:
+        return False
+    if requirement.requires_internet is not None \
+            and descriptor.requires_internet != requirement.requires_internet:
+        return False
+    if requirement.requires_local is not None \
+            and descriptor.is_local != requirement.requires_local:
+        return False
+    if requirement.required_permissions and not set(requirement.required_permissions).issubset(
+        set(descriptor.required_permissions)
+    ):
+        return False
+    return True
+
+
+def _candidate_satisfies(
+    descriptor: CapabilityDescriptor,
+    requirement: CapabilityRequirement,
+    *,
+    include_unknown: bool = False,
+) -> bool:
+    allowed_health = _USABLE_CAPABILITY_HEALTH
+    if include_unknown:
+        allowed_health = allowed_health | {CapabilityHealth.UNKNOWN}
+    if descriptor.health not in allowed_health:
+        return False
+    return _descriptor_matches_requirement(descriptor, requirement)
+
+
+def query_capability_candidates(
+    registry: CapabilityRegistry | None,
+    requirement: CapabilityRequirement,
+    *,
+    include_unknown: bool = False,
+) -> tuple[CapabilityDescriptor, ...]:
+    """Query Registry-backed implementations for planner selection.
+
+    By default only AVAILABLE and DEGRADED implementations are selectable.
+    ``include_unknown`` is an explicit inspection hook for a future validation
+    or probing policy; no planner path enables it for dispatch selection.
+    UNAVAILABLE implementations are always excluded.
+    """
+    if registry is None:
+        return ()
+    descriptors = registry.query_by_semantic_type(requirement.capability_type)
+    eligible = [
+        descriptor
+        for descriptor in descriptors
+        if _candidate_satisfies(
+            descriptor,
+            requirement,
+            include_unknown=include_unknown,
+        )
+    ]
+    # This is only a deterministic presentation preference.  It does not
+    # encode a primary/secondary/offline fallback chain or a health policy.
+    eligible.sort(key=lambda descriptor: (
+        _CAPABILITY_HEALTH_ORDER.get(descriptor.health, 99), descriptor.id,
+    ))
+    return tuple(eligible)
+
+
+def build_capability_plan(
+    task: str,
+    registry: CapabilityRegistry | None,
+) -> CapabilityPlan:
+    """Identify requirements and attach Registry-backed candidates."""
+    sub_goals: list[CapabilitySubGoal] = []
+    for requirement in identify_required_capabilities(task):
+        candidates = query_capability_candidates(registry, requirement)
+        matching = [] if registry is None else [
+            descriptor
+            for descriptor in registry.query_by_semantic_type(requirement.capability_type)
+            if _descriptor_matches_requirement(descriptor, requirement)
+        ]
+        unknown = tuple(
+            descriptor for descriptor in matching
+            if descriptor.health == CapabilityHealth.UNKNOWN
+        )
+        unavailable = tuple(
+            descriptor for descriptor in matching
+            if descriptor.health == CapabilityHealth.UNAVAILABLE
+        )
+        sub_goals.append(CapabilitySubGoal(
+            requirement=requirement,
+            candidates=candidates,
+            unknown_candidates=unknown,
+            unavailable_candidates=unavailable,
+            selected_capability_id=candidates[0].id if candidates else None,
+        ))
+    return CapabilityPlan(task=task, sub_goals=sub_goals)
+
+
+def _capability_plan_prompt(
+    plan: CapabilityPlan,
+    *,
+    affected_sub_goal_id: str | None = None,
+) -> str:
+    """Describe semantic availability to the reasoning model, not internals."""
+    lines = ["", "[CAPABILITY PLAN — semantic requirements and current availability]"]
+    for sub_goal in plan.sub_goals:
+        requirement = sub_goal.requirement
+        state = sub_goal.health_state.value
+        marker = " (reconsider this sub-goal)" if requirement.sub_goal_id == affected_sub_goal_id else ""
+        lines.append(
+            f"- {requirement.sub_goal_id}: {requirement.capability_type.value} — {state}{marker}"
+        )
+    if affected_sub_goal_id:
+        lines.append("Only reconsider the affected sub-goal; retain independent verified work.")
+    return "\n".join(lines)
+
+
+def _tool_semantic_type(tool_name: str) -> SemanticCapabilityType | None:
+    return _TOOL_CAPABILITY_TYPES.get(str(tool_name or "").strip())
+
+
+def _filter_provider_payload_by_capability_plan(
+    provider_payload: list[dict],
+    plan: CapabilityPlan | None,
+) -> list[dict]:
+    """Apply Registry health without presenting UNKNOWN as healthy.
+
+    AVAILABLE and DEGRADED providers are selected from the plan.  UNKNOWN
+    providers remain in the legacy transport input only when no validated
+    implementation exists; the plan labels that sub-goal ``unknown`` and does
+    not select one.  This preserves first-use compatibility without inventing
+    a probing subsystem or changing execution-boundary contracts.  Providers
+    whose sub-goal has no known implementation are not attempted.
+    """
+    if plan is None:
+        return provider_payload
+    reasoning = plan.sub_goal("subgoal-reasoning")
+    if reasoning is None:
+        return provider_payload
+    if reasoning.health_state == CapabilityHealth.UNKNOWN:
+        blocked = set(reasoning.unavailable_candidate_ids)
+        return [provider for provider in provider_payload
+                if f"provider-{str(provider.get('provider') or '').lower().strip()}"
+                not in blocked]
+    if not reasoning.available:
+        # No descriptor at all means a manually-created/legacy context has not
+        # run application bootstrap; preserve its old transport behavior.
+        return provider_payload if not reasoning.unavailable_candidate_ids else [
+            provider for provider in provider_payload
+            if f"provider-{str(provider.get('provider') or '').lower().strip()}"
+            not in set(reasoning.unavailable_candidate_ids)
+        ]
+    selected_ids = set(reasoning.candidate_ids)
+    return [
+        provider for provider in provider_payload
+        if f"provider-{str(provider.get('provider') or '').lower().strip()}"
+        in selected_ids
+    ]
+
+
+def _filter_tools_by_capability_plan(
+    tools: list[dict],
+    plan: CapabilityPlan | None,
+) -> list[dict]:
+    """Remove tools whose required semantic capability has no candidate."""
+    if plan is None:
+        return tools
+    unavailable_types = {
+        sub_goal.requirement.capability_type
+        for sub_goal in plan.sub_goals
+        if sub_goal.health_state == CapabilityHealth.UNAVAILABLE
+        and sub_goal.requirement.capability_type != SemanticCapabilityType.REASONING
+    }
+    if not unavailable_types:
+        return tools
+    return [
+        tool for tool in tools
+        if _tool_semantic_type(tool.get("function", {}).get("name", ""))
+        not in unavailable_types
+    ]
+
+
+def _sub_goal_for_tool(plan: CapabilityPlan | None, tool_name: str) -> str | None:
+    if plan is None:
+        return None
+    capability_type = _tool_semantic_type(tool_name)
+    if capability_type is None:
+        return None
+    requirement = plan.requirement_for_type(capability_type)
+    return requirement.sub_goal_id if requirement else None
+
+
+def recovery_eligible(result: ExecutionResult) -> bool:
+    """Decide whether backend substitution is appropriate for this failure."""
+    if result.outcome in {ExecutionOutcome.SUCCESS, ExecutionOutcome.PARTIAL_SUCCESS}:
+        return False
+    return _failure_class_for_result(result) in _RECOVERY_ELIGIBLE_FAILURES
+
+
+def _affected_sub_goal_id(
+    plan: CapabilityPlan,
+    result: ExecutionResult,
+    tool_name: str | None,
+) -> str | None:
+    """Resolve one failure to one plan sub-goal without touching siblings."""
+    if result.sub_goal_id and plan.sub_goal(result.sub_goal_id) is not None:
+        return result.sub_goal_id
+    if result.capability_id:
+        matching = next(
+            (
+                item for item in plan.sub_goals
+                if result.capability_id in item.candidate_ids
+                or result.capability_id == item.selected_capability_id
+            ),
+            None,
+        )
+        if matching is not None:
+            return matching.requirement.sub_goal_id
+    return _sub_goal_for_tool(plan, tool_name or "")
+
+
+def _refresh_sub_goal_candidates(
+    current: CapabilitySubGoal,
+    registry: CapabilityRegistry,
+) -> None:
+    """Refresh only one sub-goal's compatible registry snapshots."""
+    current.candidates = query_capability_candidates(registry, current.requirement)
+    matching = [
+        descriptor
+        for descriptor in registry.query_by_semantic_type(current.requirement.capability_type)
+        if _descriptor_matches_requirement(descriptor, current.requirement)
+    ]
+    current.unknown_candidates = tuple(
+        descriptor for descriptor in matching
+        if descriptor.health == CapabilityHealth.UNKNOWN
+    )
+    current.unavailable_candidates = tuple(
+        descriptor for descriptor in matching
+        if descriptor.health == CapabilityHealth.UNAVAILABLE
+    )
+
+
+def select_next_capability(
+    sub_goal: CapabilitySubGoal,
+    registry: CapabilityRegistry,
+) -> CapabilityDescriptor | None:
+    """Select the next healthy, compatible, untried implementation."""
+    _refresh_sub_goal_candidates(sub_goal, registry)
+    for candidate in sub_goal.candidates:
+        if candidate.id not in sub_goal.attempted_capabilities:
+            return candidate
+    return None
+
+
+def recover_failed_subgoal(
+    plan: CapabilityPlan | None,
+    registry: CapabilityRegistry | None,
+    result: ExecutionResult,
+    *,
+    tool_name: str | None = None,
+    execute_candidate: Callable[[CapabilityDescriptor], ExecutionResult] | None = None,
+) -> tuple[ExecutionResult, str | None, bool]:
+    """Boundedly hot-swap one failed sub-goal through a supplied boundary.
+
+    The executor is deliberately supplied by the caller so this helper can
+    reuse the existing tool/provider boundary without inventing a second
+    execution system. It never updates registry health; execution boundaries
+    remain responsible for health policy side effects.
+    """
+    if plan is None or registry is None:
+        return result, None, False
+    sub_goal_id = _affected_sub_goal_id(plan, result, tool_name)
+    if sub_goal_id is None:
+        return result, None, False
+    current = plan.sub_goal(sub_goal_id)
+    if current is None:
+        return result, None, False
+
+    failed_id = result.capability_id or current.selected_capability_id
+    current.mark_attempted(failed_id)
+    failure_class = _failure_class_for_result(result)
+    current.record_recovery_event(
+        event="failed",
+        capability_id=failed_id,
+        failure_class=failure_class.value if failure_class else None,
+        outcome=result.outcome.value,
+    )
+    if not recovery_eligible(result):
+        current.record_recovery_event(
+            event="recovery_skipped",
+            capability_id=failed_id,
+            reason="failure_class_not_eligible",
+        )
+        plan.record_outcome(sub_goal_id, result)
+        return result, None, False
+
+    _refresh_sub_goal_candidates(current, registry)
+    for descriptor in registry.query_by_semantic_type(current.requirement.capability_type):
+        if not _descriptor_matches_requirement(descriptor, current.requirement):
+            continue
+        if descriptor.id in current.attempted_capabilities:
+            reason = "already_attempted"
+        elif descriptor.health == CapabilityHealth.UNKNOWN:
+            reason = "unknown_health"
+        elif descriptor.health == CapabilityHealth.UNAVAILABLE:
+            reason = "unavailable"
+        else:
+            continue
+        current.record_recovery_event(
+            event="candidate_rejected",
+            capability_id=descriptor.id,
+            reason=reason,
+        )
+
+    last_result = result
+    if execute_candidate is None:
+        current.record_recovery_event(
+            event="recovery_skipped",
+            reason="no_executor",
+        )
+        plan.record_outcome(sub_goal_id, last_result)
+        return last_result, sub_goal_id, False
+
+    # The failed implementation is not an alternative. Persisted attempted
+    # state therefore also enforces the bound if recovery is invoked again for
+    # the same sub-goal instance.
+    alternatives_already_tried = max(0, len(current.attempted_capabilities) - 1)
+    remaining_attempts = max(
+        0,
+        MAX_CAPABILITY_RECOVERY_ATTEMPTS - alternatives_already_tried,
+    )
+    for _ in range(remaining_attempts):
+        candidate = select_next_capability(current, registry)
+        if candidate is None:
+            break
+        # Mark before invocation so a faulty callback cannot cause a loop to
+        # retry the same implementation.
+        current.mark_attempted(candidate.id)
+        current.selected_capability_id = candidate.id
+        current.record_recovery_event(
+            event="candidate_selected",
+            capability_id=candidate.id,
+            selected=True,
+            reason="first_eligible_untried_candidate",
+            attempt=len(current.attempted_capabilities) - 1,
+        )
+        try:
+            candidate_result = execute_candidate(candidate)
+        except Exception as exc:
+            failure_class, diagnostics = classify_exception(exc)
+            candidate_result = ExecutionResult(
+                outcome=outcome_for_failure(failure_class),
+                failure_class=failure_class,
+                diagnostics=diagnostics,
+            )
+        if not isinstance(candidate_result, ExecutionResult):
+            candidate_result = ExecutionResult(
+                outcome=ExecutionOutcome.FATAL_FAILURE,
+                failure_class=CanonicalFailureClass.VALIDATION_FAILED,
+            )
+        candidate_result = candidate_result.model_copy(update={
+            "sub_goal_id": sub_goal_id,
+            "capability_id": candidate.id,
+        })
+        last_result = candidate_result
+        candidate_failure = _failure_class_for_result(candidate_result)
+        if candidate_result.outcome in {
+            ExecutionOutcome.SUCCESS,
+            ExecutionOutcome.PARTIAL_SUCCESS,
+        }:
+            current.record_recovery_event(
+                event="recovered",
+                capability_id=candidate.id,
+                outcome=candidate_result.outcome.value,
+                reason="validated_execution_result",
+            )
+            plan.record_outcome(sub_goal_id, candidate_result)
+            return candidate_result, sub_goal_id, True
+        current.record_recovery_event(
+            event="candidate_rejected",
+            capability_id=candidate.id,
+            failure_class=candidate_failure.value if candidate_failure else None,
+            outcome=candidate_result.outcome.value,
+            reason="execution_failed",
+        )
+
+    current.record_recovery_event(
+        event="recovery_exhausted",
+        reason="no_eligible_untried_alternative_or_attempt_bound",
+    )
+    plan.record_outcome(sub_goal_id, last_result)
+    return last_result, sub_goal_id, False
+
+
+def replan_affected_subgoal(
+    plan: CapabilityPlan | None,
+    registry: CapabilityRegistry | None,
+    result: ExecutionResult,
+    *,
+    tool_name: str | None = None,
+) -> tuple[CapabilityPlan | None, str | None]:
+    """Refresh only the failed sub-goal's candidates from current Registry state."""
+    if plan is None or registry is None:
+        return plan, None
+    sub_goal_id = _affected_sub_goal_id(plan, result, tool_name)
+    if sub_goal_id is None:
+        return plan, None
+    current = plan.sub_goal(sub_goal_id)
+    if current is None:
+        return plan, None
+    current.mark_attempted(result.capability_id or current.selected_capability_id)
+    _refresh_sub_goal_candidates(current, registry)
+    current.selected_capability_id = (
+        current.candidates[0].id if current.candidates else None
+    )
+    plan.record_outcome(sub_goal_id, result)
+    return plan, sub_goal_id
+
+
+def _record_capability_result(
+    plan: CapabilityPlan | None,
+    result: ExecutionResult,
+    *,
+    tool_name: str | None = None,
+) -> None:
+    if plan is None:
+        return
+    sub_goal_id = _affected_sub_goal_id(plan, result, tool_name)
+    if sub_goal_id:
+        plan.record_outcome(sub_goal_id, result)
 
 
 async def _rate_limit_pause() -> None:
@@ -219,7 +986,19 @@ class BrainContext:
     provider_manager: ProviderManager
     memory_engine: MemoryEngine
     device_status: dict = field(default_factory=dict)
+    # The application owns registration/bootstrap during its lifespan.  The
+    # planner receives this registry as read/write health state only.
     capability_registry: CapabilityRegistry = field(default_factory=CapabilityRegistry)
+    # The application creates this once during its lifespan.  The planner
+    # receives the established instance and never constructs or initializes it.
+    knowledge_engine: KnowledgeEngine | None = None
+    # The application lifecycle owns this optional periodic scanner. The
+    # planner does not start, stop, or call it.
+    knowledge_watcher: KnowledgeIngestionWatcher | None = None
+    # The application lifecycle may establish one serialized local reasoning
+    # adapter. The planner only consumes it when the capability plan selects
+    # its registry candidate.
+    local_reasoning: LocalReasoningAdapter | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -238,38 +1017,103 @@ def _thinking(text: str, *, step: int = 0, phase: str = "plan") -> None:
     emit_event(EVENT_THINKING, step=step, phase=phase, text=text)
 
 
+def _capability_transport_metadata(
+    descriptor: CapabilityDescriptor | None,
+    producer_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Assemble transport metadata with one authoritative locality source.
+
+    Producer metadata may carry orthogonal facts such as retrieval method, but
+    locality is never accepted from it. The selected descriptor overwrites any
+    conflicting semantic metadata and is the only source allowed to add
+    locality.
+    """
+    metadata = {
+        key: value
+        for key, value in (producer_metadata or {}).items()
+        if key != "locality" and value is not None
+    }
+    if descriptor is None:
+        return metadata
+    metadata["semantic_capability"] = descriptor.capability_type.value
+    metadata.pop("locality", None)
+    if descriptor.is_local is True:
+        metadata["locality"] = "local"
+    elif descriptor.is_local is False:
+        metadata["locality"] = "remote"
+    return metadata
+
+
 def _tool_call(step: int, tool: str, arguments: dict, *, device: bool,
                label: str | None = None, thought: str | None = None,
-               action: dict | None = None) -> None:
+               action: dict | None = None, call_id: str | None = None,
+               descriptor: CapabilityDescriptor | None = None,
+               attempt: int = 0) -> None:
+    event_call_id = call_id or f"step-{step}:{tool}"
     emit_event(
         EVENT_TOOL_CALL,
         step=step,
         tool=tool,
+        call_id=event_call_id,
         label=label or tool_label(_tool_catalog_id(tool)),
         args=arguments,
         device=device,
         thought=thought or None,
         action=action,
+        attempt=attempt,
+        **_capability_transport_metadata(descriptor),
     )
 
 
-def _observation(step: int, tool: str, ok: bool, result: str, ms: int) -> None:
-    emit_event(EVENT_OBSERVATION, step=step, tool=tool, ok=bool(ok), ms=int(ms),
-               result=_clip(str(result), 320))
+def _observation(step: int, tool: str, ok: bool, result: str, ms: int,
+                 *, call_id: str | None = None, outcome: str | None = None,
+                 metadata: dict[str, Any] | None = None,
+                 attempt: int = 0) -> None:
+    payload: dict[str, Any] = {
+        "step": step,
+        "tool": tool,
+        "call_id": call_id or f"step-{step}:{tool}",
+        "ok": bool(ok),
+        "ms": int(ms),
+        "result": _clip(str(result), 320),
+    }
+    if outcome is not None:
+        payload["outcome"] = outcome
+    payload["attempt"] = attempt
+    if metadata:
+        payload.update({key: value for key, value in metadata.items() if value is not None})
+    emit_event(EVENT_OBSERVATION, **payload)
 
 
 def _self_correction(step: int, tool: str | None, reason: str, strategy: str,
-                     attempt: int = 0) -> None:
-    """One frame per healing attempt; ``reflexion`` is the semantic alias."""
-    emit_event(
-        EVENT_SELF_CORRECTION,
-        step=step,
-        tool=tool,
-        reason=_clip(reason, 240),
-        strategy=strategy,
-        attempt=attempt,
-        reflexion=_clip(reason, 240),
-    )
+                     attempt: int = 0, *, call_id: str | None = None,
+                     transition_type: str = "retry",
+                     semantic_capability: str | None = None,
+                     previous_candidate: str | None = None,
+                     selected_candidate: str | None = None,
+                     outcome: str | None = None,
+                     locality: str | None = None) -> None:
+    """Emit a typed recovery event without treating strategy prose as schema."""
+    payload: dict[str, Any] = {
+        "step": step,
+        "tool": tool,
+        "call_id": call_id,
+        "reason": _clip(reason, 240),
+        "strategy": strategy,
+        "attempt": attempt,
+        "transition_type": transition_type,
+        "reflexion": _clip(reason, 240),
+    }
+    for key, value in {
+        "semantic_capability": semantic_capability,
+        "previous_candidate": previous_candidate,
+        "selected_candidate": selected_candidate,
+        "outcome": outcome,
+        "locality": locality,
+    }.items():
+        if value is not None:
+            payload[key] = value
+    emit_event(EVENT_SELF_CORRECTION, **payload)
 
 
 def _correction_for_failure(result_text: str, tool_name: str) -> str:
@@ -297,7 +1141,7 @@ _FAILURE_REASON: dict[CanonicalFailureClass, str] = {
     CanonicalFailureClass.AUTH_DENIED: "authentication failed",
     CanonicalFailureClass.POLICY_BLOCKED: "request blocked by policy",
     CanonicalFailureClass.VALIDATION_FAILED: "invalid request data",
-    CanonicalFailureClass.DETERMINISTIC_ERROR: "requested resource not found",
+    CanonicalFailureClass.DETERMINISTIC_ERROR: "requested file was not found or command not found",
     CanonicalFailureClass.UNSUPPORTED_OPERATION: "operation not supported",
     CanonicalFailureClass.UNKNOWN_FATAL: "unexpected error",
 }
@@ -319,14 +1163,16 @@ def _tool_failure_observation(
     tool_name: str,
     failure_class: CanonicalFailureClass | None,
 ) -> str:
-    """Create a sanitized ReAct observation for a tool failure.
+    """Create a sanitized operational observation for a tool failure.
 
-    Format: ``"Tool {name} failed ({class}): {reason}"``
-    No raw exception details, stack traces, or internal paths are included.
+    The observation deliberately contains only the canonical class and a
+    stable, human-readable reason.  In particular, it never copies
+    ``ExecutionResult.data`` or ``diagnostics.raw_message`` because either may
+    contain an exception message, a filesystem path, or provider telemetry.
     """
-    label = _failure_class_label(failure_class)
+    label = failure_class.name if failure_class is not None else "UNKNOWN_FATAL"
     reason = _failure_class_reason(failure_class)
-    return f"Tool {tool_name} failed ({label}): {reason}"
+    return f"Tool {tool_name} failed. Failure class: {label}. Reason: {reason}."
 
 
 def _llm_failure_observation(
@@ -334,13 +1180,10 @@ def _llm_failure_observation(
     *,
     context: str = "Reasoning",
 ) -> str:
-    """Create a sanitized ReAct observation for an LLM reasoning failure.
-
-    Format: ``"{context} failed ({class}): {reason}"``
-    """
-    label = _failure_class_label(failure_class)
+    """Create a sanitized observation for an LLM reasoning failure."""
+    label = failure_class.name if failure_class is not None else "UNKNOWN_FATAL"
     reason = _failure_class_reason(failure_class)
-    return f"{context} failed ({label}): {reason}"
+    return f"{context} failed. Failure class: {label}. Reason: {reason}."
 
 
 def _correction_for_failure_class(
@@ -366,6 +1209,353 @@ def _correction_for_failure_class(
     if failure_class == CanonicalFailureClass.POLICY_BLOCKED:
         return "this action is not permitted; try an alternative approach"
     return "re-read the state and try a different approach"
+
+
+def _execute_llm_request(message: str, history: list, providers: list,
+                         **kwargs: Any) -> ExecutionResult:
+    """Run one selected reasoning candidate through the LLM boundary.
+
+    Local reasoning is selected by the normal capability plan and passed as a
+    callable to the existing boundary. It is not a remote-failure branch or a
+    planner-owned fallback hierarchy. The compatibility seams for tests and
+    older callers remain unchanged when no local candidate is selected.
+    """
+    local_adapter = kwargs.pop("local_adapter", None)
+    selected_capability_id = kwargs.pop("selected_capability_id", None)
+
+    def _tag(result: ExecutionResult) -> ExecutionResult:
+        # Successful remote calls report actual provider success through the
+        # existing callback bridge; only failed selected candidates need a
+        # candidate identity for bounded semantic recovery. Local calls always
+        # carry their identity so local health is updated as well.
+        if selected_capability_id and (
+            selected_capability_id == LOCAL_REASONING_CAPABILITY_ID
+            or result.outcome != ExecutionOutcome.SUCCESS
+        ):
+            return result.model_copy(update={"capability_id": selected_capability_id})
+        return result
+
+    if (
+        selected_capability_id == LOCAL_REASONING_CAPABILITY_ID
+        and isinstance(local_adapter, LocalReasoningAdapter)
+    ):
+        result = execute_llm_boundary(
+            message,
+            history,
+            providers,
+            _completion_callable=local_adapter.complete,
+            **kwargs,
+        )
+        return _tag(result)
+    if execute_llm_boundary is not _ORIGINAL_EXECUTE_LLM_BOUNDARY:
+        return _tag(execute_llm_boundary(message, history, providers, **kwargs))
+    if complete is not _ORIGINAL_COMPLETE:
+        return _tag(execute_boundary(complete, message, history, providers, **kwargs))
+    return _tag(execute_llm_boundary(message, history, providers, **kwargs))
+
+
+def _selected_reasoning_candidate(plan: CapabilityPlan | None) -> str | None:
+    """Return the Registry-selected reasoning implementation, if any."""
+    if plan is None:
+        return None
+    sub_goal = plan.sub_goal("subgoal-reasoning")
+    return sub_goal.selected_capability_id if sub_goal is not None else None
+
+
+def _selected_candidate_descriptor(
+    plan: CapabilityPlan | None,
+    registry: CapabilityRegistry | None,
+    tool_name: str,
+) -> CapabilityDescriptor | None:
+    """Resolve the plan-selected implementation; locality comes from it."""
+    if plan is None or registry is None:
+        return None
+    capability = _tool_semantic_type(tool_name)
+    if capability is None:
+        return None
+    for sub_goal in plan.sub_goals:
+        if sub_goal.requirement.capability_type != capability:
+            continue
+        selected = sub_goal.selected_capability_id
+        return registry.get(selected) if selected else None
+    return None
+
+
+def _descriptor_for_tool(
+    ctx: BrainContext,
+    tool_name: str,
+    plan: CapabilityPlan | None = None,
+) -> CapabilityDescriptor | None:
+    """Find an existing registered binding for direct transport-only routes."""
+    registry = _get_registry(ctx)
+    selected = _selected_candidate_descriptor(plan, registry, tool_name)
+    if selected is not None:
+        return selected
+    capability = _tool_semantic_type(tool_name)
+    if registry is None or capability is None:
+        return None
+    candidates = registry.query_by_semantic_type(capability)
+    for candidate in candidates:
+        metadata = candidate.metadata or {}
+        if metadata.get("function_name") == tool_name or metadata.get("tool_name") == tool_name:
+            return candidate
+        if candidate.id in {f"brain-{tool_name}", f"tool-{tool_name}"}:
+            return candidate
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _candidate_locality(ctx: BrainContext, capability_id: str | None) -> str | None:
+    registry = _get_registry(ctx)
+    descriptor = registry.get(capability_id) if registry is not None and capability_id else None
+    if descriptor is None:
+        return None
+    return _capability_transport_metadata(descriptor).get("locality")
+
+
+def _execute_reasoning_candidate(
+    candidate: CapabilityDescriptor,
+    *,
+    message: str,
+    history: list,
+    provider_payload: list[dict],
+    ctx: BrainContext,
+    kwargs: dict[str, Any],
+) -> ExecutionResult:
+    """Execute one semantic reasoning candidate through the same LLM boundary."""
+    if candidate.id == LOCAL_REASONING_CAPABILITY_ID:
+        return _execute_llm_request(
+            message,
+            history,
+            [],
+            local_adapter=getattr(ctx, "local_reasoning", None),
+            selected_capability_id=candidate.id,
+            **kwargs,
+        )
+    candidate_payload = [
+        provider for provider in provider_payload
+        if f"provider-{str(provider.get('provider') or '').strip().casefold()}" == candidate.id
+    ]
+    if not candidate_payload:
+        return ExecutionResult(
+            outcome=ExecutionOutcome.UNSUPPORTED,
+            capability_id=candidate.id,
+            failure_class=CanonicalFailureClass.UNSUPPORTED_OPERATION,
+        )
+    return _execute_llm_request(
+        message,
+        history,
+        candidate_payload,
+        selected_capability_id=candidate.id,
+        **kwargs,
+    )
+
+
+def _recover_reasoning_failure(
+    ctx: BrainContext,
+    plan: CapabilityPlan | None,
+    result: ExecutionResult,
+    *,
+    message: str,
+    history: list,
+    provider_payload: list[dict],
+    kwargs: dict[str, Any],
+) -> tuple[ExecutionResult, CapabilityPlan | None, bool]:
+    """Use Phase 11 bounded candidate recovery for any reasoning backend."""
+    registry = _get_registry(ctx)
+    if registry is None or result.outcome == ExecutionOutcome.SUCCESS:
+        return result, plan, False
+    recovered, _, did_recover = recover_failed_subgoal(
+        plan,
+        registry,
+        result,
+        execute_candidate=lambda candidate: _execute_reasoning_candidate(
+            candidate,
+            message=message,
+            history=history,
+            provider_payload=provider_payload,
+            ctx=ctx,
+            kwargs=kwargs,
+        ),
+    )
+    return recovered, plan, did_recover
+
+
+def _execute_tool_request(
+    tool_name: str,
+    arguments: dict[str, Any],
+    ctx: BrainContext | None = None,
+) -> ExecutionResult:
+    """Run a Brain tool through the existing normalized execution boundary.
+
+    ``search_local_knowledge`` is the one context-bound server tool: its
+    callable closes over the lifecycle-owned engine from ``BrainContext``.
+    The boundary still owns exception capture, canonical classification, and
+    diagnostic retention.  No global engine or planner-created engine exists.
+    """
+    if tool_name == KNOWLEDGE_TOOL_NAME and execute_tool_boundary is not _ORIGINAL_EXECUTE_TOOL_BOUNDARY:
+        # Preserve the established planner test/injection seam.
+        result = execute_tool_boundary(tool_name, arguments)
+    elif tool_name == KNOWLEDGE_TOOL_NAME:
+        result = execute_tool_boundary(tool_name, arguments, context=ctx)
+    elif execute_tool_boundary is not _ORIGINAL_EXECUTE_TOOL_BOUNDARY:
+        result = execute_tool_boundary(tool_name, arguments)
+    elif execute_tool is not _ORIGINAL_EXECUTE_TOOL:
+        result = execute_boundary(execute_tool, tool_name, arguments)
+    else:
+        result = execute_tool_boundary(tool_name, arguments)
+    return _normalize_tool_result(result)
+
+
+def _normalize_tool_result(result: ExecutionResult) -> ExecutionResult:
+    """Defensively classify JSON error payloads from compatibility transports."""
+    if result.outcome != ExecutionOutcome.SUCCESS or not isinstance(result.data, str):
+        return result
+    try:
+        payload = json.loads(result.data)
+    except (json.JSONDecodeError, TypeError):
+        return result
+    if not isinstance(payload, dict) or "error" not in payload:
+        return result
+
+    failure_class, diagnostics = classify_exception(
+        RuntimeError(str(payload.get("error") or "tool execution failed")),
+        extra_details={"source": "tool_registry"},
+    )
+    return ExecutionResult(
+        outcome=outcome_for_failure(failure_class),
+        data=result.data,
+        partial_data=result.partial_data,
+        failure_class=failure_class,
+        diagnostics=diagnostics,
+        metadata=result.metadata,
+        elapsed_ms=result.elapsed_ms,
+        sub_goal_id=result.sub_goal_id,
+        capability_id=result.capability_id,
+    )
+
+
+def _capability_tool_name(
+    candidate: CapabilityDescriptor,
+    fallback: str,
+) -> str | None:
+    """Resolve a registry descriptor to an existing Brain tool binding."""
+    metadata = candidate.metadata or {}
+    raw_name = (
+        metadata.get("function_name")
+        or metadata.get("tool_name")
+        or metadata.get("function")
+    )
+    if not raw_name and candidate.id.startswith("brain-"):
+        raw_name = candidate.id.removeprefix("brain-")
+    if not raw_name and candidate.id.startswith("tool-"):
+        raw_name = candidate.id.removeprefix("tool-")
+    raw_name = str(raw_name or "").strip()
+    if raw_name == "web_search":
+        return "search"
+    if raw_name in _TOOL_CAPABILITY_TYPES:
+        return raw_name
+    # A same-capability implementation may be represented by the original
+    # tool binding when a test/application supplies that binding explicitly.
+    if candidate.id == fallback:
+        return fallback
+    return None
+
+
+def _execute_registered_candidate(
+    candidate: CapabilityDescriptor,
+    *,
+    original_tool_name: str,
+    arguments: dict[str, Any],
+    ctx: BrainContext,
+) -> ExecutionResult:
+    """Execute one alternative using the existing tool boundary."""
+    tool_name = _capability_tool_name(candidate, original_tool_name)
+    if tool_name is None:
+        return ExecutionResult(
+            outcome=ExecutionOutcome.UNSUPPORTED,
+            capability_id=candidate.id,
+            failure_class=CanonicalFailureClass.UNSUPPORTED_OPERATION,
+        )
+    return _execute_tool_request(tool_name, arguments, ctx)
+
+
+def _failure_class_for_result(result: ExecutionResult) -> CanonicalFailureClass | None:
+    """Recover a safe canonical class when a producer supplied outcome only."""
+    if result.failure_class is not None:
+        return result.failure_class
+    return {
+        ExecutionOutcome.RETRYABLE_FAILURE: CanonicalFailureClass.TRANSIENT,
+        ExecutionOutcome.BLOCKED: CanonicalFailureClass.POLICY_BLOCKED,
+        ExecutionOutcome.DENIED: CanonicalFailureClass.AUTH_DENIED,
+        ExecutionOutcome.UNSUPPORTED: CanonicalFailureClass.UNSUPPORTED_OPERATION,
+        ExecutionOutcome.FATAL_FAILURE: CanonicalFailureClass.UNKNOWN_FATAL,
+    }.get(result.outcome)
+
+
+def _tool_execution_observation(tool_name: str, result: ExecutionResult) -> tuple[str, bool]:
+    """Interpret one tool ``ExecutionResult`` for the ReAct context and UI."""
+    if result.outcome == ExecutionOutcome.SUCCESS:
+        return _result_text(result.data), True
+    if result.outcome == ExecutionOutcome.PARTIAL_SUCCESS:
+        partial = result.partial_data if result.partial_data is not None else result.data
+        return (
+            f"Tool {tool_name} partially succeeded. Verified result: {_result_text(partial)}",
+            True,
+        )
+    # All failure outcomes intentionally discard result.data and diagnostics.
+    return _tool_failure_observation(tool_name, _failure_class_for_result(result)), False
+
+
+def _result_text(value: Any) -> str:
+    """Render successful/partial data without exposing Python object reprs."""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return "(no usable result)"
+
+
+def _device_failure_observation(tool_name: str, *, timed_out: bool = False) -> str:
+    """Sanitize a Body callback failure before it reaches ReAct or the UI."""
+    if timed_out:
+        return (
+            f"Tool {tool_name} failed. Failure class: TRANSIENT. "
+            "Reason: Body callback TIMEOUT waiting for an observation."
+        )
+    return _tool_failure_observation(tool_name, CanonicalFailureClass.UNKNOWN_FATAL)
+
+
+def _llm_completion(result: ExecutionResult) -> dict | None:
+    """Extract usable completion data while preserving partial-success semantics."""
+    if result.outcome not in {ExecutionOutcome.SUCCESS, ExecutionOutcome.PARTIAL_SUCCESS}:
+        return None
+    data = (
+        result.partial_data if result.outcome == ExecutionOutcome.PARTIAL_SUCCESS
+        and result.partial_data is not None else result.data
+    )
+    return data if isinstance(data, dict) else None
+
+
+def _llm_failure_response(result: ExecutionResult, *, steps: int = 0) -> AskResponse:
+    """Return a bounded, sanitized response for a failed reasoning boundary."""
+    failure_class = _failure_class_for_result(result)
+    observation = _llm_failure_observation(failure_class)
+    _self_correction(
+        steps,
+        None,
+        observation,
+        "stop this reasoning step and use only an explicitly available fallback",
+        attempt=steps,
+        transition_type="retry",
+        semantic_capability=SemanticCapabilityType.REASONING.value,
+    )
+    return AskResponse(
+        response=f"{observation} The reasoning service is temporarily unavailable.",
+        route="agent_final" if steps else "llm",
+        error="llm_unavailable",
+        steps=steps,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -468,32 +1658,30 @@ def _get_registry(ctx: BrainContext) -> CapabilityRegistry | None:
     return getattr(ctx, "capability_registry", None)
 
 
-def _bootstrap_providers(ctx: BrainContext, provider_payload: list[dict]) -> None:
-    """Bootstrap the registry with provider capabilities from this request."""
-    reg = _get_registry(ctx)
-    if reg is None:
-        return
-    _bootstrap_registry_fn(reg, providers_config=provider_payload)
-    # Register the meta-reasoning capability if not already present.
-    if not reg.contains(_REASONING_META_CAP_ID):
-        reg.register(CapabilityDescriptor(
-            id=_REASONING_META_CAP_ID,
-            capability_type=SemanticCapabilityType.REASONING,
-            description="Meta-capability for LLM reasoning request execution",
-            requires_internet=True,
-            requires_auth=True,
-            is_local=False,
-        ))
+def _knowledge_tool_is_selectable(ctx: BrainContext) -> bool:
+    """Return whether lifecycle health permits the read-only local tool."""
+    engine = getattr(ctx, "knowledge_engine", None)
+    registry = _get_registry(ctx)
+    descriptor = registry.get(KNOWLEDGE_CAPABILITY_ID) if registry is not None else None
+    return bool(
+        engine is not None
+        and descriptor is not None
+        and descriptor.health in {
+            CapabilityHealth.AVAILABLE,
+            CapabilityHealth.DEGRADED,
+        }
+    )
 
 
 def _sort_providers_by_health(
     ctx: BrainContext, provider_payload: list[dict],
 ) -> list[dict]:
-    """Sort providers by capability health: AVAILABLE/UNKNOWN first.
+    """Present providers by current Registry health without health mutation.
 
-    UNAVAILABLE providers are placed last but still included —
-    ``complete()`` handles internal failover, so they serve as a
-    last-resort fallback before the request fails entirely.
+    AVAILABLE precedes DEGRADED.  UNKNOWN is ordered after both because it is
+    not evidence of health; it remains a distinguishable transport input for
+    the compatibility validation path.  UNAVAILABLE is last and is removed
+    once a validated reasoning candidate exists.
     """
     reg = _get_registry(ctx)
     if reg is None:
@@ -501,8 +1689,8 @@ def _sort_providers_by_health(
 
     _PRIORITY = {
         CapabilityHealth.AVAILABLE: 0,
-        CapabilityHealth.UNKNOWN: 1,
-        CapabilityHealth.DEGRADED: 2,
+        CapabilityHealth.DEGRADED: 1,
+        CapabilityHealth.UNKNOWN: 2,
         CapabilityHealth.UNAVAILABLE: 3,
     }
 
@@ -522,12 +1710,12 @@ def _invoke_complete(
     *args: Any,
     **kwargs: Any,
 ) -> Any:
-    """Call ``complete()`` wrapped in the capability execution boundary.
+    """Call ``complete()`` through the pre-existing capability health bridge.
 
-    On success: returns the raw completion dict.
-    On failure: the executor updates health, then ``LLMError`` is re-raised
-    so the caller's existing error-handling (offline fallback, etc.) works
-    unchanged.
+    This legacy helper is retained for callers that still import it.  Active
+    planner paths use :func:`_execute_llm_request` and interpret
+    ``ExecutionResult`` directly; the registry-aware helper remains separate
+    so boundary signatures stay registry-agnostic.
     """
     if reg is None:
         return complete(*args, **kwargs)
@@ -536,14 +1724,10 @@ def _invoke_complete(
     if exec_result.outcome == ExecutionOutcome.SUCCESS:
         return exec_result.data
 
-    # Health was already updated by the executor.  Re-raise so the
-    # caller's catch block still fires.
-    raw_msg = (
-        exec_result.diagnostics.raw_message
-        if exec_result.diagnostics
-        else "provider execution failed"
-    )
-    raise LLMError(raw_msg)
+    # Health was already updated by the existing executor bridge.  Preserve
+    # the legacy exception contract for callers outside the active loop.
+    failure_class = _failure_class_for_result(exec_result)
+    raise LLMError(_llm_failure_observation(failure_class))
 
 
 def _record_provider_failures_from_llm_error(
@@ -593,6 +1777,26 @@ def _record_provider_failures_from_llm_error(
                     pass
 
 
+def _record_reasoning_result(ctx: BrainContext, result: ExecutionResult) -> None:
+    """Apply one selected reasoning outcome to its Registry candidate."""
+    capability_id = result.capability_id
+    registry = _get_registry(ctx)
+    if not capability_id or registry is None or not registry.contains(capability_id):
+        return
+    try:
+        if result.outcome == ExecutionOutcome.SUCCESS:
+            registry.update_health(capability_id, success=True)
+        elif result.failure_class is not None:
+            registry.update_health(
+                capability_id,
+                success=False,
+                failure_class=result.failure_class,
+            )
+    except Exception:
+        # A concurrent lifecycle teardown must not change the planner result.
+        pass
+
+
 def _record_provider_success(
     ctx: BrainContext, provider_calls: dict[str, bool],
 ) -> None:
@@ -623,7 +1827,6 @@ def _count_healthy_reasoners(ctx: BrainContext) -> int:
         1 for d in reasoners
         if d.health in (
             CapabilityHealth.AVAILABLE,
-            CapabilityHealth.UNKNOWN,
             CapabilityHealth.DEGRADED,
         )
     )
@@ -650,9 +1853,14 @@ async def _run_android_command(request: AskRequest, ctx: BrainContext) -> AskRes
     ctx.log.log(f"Executing device command: {command.action}", "tool")
     # The offline/legacy path hands the command to the Body in the response, so
     # there is no observation to wait for — still surface the intent in the log.
+    call_id = f"step-0:{command.action}"
+    descriptor = _descriptor_for_tool(ctx, command.action)
     _tool_call(0, command.action, command_payload, device=True,
-               label=f"Device command · {command.action}")
-    _observation(0, command.action, True, "Queued on the Body for execution.", 0)
+               label=f"Device command · {command.action}", call_id=call_id,
+               descriptor=descriptor)
+    _observation(0, command.action, True, "Queued on the Body for execution.", 0,
+                 call_id=call_id, outcome=ExecutionOutcome.SUCCESS.value,
+                 metadata=_capability_transport_metadata(descriptor))
     await ctx.stats.bump("apps_opened")
     await ctx.stats.record_tool_usage("app_control", command.action, True)
     return AskResponse(
@@ -671,24 +1879,51 @@ async def _run_web_search(request: AskRequest, ctx: BrainContext) -> AskResponse
     query = request.message.split(" ", 2)[-1]
     ctx.state.set("executing", "Searching web...")
     ctx.log.log(f"Searching web for: \"{_clip(query, 48)}\"", "tool")
-    _tool_call(0, "search", {"query": query}, device=False, label="Web Search")
+    call_id = "step-0:search"
+    descriptor = _descriptor_for_tool(ctx, "search")
+    _tool_call(0, "search", {"query": query}, device=False, label="Web Search",
+               call_id=call_id, descriptor=descriptor)
     started = time.monotonic()
     exec_result = await asyncio.to_thread(execute_search_boundary, query)
     latency_ms = exec_result.elapsed_ms or int((time.monotonic() - started) * 1000)
-    if exec_result.outcome != ExecutionOutcome.SUCCESS:
+    if exec_result.outcome not in {ExecutionOutcome.SUCCESS, ExecutionOutcome.PARTIAL_SUCCESS}:
         failure_label = _failure_class_label(exec_result.failure_class)
-        sanitized = _llm_failure_observation(exec_result.failure_class, context="Web search")
+        sanitized = _tool_failure_observation("search", exec_result.failure_class)
         await ctx.stats.record_tool_usage("web_search", query, False)
         ctx.log.log(f"Web search failed: {failure_label}", "error")
-        _observation(0, "search", False, sanitized, latency_ms)
-        _self_correction(0, "search", sanitized,
-                         _correction_for_failure_class(exec_result.failure_class, "search"))
+        _observation(0, "search", False, sanitized, latency_ms,
+                     call_id=call_id, outcome=exec_result.outcome.value,
+                     metadata=_capability_transport_metadata(descriptor))
+        _self_correction(
+            0,
+            "search",
+            sanitized,
+            _correction_for_failure_class(_failure_class_for_result(exec_result), "search"),
+            call_id=call_id,
+            semantic_capability=_capability_transport_metadata(descriptor).get(
+                "semantic_capability"
+            ),
+            locality=_capability_transport_metadata(descriptor).get("locality"),
+        )
         return AskResponse(response=sanitized, route="web_search", error=failure_label)
-    data = exec_result.data
+    data = (
+        exec_result.partial_data
+        if exec_result.outcome == ExecutionOutcome.PARTIAL_SUCCESS
+        and exec_result.partial_data is not None else exec_result.data
+    )
     latency_ms = int((time.monotonic() - started) * 1000)
+    if not isinstance(data, dict):
+        sanitized = "Web search failed. Failure class: VALIDATION_FAILED. Reason: invalid request data."
+        await ctx.stats.record_tool_usage("web_search", query, False)
+        _observation(0, "search", False, sanitized, latency_ms,
+                     call_id=call_id, outcome=ExecutionOutcome.FATAL_FAILURE.value,
+                     metadata=_capability_transport_metadata(descriptor))
+        return AskResponse(response=sanitized, route="web_search", error="validation_failed")
     results = data.get("results") or []
     ctx.log.log(f"Parsing {len(results)} results...", "info")
-    _observation(0, "search", len(results) > 0, f"{len(results)} results parsed", latency_ms)
+    _observation(0, "search", len(results) > 0, f"{len(results)} results parsed", latency_ms,
+                 call_id=call_id, outcome=exec_result.outcome.value,
+                 metadata=_capability_transport_metadata(descriptor))
     await ctx.stats.bump("web_searches")
     await ctx.stats.record_tool_usage("web_search", query, len(results) > 0)
     response = "\n".join(f"{x['title']}: {x['snippet']}" for x in results) or "No web results were returned."
@@ -699,7 +1934,10 @@ async def _run_local_tool(request: AskRequest, ctx: BrainContext) -> AskResponse
     fact = request.message.split(" ", 1)[-1]
     ctx.state.set("learning", "Saving memory...")
     ctx.log.log("Saving memory...", "info")
-    _tool_call(0, "save_memory", {"content": _clip(fact, 120)}, device=False, label="Agent Memory")
+    call_id = "step-0:save_memory"
+    descriptor = _descriptor_for_tool(ctx, "save_memory")
+    _tool_call(0, "save_memory", {"content": _clip(fact, 120)}, device=False,
+               label="Agent Memory", call_id=call_id, descriptor=descriptor)
     await store_fact(fact[:120].lower(), fact)
     title = _clip(fact, 48)
     await ctx.memory_engine.add(category="knowledge", title=title, content=fact,
@@ -707,7 +1945,9 @@ async def _run_local_tool(request: AskRequest, ctx: BrainContext) -> AskResponse
     await ctx.stats.bump("learned")
     await ctx.stats.record_tool_usage("note_creator", title, True)
     ctx.log.log(f"Memory saved: \"{title}\"", "success")
-    _observation(0, "save_memory", True, f"Stored as \"{title}\"", 0)
+    _observation(0, "save_memory", True, f"Stored as \"{title}\"", 0,
+                 call_id=call_id, outcome=ExecutionOutcome.SUCCESS.value,
+                 metadata=_capability_transport_metadata(descriptor))
     return AskResponse(response="Stored in persistent memory.", route="local_tool")
 
 
@@ -728,14 +1968,15 @@ async def _run_tool_creation(request: AskRequest, ctx: BrainContext) -> AskRespo
     started = time.monotonic()
     stream = _stream()
     exec_result = await asyncio.to_thread(
-        execute_llm_boundary, request.message, [], provider_payload,
+        _execute_llm_request, request.message, [], provider_payload,
         system_prompt=tool_creation_system_prompt,
         on_delta=stream.delta_forwarder(0) if stream is not None else None,
     )
     elapsed_ms = exec_result.elapsed_ms or int((time.monotonic() - started) * 1000)
     if stream is not None:
         stream.flush_delta(0)
-    if exec_result.outcome != ExecutionOutcome.SUCCESS:
+    completion = _llm_completion(exec_result)
+    if completion is None:
         failure_label = _failure_class_label(exec_result.failure_class)
         ctx.log.log(f"Code generation failed: {failure_label}", "error")
         return AskResponse(
@@ -743,7 +1984,6 @@ async def _run_tool_creation(request: AskRequest, ctx: BrainContext) -> AskRespo
             route="tool_creation",
             error=failure_label,
         )
-    completion = exec_result.data
     _record_provider_latency(ctx, completion, elapsed_ms, provider_payload)
     generated_code = _response_text(_assistant_message(completion))
     cleaned_code = generated_code.replace("```python", "").replace("```", "").strip()
@@ -769,11 +2009,12 @@ async def _run_tool_creation(request: AskRequest, ctx: BrainContext) -> AskRespo
 # ---------------------------------------------------------------------------
 
 async def _run_llm(request: AskRequest, ctx: BrainContext) -> AskResponse:
-    """Contain provider failures, including failures after a tool result.
+    """Contain normalized reasoning failures without leaking diagnostics.
 
-    Capability-aware variant: classifies per-provider failures, updates
-    health in the registry, and only returns the offline fallback when no
-    reasoning capabilities remain available.
+    Active reasoning calls return ``ExecutionResult`` objects from the LLM
+    boundary.  The ``LLMError`` handler remains only for legacy callers that
+    bypass that boundary; it preserves the existing response contract while
+    keeping raw provider messages out of ReAct and UI surfaces.
     """
     try:
         return await _run_llm_unchecked(request, ctx)
@@ -813,9 +2054,10 @@ async def _run_llm_unchecked(request: AskRequest, ctx: BrainContext) -> AskRespo
     system_prompt += memory_block
     provider_payload = [provider.model_dump() for provider in request.providers]
 
-    # --- Capability-aware provider setup ---
+    # --- Capability-aware provider discovery ---
+    # Registration is owned by the application lifecycle.  A request only
+    # reads the active registry and applies its current health state.
     reg = _get_registry(ctx)
-    _bootstrap_providers(ctx, provider_payload)
     provider_payload = _sort_providers_by_health(ctx, provider_payload)
 
     settings = _runtime_settings(Path(__file__).resolve().parent.parent / "config" / "settings.json")
@@ -826,10 +2068,27 @@ async def _run_llm_unchecked(request: AskRequest, ctx: BrainContext) -> AskRespo
             if tool.get("function", {}).get("name") not in HIDDEN_LEGACY_TOOLS
         ]
         server_tools = _filter_tools(server_tools, _enabled_map(request))
+        if _knowledge_tool_is_selectable(ctx):
+            server_tools.append(knowledge_tool_schema())
         device_tools = _filter_tools(device_tool_schemas(), _enabled_map(request))
         available_tools = server_tools + device_tools
     else:
         available_tools = []
+
+    # Build a semantic plan from the lifecycle-owned Registry before the
+    # prompt/tool surface is finalized.  No capability registration occurs in
+    # this request path.
+    capability_plan = build_capability_plan(request.message, reg) if reg is not None else None
+    provider_payload = _filter_provider_payload_by_capability_plan(
+        provider_payload,
+        capability_plan,
+    )
+    available_tools = _filter_tools_by_capability_plan(available_tools, capability_plan)
+    if capability_plan is not None:
+        system_prompt += _capability_plan_prompt(capability_plan)
+    selected_reasoning_id = _selected_reasoning_candidate(capability_plan)
+    local_reasoning = getattr(ctx, "local_reasoning", None)
+
     if available_tools:
         log.log(f"{len(available_tools)} tools available for this request", "info")
         system_prompt += build_tool_instructions(available_tools)
@@ -853,19 +2112,71 @@ async def _run_llm_unchecked(request: AskRequest, ctx: BrainContext) -> AskRespo
         provider_calls[name] = ok
         if not ok:
             # Failover is self-healing the user should see happening.
-            emit_event(EVENT_SELF_CORRECTION, step=0, tool=None, reason=f"provider {name} failed",
-                       strategy="failing over to the next configured provider", attempt=0,
-                       reflexion=f"{name} failed — rotating provider")
+            _self_correction(
+                0, None, f"provider {name} failed",
+                "failing over to the next configured provider", attempt=0,
+                call_id=f"provider:{name}:attempt:0",
+                transition_type="retry",
+                semantic_capability=SemanticCapabilityType.REASONING.value,
+            )
 
     started = time.monotonic()
     messages = _conversation_messages(request.message, history, system_prompt)
-    completion = await asyncio.to_thread(
-        _invoke_complete, reg, _REASONING_META_CAP_ID,
+    llm_result = await asyncio.to_thread(
+        _execute_llm_request,
         request.message, history, provider_payload,
         system_prompt=system_prompt, tools=available_tools, on_provider=_on_provider,
         on_delta=stream.delta_forwarder(0) if stream is not None else None,
+        local_adapter=local_reasoning,
+        selected_capability_id=selected_reasoning_id,
     )
-    # Record per-provider success in the capability registry.
+    _record_reasoning_result(ctx, llm_result)
+    if llm_result.outcome != ExecutionOutcome.SUCCESS:
+        failed_reasoning_id = selected_reasoning_id or llm_result.capability_id
+        llm_result, capability_plan, did_recover = _recover_reasoning_failure(
+            ctx,
+            capability_plan,
+            llm_result,
+            message=request.message,
+            history=history,
+            provider_payload=provider_payload,
+            kwargs={
+                "system_prompt": system_prompt,
+                "tools": available_tools,
+                "on_provider": _on_provider,
+                "on_delta": stream.delta_forwarder(0) if stream is not None else None,
+            },
+        )
+        if (
+            did_recover
+            and failed_reasoning_id
+            and llm_result.capability_id
+            and failed_reasoning_id != llm_result.capability_id
+        ):
+            replacement_descriptor = _get_registry(ctx).get(llm_result.capability_id) if _get_registry(ctx) else None
+            replacement_metadata = _capability_transport_metadata(replacement_descriptor)
+            _self_correction(
+                0, None,
+                "A verified reasoning capability replacement completed successfully",
+                "capability replacement",
+                attempt=0,
+                transition_type="capability_replacement",
+                semantic_capability=replacement_metadata.get("semantic_capability"),
+                previous_candidate=failed_reasoning_id,
+                selected_candidate=llm_result.capability_id,
+                outcome=llm_result.outcome.value,
+                locality=replacement_metadata.get("locality"),
+            )
+        _record_reasoning_result(ctx, llm_result)
+    completion = _llm_completion(llm_result)
+    if completion is None:
+        # The normalized failure class is the only feedback allowed past the
+        # boundary.  In particular, diagnostics.raw_message never enters the
+        # ReAct context or the streamed thought terminal.
+        return _llm_failure_response(llm_result)
+    # Record per-provider success in the capability registry only for the
+    # pre-existing health bridge.  The execution boundary itself remains
+    # registry-agnostic.
     _record_provider_success(ctx, provider_calls)
     if stream is not None:
         stream.flush_delta(0, text=_stream_visible_thought(_assistant_message(completion)))
@@ -877,6 +2188,7 @@ async def _run_llm_unchecked(request: AskRequest, ctx: BrainContext) -> AskRespo
         steps=0, brain_tools_called=[], session_id=request.session_id,
         original_message=request.message, started=started,
         input_mode=str(request.input_mode or "text"),
+        capability_plan=capability_plan,
     )
 
 
@@ -915,8 +2227,12 @@ async def _await_device_observation(
     result = str(payload.get("result") or "")
     success = bool(payload.get("success", True))
     tool = str(payload.get("tool") or tool_name)
-    status = "succeeded" if success else "FAILED"
-    return (f"[{tool} {status}]: {result.strip() or '(empty result)'}", success, tool, False)
+    if not success:
+        # Body callbacks have no normalized boundary object.  Preserve only a
+        # safe class-level observation; never feed the callback's raw error
+        # text (which may include device diagnostics) to the model.
+        return (_device_failure_observation(tool), False, tool, False)
+    return (f"[{tool} succeeded]: {result.strip() or '(empty result)'}", True, tool, False)
 
 
 
@@ -936,6 +2252,7 @@ async def _react_loop(
     original_message: str,
     started: float,
     input_mode: str = "text",
+    capability_plan: CapabilityPlan | None = None,
 ) -> AskResponse:
     """Thought -> Action -> Observation until final speech or device dispatch.
 
@@ -970,6 +2287,11 @@ async def _react_loop(
             arguments = function.get("arguments", {})
             if not isinstance(arguments, dict):
                 arguments = {}
+            call_id = str(tool_call.get("id") or f"step-{steps}:{tool_name}")
+            selected_descriptor = _selected_candidate_descriptor(
+                capability_plan, _get_registry(ctx), tool_name,
+            )
+            tool_attempt = 0
 
             raw_thought = assistant_message.get("content")
             thought = strip_tool_tags(raw_thought)[:2000] if isinstance(raw_thought, str) else None
@@ -995,12 +2317,15 @@ async def _react_loop(
                     "provider_calls": provider_calls,
                     "started": started,
                     "input_mode": input_mode,
+                    "capability_plan": capability_plan,
                 })
                 catalog_id = _tool_catalog_id(tool_name)
                 state.set("executing", f"Running {tool_label(catalog_id)} on device...")
                 log.log(f"Dispatching device tool: {tool_name} { _clip(json.dumps(arguments, ensure_ascii=False), 80)}", "tool")
                 _tool_call(steps, tool_name, arguments, device=True, thought=thought,
-                           label=f"Executing {tool_name} on the Body", action=action_payload)
+                           label=f"Executing {tool_name} on the Body", action=action_payload,
+                           call_id=call_id, descriptor=selected_descriptor,
+                           attempt=tool_attempt)
                 if stream is None:
                     return AskResponse(
                         response="",
@@ -1016,8 +2341,7 @@ async def _react_loop(
                     session_id, tool_name)
                 device_ms = int((time.monotonic() - dispatch_started) * 1000)
                 if timed_out:
-                    observation_text = f"[{tool_name} TIMEOUT]: no result from the Body in " \
-                                       f"{int(TOOL_RESULT_TIMEOUT_SECONDS)} s"
+                    observation_text = _device_failure_observation(tool_name, timed_out=True)
                     log.log(f"Device tool {tool_name} timed out waiting for the Body", "error")
                     # Nobody is coming with an answer: drop the resume session so a
                     # late callback cannot run the loop a second time.
@@ -1027,20 +2351,62 @@ async def _react_loop(
                 else:
                     log.log(f"Device tool {tool_name} failed in {device_ms} ms — agent will self-correct",
                             "warning")
-                _observation(steps, tool_name, device_ok, observation_text, device_ms)
+                _observation(
+                    steps, tool_name, device_ok, observation_text, device_ms,
+                    call_id=call_id,
+                    outcome=(ExecutionOutcome.SUCCESS.value if device_ok else
+                             ExecutionOutcome.RETRYABLE_FAILURE.value if timed_out else
+                             ExecutionOutcome.FATAL_FAILURE.value),
+                    metadata=_capability_transport_metadata(selected_descriptor),
+                    attempt=tool_attempt,
+                )
                 if not device_ok:
                     _self_correction(
                         steps, tool_name,
                         "device action timed out; retry with another strategy" if timed_out
                         else _clip(observation_text, 200),
                         _correction_for_failure(observation_text if not timed_out else "timeout", tool_name),
-                        attempt=steps)
+                        attempt=steps, call_id=call_id,
+                        semantic_capability=(
+                            _capability_transport_metadata(selected_descriptor)
+                            .get("semantic_capability")
+                        ),
+                        locality=_capability_transport_metadata(selected_descriptor).get("locality"))
                 messages.append({
                     "role": "tool",
                     "tool_call_id": action_payload.get("tool_call_id") or "",
                     "name": observed_tool or tool_name,
                     "content": observation_text[:MAX_OBSERVATION_CHARS],
                 })
+                device_result = ExecutionResult(
+                    outcome=(ExecutionOutcome.SUCCESS if device_ok
+                             else ExecutionOutcome.RETRYABLE_FAILURE if timed_out
+                             else ExecutionOutcome.FATAL_FAILURE),
+                    capability_id=f"tool-device-{observed_tool or tool_name}",
+                    failure_class=(None if device_ok else
+                                   CanonicalFailureClass.TRANSIENT if timed_out
+                                   else CanonicalFailureClass.UNKNOWN_FATAL),
+                )
+                if device_ok:
+                    _record_capability_result(
+                        capability_plan, device_result,
+                        tool_name=observed_tool or tool_name,
+                    )
+                else:
+                    capability_plan, affected_sub_goal_id = replan_affected_subgoal(
+                        capability_plan,
+                        _get_registry(ctx),
+                        device_result,
+                        tool_name=observed_tool or tool_name,
+                    )
+                    if affected_sub_goal_id:
+                        messages.append({
+                            "role": "system",
+                            "content": _capability_plan_prompt(
+                                capability_plan,
+                                affected_sub_goal_id=affected_sub_goal_id,
+                            ),
+                        })
                 await stats.record_tool_usage(_tool_catalog_id(observed_tool or tool_name),
                                               _clip(observation_text, 80), device_ok)
                 # One dispatched action per step: reason over its observation now.
@@ -1051,34 +2417,189 @@ async def _react_loop(
             state.set("executing", f"Running {tool_label(_tool_catalog_id(tool_name))}...")
             log.log(f"Executing tool: {tool_name}", "tool")
             _tool_call(steps, tool_name, arguments, device=False, thought=thought,
-                       label=f"Executing {tool_name} in the Brain")
+                       label=f"Executing {tool_name} in the Brain", call_id=call_id,
+                       descriptor=selected_descriptor, attempt=tool_attempt)
             tool_started = time.monotonic()
-            try:
-                result_text = await asyncio.to_thread(execute_tool, tool_name, arguments)
-            except Exception as exc:  # never let one tool kill the loop; observe + self-correct
-                result_text = json.dumps({"error": f"Tool execution failed: {exc}"}, ensure_ascii=False)
-            tool_ms = int((time.monotonic() - tool_started) * 1000)
-            success = '"error"' not in result_text[:160]
-            catalog_id = _tool_catalog_id(tool_name)
-            await stats.record_tool_usage(catalog_id, _clip(json.dumps(arguments, ensure_ascii=False)[:80]), success)
+            exec_result = await asyncio.to_thread(
+                _execute_tool_request, tool_name, arguments, ctx,
+            )
+            tool_ms = exec_result.elapsed_ms or int((time.monotonic() - tool_started) * 1000)
+            result_text, tool_ok = _tool_execution_observation(tool_name, exec_result)
+            effective_tool_name = tool_name
+            affected_sub_goal_id: str | None = None
+
+            # Backend recovery happens before the failed observation is handed
+            # to the model. The original attempt is still transported to the
+            # Body, and each verified alternative gets the same call ID with a
+            # distinct attempt number.
+            failed_candidate_id = selected_descriptor.id if selected_descriptor is not None else None
+            initial_observation_emitted = False
+            if not tool_ok:
+                _observation(
+                    steps, tool_name, False, result_text, tool_ms,
+                    call_id=call_id,
+                    outcome=exec_result.outcome.value,
+                    metadata=_capability_transport_metadata(
+                        selected_descriptor, exec_result.metadata,
+                    ),
+                    attempt=tool_attempt,
+                )
+                initial_observation_emitted = True
+
+                def _execute_recovery_candidate(candidate: CapabilityDescriptor) -> ExecutionResult:
+                    nonlocal tool_attempt
+                    tool_attempt += 1
+                    candidate_tool_name = (
+                        _capability_tool_name(candidate, tool_name) or tool_name
+                    )
+                    _tool_call(
+                        steps,
+                        candidate_tool_name,
+                        arguments,
+                        device=False,
+                        thought=thought,
+                        label=f"Executing {candidate_tool_name} in the Brain",
+                        call_id=call_id,
+                        descriptor=candidate,
+                        attempt=tool_attempt,
+                    )
+                    return _execute_registered_candidate(
+                        candidate,
+                        original_tool_name=tool_name,
+                        arguments=arguments,
+                        ctx=ctx,
+                    )
+
+                recovered_result, affected_sub_goal_id, recovered = recover_failed_subgoal(
+                    capability_plan,
+                    _get_registry(ctx),
+                    exec_result,
+                    tool_name=tool_name,
+                    execute_candidate=_execute_recovery_candidate,
+                )
+                if recovered_result is not exec_result:
+                    exec_result = recovered_result
+                    registry = _get_registry(ctx)
+                    descriptor = (
+                        registry.get(exec_result.capability_id)
+                        if registry is not None and exec_result.capability_id
+                        else None
+                    )
+                    selected_descriptor = descriptor
+                    effective_tool_name = (
+                        _capability_tool_name(descriptor, tool_name)
+                        if descriptor is not None
+                        else tool_name
+                    ) or tool_name
+                    result_text, tool_ok = _tool_execution_observation(
+                        effective_tool_name, exec_result,
+                    )
+                    tool_ms = exec_result.elapsed_ms or tool_ms
+                    if recovered:
+                        log.log(
+                            f"Recovered {affected_sub_goal_id} via {exec_result.capability_id}",
+                            "success",
+                        )
+                        if (
+                            failed_candidate_id
+                            and exec_result.capability_id
+                            and failed_candidate_id != exec_result.capability_id
+                        ):
+                            replacement_metadata = _capability_transport_metadata(selected_descriptor)
+                            _self_correction(
+                                steps,
+                                effective_tool_name,
+                                "A verified capability replacement completed successfully",
+                                "capability replacement",
+                                attempt=tool_attempt,
+                                call_id=call_id,
+                                transition_type="capability_replacement",
+                                semantic_capability=replacement_metadata.get("semantic_capability"),
+                                previous_candidate=failed_candidate_id,
+                                selected_candidate=exec_result.capability_id,
+                                outcome=exec_result.outcome.value,
+                                locality=replacement_metadata.get("locality"),
+                            )
+                    elif affected_sub_goal_id:
+                        log.log(
+                            f"Recovery exhausted for {affected_sub_goal_id}; returning sanitized observation",
+                            "warning",
+                        )
+
+            catalog_id = _tool_catalog_id(effective_tool_name)
+            await stats.record_tool_usage(
+                catalog_id,
+                _clip(json.dumps(arguments, ensure_ascii=False)[:80]),
+                tool_ok,
+            )
             if catalog_id == "web_search":
                 await stats.bump("web_searches")
             if catalog_id == "app_control":
                 await stats.bump("apps_opened")
-            if catalog_id in {"agent_memory", "note_creator"} and success:
+            if catalog_id in {"agent_memory", "note_creator"} and tool_ok:
                 await stats.bump("learned")
-            brain_tools_called.append(tool_name)
-            _observation(steps, tool_name, success, result_text, tool_ms)
-            if success:
-                log.log(f"Tool {tool_name} finished in {tool_ms} ms", "success")
+            brain_tools_called.append(effective_tool_name)
+            transport_metadata = _capability_transport_metadata(
+                selected_descriptor,
+                exec_result.metadata,
+            )
+            if not initial_observation_emitted or tool_attempt > 0:
+                _observation(
+                    steps, effective_tool_name, tool_ok, result_text, tool_ms,
+                    call_id=call_id,
+                    outcome=exec_result.outcome.value,
+                    metadata=transport_metadata,
+                    attempt=tool_attempt,
+                )
+            if tool_ok:
+                log.log(f"Tool {effective_tool_name} finished in {tool_ms} ms", "success")
+                _record_capability_result(
+                    capability_plan,
+                    exec_result,
+                    tool_name=effective_tool_name,
+                )
             else:
-                # Self-correction fuel: the next Thought sees the error and adapts.
-                log.log(f"Tool {tool_name} failed in {tool_ms} ms — agent will self-correct", "warning")
-                _self_correction(steps, tool_name, _clip(result_text, 200),
-                                 _correction_for_failure(result_text, tool_name), attempt=steps)
+                # The next Thought sees a canonical, sanitized observation;
+                # raw boundary diagnostics never enter messages or the stream.
+                log.log(
+                    f"Tool {effective_tool_name} failed ({exec_result.outcome.value}) in {tool_ms} ms — agent will self-correct",
+                    "warning",
+                )
+                _self_correction(
+                    steps,
+                    effective_tool_name,
+                    result_text,
+                    _correction_for_failure_class(
+                        _failure_class_for_result(exec_result), effective_tool_name,
+                    ),
+                    attempt=tool_attempt,
+                    call_id=call_id,
+                    semantic_capability=_capability_transport_metadata(
+                        selected_descriptor,
+                    ).get("semantic_capability"),
+                    locality=_capability_transport_metadata(selected_descriptor).get("locality"),
+                )
+                if affected_sub_goal_id is None:
+                    capability_plan, affected_sub_goal_id = replan_affected_subgoal(
+                        capability_plan,
+                        _get_registry(ctx),
+                        exec_result,
+                        tool_name=effective_tool_name,
+                    )
+                if affected_sub_goal_id:
+                    messages.append({
+                        "role": "system",
+                        "content": _capability_plan_prompt(
+                            capability_plan,
+                            affected_sub_goal_id=affected_sub_goal_id,
+                        ),
+                    })
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.get("id", "") if isinstance(tool_call, dict) else "",
+                # Keep the protocol name paired with the model's original
+                # tool_call; the observation content carries the verified
+                # alternative result.
                 "name": tool_name,
                 "content": result_text[:MAX_OBSERVATION_CHARS],
             })
@@ -1090,10 +2611,38 @@ async def _react_loop(
         _thinking("Reasoning over tool results…", step=steps + 1,
                   phase="reason" if not resume_after_dispatch else "verify")
         next_delta = stream.delta_forwarder(steps + 1) if stream is not None else None
-        completion = await asyncio.to_thread(
-            complete, "", [], provider_payload, tools=available_tools, messages=messages,
+        llm_result = await asyncio.to_thread(
+            _execute_llm_request,
+            "", [], provider_payload,
+            tools=available_tools,
+            messages=messages,
+            on_provider=on_provider,
             on_delta=next_delta,
+            local_adapter=getattr(ctx, "local_reasoning", None),
+            selected_capability_id=_selected_reasoning_candidate(capability_plan),
         )
+        _record_reasoning_result(ctx, llm_result)
+        if llm_result.outcome != ExecutionOutcome.SUCCESS:
+            llm_result, capability_plan, _ = _recover_reasoning_failure(
+                ctx,
+                capability_plan,
+                llm_result,
+                message="",
+                history=[],
+                provider_payload=provider_payload,
+                kwargs={
+                    "tools": available_tools,
+                    "messages": messages,
+                    "on_provider": on_provider,
+                    "on_delta": next_delta,
+                },
+            )
+            _record_reasoning_result(ctx, llm_result)
+        completion = _llm_completion(llm_result)
+        if completion is None:
+            # A failed re-plan ends this bounded run cleanly.  It does not
+            # consume another retry, enter offline mode, or expose diagnostics.
+            return _llm_failure_response(llm_result, steps=steps + 1)
         if stream is not None:
             stream.flush_delta(steps + 1, text=_stream_visible_thought(_assistant_message(completion)))
         assistant_message = _assistant_message(completion)
@@ -1165,15 +2714,40 @@ async def continue_with_tool_result(request: ToolResultRequest, ctx: BrainContex
     started = float(session.get("started", time.monotonic()))
     pending_id = str(session.get("pending_id", "") or request.tool_call_id or "")
     input_mode = str(session.get("input_mode", "text") or "text")
+    capability_plan = session.get("capability_plan")
 
-    status = "succeeded" if request.success else "FAILED"
-    observation = f"[{request.tool} {status}]: {(request.result or '').strip() or '(empty result)'}"
+    observation = (
+        f"[{request.tool} succeeded]: {(request.result or '').strip() or '(empty result)'}"
+        if request.success else _device_failure_observation(request.tool)
+    )
     messages.append({
         "role": "tool",
         "tool_call_id": pending_id,
         "name": request.tool,
         "content": observation[:MAX_OBSERVATION_CHARS],
     })
+    device_result = ExecutionResult(
+        outcome=(ExecutionOutcome.SUCCESS if request.success else ExecutionOutcome.FATAL_FAILURE),
+        capability_id=f"tool-device-{request.tool}",
+        failure_class=None if request.success else CanonicalFailureClass.UNKNOWN_FATAL,
+    )
+    if request.success:
+        _record_capability_result(capability_plan, device_result, tool_name=request.tool)
+    else:
+        capability_plan, affected_sub_goal_id = replan_affected_subgoal(
+            capability_plan,
+            _get_registry(ctx),
+            device_result,
+            tool_name=request.tool,
+        )
+        if affected_sub_goal_id:
+            messages.append({
+                "role": "system",
+                "content": _capability_plan_prompt(
+                    capability_plan,
+                    affected_sub_goal_id=affected_sub_goal_id,
+                ),
+            })
     catalog_id = _tool_catalog_id(request.tool)
     await stats.record_tool_usage(catalog_id, _clip(request.result or "", 80), request.success)
     if request.tool == "open_app" and request.success:
@@ -1188,19 +2762,36 @@ async def continue_with_tool_result(request: ToolResultRequest, ctx: BrainContex
 
     state.set("thinking", "Reasoning over device result...")
     await _rate_limit_pause()  # GROQ RATE LIMIT BYPASS
-    try:
-        completion = await asyncio.to_thread(
-            complete, "", [], provider_payload, tools=available_tools,
-            messages=messages,
+    llm_result = await asyncio.to_thread(
+        _execute_llm_request,
+        "", [], provider_payload,
+        tools=available_tools,
+        messages=messages,
+        on_provider=_on_provider,
+        local_adapter=getattr(ctx, "local_reasoning", None),
+        selected_capability_id=_selected_reasoning_candidate(capability_plan),
+    )
+    _record_reasoning_result(ctx, llm_result)
+    if llm_result.outcome != ExecutionOutcome.SUCCESS:
+        llm_result, capability_plan, _ = _recover_reasoning_failure(
+            ctx,
+            capability_plan,
+            llm_result,
+            message="",
+            history=[],
+            provider_payload=provider_payload,
+            kwargs={
+                "tools": available_tools,
+                "messages": messages,
+                "on_provider": _on_provider,
+            },
         )
-    except LLMError:
-        log.log("All configured AI providers failed", "error")
+        _record_reasoning_result(ctx, llm_result)
+    completion = _llm_completion(llm_result)
+    if completion is None:
+        log.log("Reasoning failed after device observation", "error")
         state.set("idle", "AI unavailable. Please retry.")
-        return AskResponse(
-            response="The AI service dropped mid-action, Boss. Please try again.",
-            route="agent_final",
-            error="llm_unavailable",
-        )
+        return _llm_failure_response(llm_result, steps=steps + 1)
     assistant_message = _assistant_message(completion)
     result = await _react_loop(
         ctx, provider_payload=provider_payload, available_tools=available_tools,
@@ -1209,6 +2800,7 @@ async def continue_with_tool_result(request: ToolResultRequest, ctx: BrainContex
         steps=steps + 1, brain_tools_called=brain_tools_called,
         session_id=request.session_id, original_message=original_message, started=started,
         input_mode=input_mode,
+        capability_plan=capability_plan,
     )
     if not result.needs_tool_result:
         _clear_agent_session(request.session_id)
@@ -1285,9 +2877,11 @@ async def plan_request(request: AskRequest, ctx: BrainContext,
         stream.bind_loop()
     try:
         return await _plan_request_inner(request, ctx, stream=stream)
-    except Exception as exc:  # a stream must always end with a terminal frame
+    except Exception:  # a stream must always end with a terminal frame
         if stream is not None:
-            stream.emit(EVENT_ERROR, code="brain_error", message=_clip(str(exc), 300),
+            # Unexpected failures are intentionally not copied into the stream;
+            # normalized boundary failures have already been interpreted above.
+            stream.emit(EVENT_ERROR, code="brain_error", message="Planner execution failed",
                         fatal=True, elapsed_ms=_elapsed(stream))
         raise
     finally:
@@ -1339,22 +2933,38 @@ async def _plan_request_inner(request: AskRequest, ctx: BrainContext, *,
                 fallback = legacy_route(message)
                 if fallback.route not in {"llm", "tool_creation"}:
                     log.log(f"LLM unavailable — offline fallback: {fallback.route}", "warning")
-                    _self_correction(0, None, "no AI provider reachable",
-                                     f"offline legacy route → {fallback.route}", attempt=0)
+                    _self_correction(
+                        0, None, "no AI provider reachable",
+                        f"offline legacy route → {fallback.route}", attempt=0,
+                        transition_type="fallback_proposal",
+                        semantic_capability=SemanticCapabilityType.REASONING.value,
+                    )
                     if fallback.route == "android_command":
                         result = await _run_android_command(request, ctx)
                     elif fallback.route == "web_search":
                         result = await _run_web_search(request, ctx)
                     elif fallback.route == "local_tool":
                         result = await _run_local_tool(request, ctx)
-    except LLMError as exc:
-        log.log(f"AI engine error: {exc}", "error")
-        print(f"\n[🔥 RONIN CRITICAL ERROR]:\n{traceback.format_exc()}\n", flush=True)
-        result = AskResponse(response="RONIN could not complete that request.", route=decision.route, error=str(exc))
-    except Exception as exc:  # keep the endpoint alive no matter what
-        log.log(f"Unexpected error: {exc}", "error")
-        print(f"\n[🔥 RONIN CRITICAL ERROR]:\n{traceback.format_exc()}\n", flush=True)
-        result = AskResponse(response="RONIN could not complete that request.", route=decision.route, error=str(exc))
+    except LLMError:
+        # Boundary failures are handled as ExecutionResults; this is only an
+        # unexpected legacy escape hatch and must stay sanitized as well.
+        log.log("AI engine execution failed", "error")
+        print("\n[🔥 RONIN CRITICAL ERROR]: AI engine execution failed\n", flush=True)
+        result = AskResponse(
+            response="RONIN could not complete that request.",
+            route=decision.route,
+            error="llm_execution_failed",
+        )
+    except Exception:
+        # Keep the endpoint alive without copying raw exception text into the
+        # API response or streamed UI.
+        log.log("Unexpected planner execution failure", "error")
+        print("\n[🔥 RONIN CRITICAL ERROR]: planner execution failed\n", flush=True)
+        result = AskResponse(
+            response="RONIN could not complete that request.",
+            route=decision.route,
+            error="planner_execution_failed",
+        )
 
     # Pending device action: the Body will call back on /agent/result, which
     # finalizes the turn. Stay in executing state so the orb shows acting.

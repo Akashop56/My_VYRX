@@ -1,5 +1,7 @@
 {
   "tool_execution_mode": "full",
   "developer_mode": true,
-  "allow_dynamic_tools": true
+  "allow_dynamic_tools": true,
+  "knowledge_background_watch_enabled": true,
+  "knowledge_background_watch_interval_seconds": 300
 }

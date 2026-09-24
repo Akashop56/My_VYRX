@@ -18,7 +18,7 @@ Design decisions
   entries are mapped to the closest :class:`SemanticCapabilityType` based
   on their ``category`` and ``id``.
 * **Idempotent.**  Calling ``bootstrap_registry`` twice with the same
-  config is safe — re-registration replaces the previous entry.
+  config is safe — existing entries and their health trackers are retained.
 * **No side effects beyond the registry.**  The function does not modify
   provider state, tool files, or any other module.
 """
@@ -248,7 +248,7 @@ def bootstrap_registry(
         if not name:
             continue
         descriptor = _build_provider_descriptor(provider)
-        registry.register(descriptor)
+        registry.register_if_absent(descriptor)
         count += 1
 
     seen_tool_ids: set[str] = set()
@@ -258,7 +258,7 @@ def bootstrap_registry(
             continue
         seen_tool_ids.add(tool_id)
         descriptor = _build_tool_descriptor(tool)
-        registry.register(descriptor)
+        registry.register_if_absent(descriptor)
         count += 1
 
     for func_name in brain_tool_names or []:
@@ -266,7 +266,7 @@ def bootstrap_registry(
         if not func_name:
             continue
         descriptor = _build_brain_tool_descriptor(func_name)
-        registry.register(descriptor)
+        registry.register_if_absent(descriptor)
         count += 1
 
     return count
